@@ -41,5 +41,11 @@ development / virtual-product testing. Project overview and decisions:
 ## Baseline
 
 - Base version: tag `v11.1.3` (branch point of `rx113/dev`).
-- Build: `mkdir build && cd build && ../configure --target-list=rx-softmmu && make -j$(nproc)`
+- Subprojects are not vendored in this clone. Fetch them first, from the
+  wrap-defined official URLs at their pinned revisions:
+  `meson subprojects download dtc berkeley-softfloat-3 berkeley-testfloat-3 keycodemapdb`
+  (meson/ninja live in `~/workspace/tools/build-venv`; put it on PATH).
+  Note: rx-softmmu requires FDT in QEMU 11 — `-Dfdt=disabled` fails.
+- Build: `mkdir build && cd build && ../configure --target-list=rx-softmmu --disable-docs && make -j$(nproc)`
 - Smoke: `./build/qemu-system-rx -M help` must list the gdbsim machines.
+  Verified green on the unmodified v11.1.3 base (2026-11-05).
