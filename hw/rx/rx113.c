@@ -10,6 +10,7 @@
 #include "qemu/units.h"
 #include "qemu/bswap.h"
 #include "qemu/log.h"
+#include "qemu/timer.h"
 #include "migration/vmstate.h"
 #include "hw/rx/rx113.h"
 #include "hw/misc/unimp.h"
@@ -93,7 +94,7 @@ static const struct {
     [SYS_SOSCCR] = { 0x33, 1, 1, 1, 1 },
     [SYS_LOCOCR] = { 0x34, 1, 0, 1, 1 },
     [SYS_HOCOCR] = { 0x36, 1, 1, 1, 1 },
-    /* §9.2.17-18: wait settings; no elapsed-time simulation. */
+    /* §9.2.17-18: LOCO-based oscillator wait settings. */
     [SYS_MOSCWTCR] = { 0xa2, 1, 4, 0x1f, 2 },
     [SYS_HOCOWTCR] = { 0xa5, 1, 5, 0x1f, 4 },
     /* §12.1.1: key not retained, reset protection enabled. */
@@ -102,13 +103,95 @@ static const struct {
     [SYS_MOFCR] = { 0xc293, 1, 0, 0x60, 2 },
 };
 
+enum {
+    OSC_MAIN, OSC_HOCO, OSC_PLL, OSC_UPLL, OSC_COUNT,
+};
+
+static const unsigned oscillator_stop[OSC_COUNT] = {
+    SYS_MOSCCR, SYS_HOCOCR, SYS_PLLCR2, SYS_UPLLCR2,
+};
+
+static const uint8_t oscillator_flag[OSC_COUNT] = { 1, 8, 4, 0x20 };
+
 struct RX113SystemState {
     SysBusDevice parent_obj;
     MemoryRegion iomem;
     MemoryRegion status;
     MemoryRegion *flash;
     uint32_t regs[SYS_REG_COUNT];
+    uint8_t oscovfsr;
+    int64_t deadline[OSC_COUNT];
+    QEMUTimer *osc_timer;
 };
+
+/* Nominal LOCO is 4 MHz, even when LOCOCR.LOSTP is set (§9.2.17-18). */
+static int64_t rx113_system_wait_ns(RX113SystemState *s, unsigned osc)
+{
+    static const unsigned main_cycles[] = {
+        2, 1024, 2048, 4096, 8192, 16384, 32768, 65536,
+    };
+    unsigned wait;
+
+    switch (osc) {
+    case OSC_MAIN:
+        wait = s->regs[SYS_MOSCWTCR];
+        if (wait < ARRAY_SIZE(main_cycles)) {
+            return main_cycles[wait] * 250LL;
+        }
+        break;
+    case OSC_HOCO:
+        wait = s->regs[SYS_HOCOWTCR];
+        if (wait == 5 || wait == 6) {
+            return (wait == 5 ? 138 : 266) * 250LL;
+        }
+        break;
+    default:
+        /* Table 43.22: tPLL maximum is 50 us for both PLLs. */
+        return 50000;
+    }
+    qemu_log_mask(LOG_GUEST_ERROR, "%s: prohibited oscillator wait setting\n",
+                  TYPE_RX113_SYSTEM);
+    /* Prohibited encodings never report stability; stop/restart recovers. */
+    return -1;
+}
+
+static void rx113_system_update_oscillators(void *opaque)
+{
+    RX113SystemState *s = opaque;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t next = INT64_MAX;
+    unsigned i;
+
+    timer_del(s->osc_timer);
+    /* Main precedes PLLs, which start their tPLL wait only after MOOVF. */
+    for (i = 0; i < OSC_COUNT; i++) {
+        uint8_t flag = oscillator_flag[i];
+
+        if ((s->regs[oscillator_stop[i]] & 1) ||
+            (i >= OSC_PLL && !(s->oscovfsr & 1))) {
+            s->oscovfsr &= ~flag;
+            s->deadline[i] = -1;
+        } else if (!(s->oscovfsr & flag)) {
+            if (s->deadline[i] == -1) {
+                int64_t wait = rx113_system_wait_ns(s, i);
+
+                /* -2 denotes a prohibited wait, latched until stop. */
+                s->deadline[i] = wait < 0 ? -2 : now + wait;
+            }
+            if (s->deadline[i] >= 0) {
+                if (s->deadline[i] <= now) {
+                    s->oscovfsr |= flag;
+                    s->deadline[i] = -1;
+                } else {
+                    next = MIN(next, s->deadline[i]);
+                }
+            }
+        }
+    }
+    if (next != INT64_MAX) {
+        timer_mod(s->osc_timer, next);
+    }
+}
 
 static uint64_t rx113_system_read(void *opaque, hwaddr addr, unsigned size)
 {
@@ -116,17 +199,7 @@ static uint64_t rx113_system_read(void *opaque, hwaddr addr, unsigned size)
     unsigned i;
 
     if (addr == 0x3c && size == 1) {
-        /*
-         * §9.2.12: flags clear on stop, PLLs require the main oscillator.
-         * Treat stabilization as instantaneous. This verifies startup control
-         * flow, not oscillator timing or electrical clock validity.
-         */
-        bool main_running = !(s->regs[SYS_MOSCCR] & 1);
-
-        return (main_running ? 1 : 0) |
-            (main_running && !(s->regs[SYS_PLLCR2] & 1) ? 4 : 0) |
-            (!(s->regs[SYS_HOCOCR] & 1) ? 8 : 0) |
-            (main_running && !(s->regs[SYS_UPLLCR2] & 1) ? 0x20 : 0);
+        return s->oscovfsr;
     }
     for (i = 0; i < SYS_REG_COUNT; i++) {
         if (addr == system_regs[i].offset && size == system_regs[i].size) {
@@ -160,6 +233,7 @@ static void rx113_system_write(void *opaque, hwaddr addr, uint64_t value,
             uint32_t mask = system_regs[i].mask;
 
             s->regs[i] = (value & mask) | (system_regs[i].reset & ~mask);
+            rx113_system_update_oscillators(s);
         }
         return;
     }
@@ -205,6 +279,11 @@ static void rx113_system_reset_hold(Object *obj, ResetType type)
     RX113SystemState *s = RX113_SYSTEM(obj);
     unsigned i;
 
+    timer_del(s->osc_timer);
+    s->oscovfsr = 0;
+    for (i = 0; i < OSC_COUNT; i++) {
+        s->deadline[i] = -1;
+    }
     for (i = 0; i < SYS_REG_COUNT; i++) {
         s->regs[i] = system_regs[i].reset;
     }
@@ -219,12 +298,16 @@ static void rx113_system_reset_exit(Object *obj, ResetType type)
     /* Read option bytes after the ROM loader's reset hold phase. */
     /* §7.2.2, §9.2.11: OFS1 bit 8 enables HOCO at reset when zero. */
     s->regs[SYS_HOCOCR] = (ldl_le_p(flash + flash_size - 0x78) >> 8) & 1;
+    /* §9.2.18 note 2: hardware secures tHOCO before CPU reset release. */
+    s->oscovfsr = s->regs[SYS_HOCOCR] ? 0 : 8;
 }
 
 static void rx113_system_init(Object *obj)
 {
     RX113SystemState *s = RX113_SYSTEM(obj);
 
+    s->osc_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                rx113_system_update_oscillators, s);
     memory_region_init_io(&s->iomem, obj, &rx113_system_ops, s,
                           TYPE_RX113_SYSTEM, 0x400);
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
@@ -233,12 +316,43 @@ static void rx113_system_init(Object *obj)
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->status);
 }
 
+static void rx113_system_finalize(Object *obj)
+{
+    RX113SystemState *s = RX113_SYSTEM(obj);
+
+    timer_free(s->osc_timer);
+}
+
+static int rx113_system_post_load(void *opaque, int version_id)
+{
+    RX113SystemState *s = opaque;
+    unsigned i;
+
+    if (version_id == 1) {
+        /* Version 1 reported enabled oscillators as immediately stable. */
+        s->oscovfsr = 0;
+        timer_del(s->osc_timer);
+        for (i = 0; i < OSC_COUNT; i++) {
+            s->deadline[i] = -1;
+            if (!(s->regs[oscillator_stop[i]] & 1) &&
+                (i < OSC_PLL || (s->oscovfsr & 1))) {
+                s->oscovfsr |= oscillator_flag[i];
+            }
+        }
+    }
+    return 0;
+}
+
 static const VMStateDescription vmstate_rx113_system = {
     .name = TYPE_RX113_SYSTEM,
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
+    .post_load = rx113_system_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(regs, RX113SystemState, SYS_REG_COUNT),
+        VMSTATE_UINT8_V(oscovfsr, RX113SystemState, 2),
+        VMSTATE_INT64_ARRAY_V(deadline, RX113SystemState, OSC_COUNT, 2),
+        VMSTATE_TIMER_PTR_V(osc_timer, RX113SystemState, 2),
         VMSTATE_END_OF_LIST()
     },
 };
@@ -518,6 +632,7 @@ static const TypeInfo rx113_types[] = {
         .parent = TYPE_SYS_BUS_DEVICE,
         .instance_size = sizeof(RX113SystemState),
         .instance_init = rx113_system_init,
+        .instance_finalize = rx113_system_finalize,
         .class_init = rx113_system_class_init,
     }, {
         .name = TYPE_R5F51138_MCU,

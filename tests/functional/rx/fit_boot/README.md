@@ -45,7 +45,7 @@ python3 tests/functional/rx/fit_boot/build.py .issue6-runtime/probe
 python3 tests/functional/rx/fit_boot/build.py .issue6-runtime/probe-hoco --hoco
 ./build/pyvenv/bin/python3 tests/functional/rx/fit_boot/verify.py build/qemu-system-rx \
   .issue6-runtime/probe-hoco/boot.elf .issue6-runtime/verify-hoco
-# Also check protected writes, readback and oscillator flag transitions.
+# Check protection/readback and exact virtual-time oscillator delays.
 timeout 30s python3 tests/functional/rx/fit_boot/system.py \
   build/qemu-system-rx .issue6-runtime/system-test
 timeout 30s python3 tests/functional/rx/fit_boot/system.py \
@@ -61,8 +61,22 @@ stall with an unmodified Phase 1 binary, use the same ELF and add
 and `boot.nm` to identify the wait loop. This mode only checks lack of SCI
 output and records evidence; it does not classify an arbitrary hang.
 
-Clock stabilization is instantaneous in the minimal QEMU model. Clock
-selection readback does not change the fixed 32 MHz peripheral input, and
-module-stop readback does not gate the existing peripheral models. These
-checks establish startup control flow for the selected configurations,
-not clock timing, electrical accuracy or general FIT compatibility.
+`system.py` uses qtest virtual clock steps to check flags immediately after
+start, one nanosecond before each deadline, and at the deadline. It covers
+all eight MOSCWTCR waits, both HOCOWTCR waits, PLL/USB PLL dependency on
+main stability plus 50 us, stop/restart cancellation, reset during pending
+waits, repeated enables, and operation with LOCO stopped. It also checks
+OFS1-dependent HOCO reset state, read-only status and reserved bits.
+Run both without an ELF (zero-filled OFS1 enables HOCO at reset) and with
+the FIT ELF (OFS1 disables HOCO). Prohibited wait encodings are diagnosed
+and leave the corresponding flag clear until stop/restart with a valid value.
+
+SYSTEM oscillator flags now use virtual-time stabilization waits. The
+LOCO cycle basis is nominal 4 MHz; PLL and USB PLL each use the Table 43.22
+maximum tPLL of 50 us after main stability. HOCO enabled by OFS1 is already
+stable at reset release. These timings model the documented wait counters,
+not analog oscillator behavior or electrical frequency accuracy. Clock
+selection readback still does not change the fixed 32 MHz peripheral input,
+and module-stop readback does not gate the existing peripheral models.
+The FIT checks establish startup control flow for the selected configurations;
+they do not establish general FIT compatibility.

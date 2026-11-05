@@ -25,3 +25,14 @@ Date: 2026-11-05. Decided by: PO.
 Same regime as the owner's other PMO projects: PO decides, PMO
 decomposes and reviews, Codex workers implement via draft PRs and
 never merge. Worker rules are in the repository-root `AGENTS.md`.
+
+## D-005: Split Issue #8; defer clock propagation and module gating
+Date: 2026-11-06. Decided by: PO; implemented under PMO instructions.
+Issue #8 now implements oscillator stabilization delays only, confined to
+RX113 SYSTEM. Clock-frequency propagation and module gating move to
+a separate issue. The shared CMT/TMR/SCI models expose fixed `input-freq`
+properties that reject runtime changes and provide no retained-state gate
+interface. Updating those properties alone would not reschedule timers or
+refresh cached SCI timing; zero frequency is unsupported. Separate design
+and shared-model interface work are therefore required, preserving RX62N
+behavior. See `issue-8-clock-tree-report.md` for the blocking evidence.
