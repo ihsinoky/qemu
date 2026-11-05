@@ -8,6 +8,9 @@
 #include "qemu/osdep.h"
 #include "qapi/error.h"
 #include "qemu/units.h"
+#include "qemu/bswap.h"
+#include "qemu/log.h"
+#include "migration/vmstate.h"
 #include "hw/rx/rx113.h"
 #include "hw/misc/unimp.h"
 #include "hw/core/sysbus.h"
@@ -52,6 +55,216 @@ typedef struct RX113Class RX113Class;
 
 DECLARE_CLASS_CHECKERS(RX113Class, RX113_MCU,
                        TYPE_RX113_MCU)
+
+/*
+ * Minimal RX113 SYSTEM startup registers, R01UH0448EJ0120 Rev.1.20.
+ * Clock selections and module-stop bits are retained for readback only:
+ * peripheral clocks remain fixed and module-stop does not gate devices.
+ */
+#define TYPE_RX113_SYSTEM "rx113-system"
+OBJECT_DECLARE_SIMPLE_TYPE(RX113SystemState, RX113_SYSTEM)
+
+/* Indices also define the migration array layout. */
+enum {
+    SYS_MSTPCRB, SYS_SCKCR, SYS_SCKCR3, SYS_PLLCR, SYS_PLLCR2,
+    SYS_UPLLCR, SYS_UPLLCR2, SYS_MOSCCR, SYS_SOSCCR, SYS_LOCOCR,
+    SYS_HOCOCR, SYS_MOSCWTCR, SYS_HOCOWTCR, SYS_PRCR, SYS_MOFCR,
+    SYS_REG_COUNT,
+};
+
+static const struct {
+    hwaddr offset;
+    unsigned size;
+    uint32_t reset;
+    uint32_t mask;
+    unsigned protect;
+} system_regs[SYS_REG_COUNT] = {
+    /* §11.2.3: reserved bits read as one; PRC1 protects module stop. */
+    [SYS_MSTPCRB] = { 0x14, 4, 0xffffffff, 0xe6aa0650, 2 },
+    /* §9.2.1-6: clock selections; PRC0 protects these registers. */
+    [SYS_SCKCR] = { 0x20, 4, 0x33000303, 0xff000f0f, 1 },
+    [SYS_SCKCR3] = { 0x26, 2, 0, 0x700, 1 },
+    [SYS_PLLCR] = { 0x28, 2, 0x0f00, 0x3f03, 1 },
+    [SYS_PLLCR2] = { 0x2a, 1, 1, 1, 1 },
+    [SYS_UPLLCR] = { 0x2c, 2, 0x0f00, 0x3f13, 1 },
+    [SYS_UPLLCR2] = { 0x2e, 1, 1, 1, 1 },
+    /* §9.2.7-11: stop controls; HOCO reset depends on OFS1.HOCOEN. */
+    [SYS_MOSCCR] = { 0x32, 1, 1, 1, 1 },
+    [SYS_SOSCCR] = { 0x33, 1, 1, 1, 1 },
+    [SYS_LOCOCR] = { 0x34, 1, 0, 1, 1 },
+    [SYS_HOCOCR] = { 0x36, 1, 1, 1, 1 },
+    /* §9.2.17-18: wait settings; no elapsed-time simulation. */
+    [SYS_MOSCWTCR] = { 0xa2, 1, 4, 0x1f, 2 },
+    [SYS_HOCOWTCR] = { 0xa5, 1, 5, 0x1f, 4 },
+    /* §12.1.1: key not retained, reset protection enabled. */
+    [SYS_PRCR] = { 0x3fe, 2, 0, 0xf, 0 },
+    /* §9.2.20: main oscillator source/drive control; PRC1. */
+    [SYS_MOFCR] = { 0xc293, 1, 0, 0x60, 2 },
+};
+
+struct RX113SystemState {
+    SysBusDevice parent_obj;
+    MemoryRegion iomem;
+    MemoryRegion status;
+    MemoryRegion *flash;
+    uint32_t regs[SYS_REG_COUNT];
+};
+
+static uint64_t rx113_system_read(void *opaque, hwaddr addr, unsigned size)
+{
+    RX113SystemState *s = opaque;
+    unsigned i;
+
+    if (addr == 0x3c && size == 1) {
+        /*
+         * §9.2.12: flags clear on stop, PLLs require the main oscillator.
+         * Treat stabilization as instantaneous. This verifies startup control
+         * flow, not oscillator timing or electrical clock validity.
+         */
+        bool main_running = !(s->regs[SYS_MOSCCR] & 1);
+
+        return (main_running ? 1 : 0) |
+            (main_running && !(s->regs[SYS_PLLCR2] & 1) ? 4 : 0) |
+            (!(s->regs[SYS_HOCOCR] & 1) ? 8 : 0) |
+            (main_running && !(s->regs[SYS_UPLLCR2] & 1) ? 0x20 : 0);
+    }
+    for (i = 0; i < SYS_REG_COUNT; i++) {
+        if (addr == system_regs[i].offset && size == system_regs[i].size) {
+            return s->regs[i];
+        }
+    }
+    qemu_log_mask(LOG_UNIMP, "%s: unimplemented read at 0x%" HWADDR_PRIx
+                  " size %u\n", TYPE_RX113_SYSTEM, addr, size);
+    return 0;
+}
+
+static void rx113_system_write(void *opaque, hwaddr addr, uint64_t value,
+                               unsigned size)
+{
+    RX113SystemState *s = opaque;
+    unsigned i;
+
+    if (addr == 0x3c && size == 1) {
+        return; /* §9.2.12: all oscillator status bits are read-only. */
+    }
+    for (i = 0; i < SYS_REG_COUNT; i++) {
+        if (addr != system_regs[i].offset || size != system_regs[i].size) {
+            continue;
+        }
+        if (i == SYS_PRCR) {
+            /* §12.1.1: only a 16-bit write with PRKEY=A5 is accepted. */
+            if ((value & 0xff00) == 0xa500) {
+                s->regs[i] = value & 0xf;
+            }
+        } else if (s->regs[SYS_PRCR] & system_regs[i].protect) {
+            uint32_t mask = system_regs[i].mask;
+
+            s->regs[i] = (value & mask) | (system_regs[i].reset & ~mask);
+        }
+        return;
+    }
+    qemu_log_mask(LOG_UNIMP, "%s: unimplemented write at 0x%" HWADDR_PRIx
+                  " size %u value 0x%" PRIx64 "\n",
+                  TYPE_RX113_SYSTEM, addr, size, value);
+}
+
+static uint64_t rx113_system_status_read(void *opaque, hwaddr addr,
+                                         unsigned size)
+{
+    return rx113_system_read(opaque, 0xc290 + addr, size);
+}
+
+static void rx113_system_status_write(void *opaque, hwaddr addr, uint64_t value,
+                                      unsigned size)
+{
+    rx113_system_write(opaque, 0xc290 + addr, value, size);
+}
+
+static const MemoryRegionOps rx113_system_ops = {
+    .read = rx113_system_read,
+    .write = rx113_system_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 4,
+    .impl.min_access_size = 1,
+    .impl.max_access_size = 4,
+};
+
+static const MemoryRegionOps rx113_system_status_ops = {
+    .read = rx113_system_status_read,
+    .write = rx113_system_status_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 4,
+    .impl.min_access_size = 1,
+    .impl.max_access_size = 4,
+};
+
+static void rx113_system_reset_hold(Object *obj, ResetType type)
+{
+    RX113SystemState *s = RX113_SYSTEM(obj);
+    unsigned i;
+
+    for (i = 0; i < SYS_REG_COUNT; i++) {
+        s->regs[i] = system_regs[i].reset;
+    }
+}
+
+static void rx113_system_reset_exit(Object *obj, ResetType type)
+{
+    RX113SystemState *s = RX113_SYSTEM(obj);
+    const uint8_t *flash = memory_region_get_ram_ptr(s->flash);
+    uint64_t flash_size = memory_region_size(s->flash);
+
+    /* Read option bytes after the ROM loader's reset hold phase. */
+    /* §7.2.2, §9.2.11: OFS1 bit 8 enables HOCO at reset when zero. */
+    s->regs[SYS_HOCOCR] = (ldl_le_p(flash + flash_size - 0x78) >> 8) & 1;
+}
+
+static void rx113_system_init(Object *obj)
+{
+    RX113SystemState *s = RX113_SYSTEM(obj);
+
+    memory_region_init_io(&s->iomem, obj, &rx113_system_ops, s,
+                          TYPE_RX113_SYSTEM, 0x400);
+    sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
+    memory_region_init_io(&s->status, obj, &rx113_system_status_ops, s,
+                          "rx113-system-status", 0x10);
+    sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->status);
+}
+
+static const VMStateDescription vmstate_rx113_system = {
+    .name = TYPE_RX113_SYSTEM,
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32_ARRAY(regs, RX113SystemState, SYS_REG_COUNT),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
+static void rx113_system_class_init(ObjectClass *klass, const void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+    ResettableClass *rc = RESETTABLE_CLASS(klass);
+
+    dc->vmsd = &vmstate_rx113_system;
+    rc->phases.hold = rx113_system_reset_hold;
+    rc->phases.exit = rx113_system_reset_exit;
+    dc->user_creatable = false;
+}
+
+static void register_system(RX113State *s)
+{
+    DeviceState *dev = qdev_new(TYPE_RX113_SYSTEM);
+    RX113SystemState *sys = RX113_SYSTEM(dev);
+
+    object_property_add_child(OBJECT(s), "system", OBJECT(dev));
+    sys->flash = &s->c_flash;
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_abort);
+    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, 0x00080000);
+    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 1, 0x0008c290);
+}
 
 /*
  * R01UH0448EJ0120 Rev.1.20, Table 14.3 (pp.266-272).
@@ -219,7 +432,6 @@ static void register_stubs(void)
         hwaddr base;
         hwaddr size;
     } stubs[] = {
-        { "rx113-system", 0x00080000, 0x400 },
         { "rx113-dtc", 0x00082400, 0x10 },
         { "rx113-iwdt", 0x00088030, 0x10 },
         { "rx113-dac", 0x00088040, 0x10 },
@@ -232,7 +444,6 @@ static void register_stubs(void)
         { "rx113-elc", 0x0008b100, 0x30 },
         { "rx113-port", 0x0008c000, 0x100 },
         { "rx113-mpc", 0x0008c100, 0x100 },
-        { "rx113-system-status", 0x0008c290, 0x10 },
         { "rx113-rtc", 0x0008c400, 0x100 },
         { "rx113-usb0", 0x000a0000, 0x200 },
         { "rx113-lcdc", 0x000a0800, 0x100 },
@@ -266,6 +477,7 @@ static void rx113_realize(DeviceState *dev, Error **errp)
     object_initialize_child(OBJECT(s), "cpu", &s->cpu, TYPE_RX62N_CPU);
     qdev_realize(DEVICE(&s->cpu), NULL, &error_abort);
 
+    register_system(s);
     register_icu(s);
     s->cpu.env.ack = qdev_get_gpio_in_named(DEVICE(&s->icu), "ack", 0);
     register_tmr(s, 0);
@@ -302,6 +514,12 @@ static void r5f51138_class_init(ObjectClass *oc, const void *data)
 
 static const TypeInfo rx113_types[] = {
     {
+        .name = TYPE_RX113_SYSTEM,
+        .parent = TYPE_SYS_BUS_DEVICE,
+        .instance_size = sizeof(RX113SystemState),
+        .instance_init = rx113_system_init,
+        .class_init = rx113_system_class_init,
+    }, {
         .name = TYPE_R5F51138_MCU,
         .parent = TYPE_RX113_MCU,
         .class_init = r5f51138_class_init,
