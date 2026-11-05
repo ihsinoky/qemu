@@ -26,6 +26,7 @@
 #include "qemu/osdep.h"
 #include "qemu/log.h"
 #include "qemu/error-report.h"
+#include "qapi/error.h"
 #include "hw/core/irq.h"
 #include "hw/core/registerfields.h"
 #include "hw/core/qdev-properties.h"
@@ -71,9 +72,27 @@ static void set_irq(RXICUState *icu, int n_IRQ, int req)
     }
 }
 
+static uint8_t rxicu_priority(RXICUState *icu, unsigned n)
+{
+    unsigned ipr;
+
+    if (n >= icu->nr_irqs) {
+        return 0;
+    }
+    ipr = icu->map[n];
+    if (ipr < icu->ipr_count) {
+        return icu->ipr[ipr];
+    }
+    /* Preserve the legacy RX62N overlap with the adjacent DMRSR array. */
+    if (icu->ipr_count == 142 && ipr < 142 + ARRAY_SIZE(icu->dmasr)) {
+        return icu->dmasr[ipr - 142];
+    }
+    return 0;
+}
+
 static uint16_t rxicu_level(RXICUState *icu, unsigned n)
 {
-    return (icu->ipr[icu->map[n]] << 8) | n;
+    return (rxicu_priority(icu, n) << 8) | n;
 }
 
 static void rxicu_request(RXICUState *icu, int n_IRQ)
@@ -157,9 +176,11 @@ static void rxicu_ack_irq(void *opaque, int no, int level)
     n_IRQ = -1;
     for (i = 0; i < NR_IRQS; i++) {
         if (icu->ir[i]) {
-            if (max_pri < icu->ipr[icu->map[i]]) {
+            int priority = rxicu_priority(icu, i);
+
+            if (max_pri < priority) {
                 n_IRQ = i;
-                max_pri = icu->ipr[icu->map[i]];
+                max_pri = priority;
             }
         }
     }
@@ -181,6 +202,14 @@ static uint64_t icu_read(void *opaque, hwaddr addr, unsigned size)
                       addr);
         return UINT64_MAX;
     }
+    if (addr >= A_IPR && addr < A_IPR + icu->ipr_count) {
+        return icu->ipr[reg] & R_IPR_IPR_MASK;
+    }
+    /* The old 144-byte decode overlapped DMRSR0/1 after ipr[142]. */
+    if (icu->ipr_count == 142 && addr >= A_IPR + 142 &&
+        addr < A_IPR + 144) {
+        return icu->dmasr[reg - 142] & R_IPR_IPR_MASK;
+    }
     switch (addr) {
     case A_IR ... A_IR + 0xff:
         return icu->ir[reg] & R_IR_IR_MASK;
@@ -192,8 +221,6 @@ static uint64_t icu_read(void *opaque, hwaddr addr, unsigned size)
         return 0;
     case A_FIR:
         return icu->fir & (R_FIR_FIEN_MASK | R_FIR_FVCT_MASK);
-    case A_IPR ... A_IPR + 0x8f:
-        return icu->ipr[reg] & R_IPR_IPR_MASK;
     case A_DMRSR:
     case A_DMRSR + 4:
     case A_DMRSR + 8:
@@ -229,6 +256,15 @@ static void icu_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
                       addr);
         return;
     }
+    if (addr >= A_IPR && addr < A_IPR + icu->ipr_count) {
+        icu->ipr[reg] = val & R_IPR_IPR_MASK;
+        return;
+    }
+    if (icu->ipr_count == 142 && addr >= A_IPR + 142 &&
+        addr < A_IPR + 144) {
+        icu->dmasr[reg - 142] = val & R_IPR_IPR_MASK;
+        return;
+    }
     switch (addr) {
     case A_IR ... A_IR + 0xff:
         if (icu->src[reg].sense != TRG_LEVEL && val == 0) {
@@ -249,9 +285,6 @@ static void icu_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
         break;
     case A_FIR:
         icu->fir = val & (R_FIR_FIEN_MASK | R_FIR_FVCT_MASK);
-        break;
-    case A_IPR ... A_IPR + 0x8f:
-        icu->ipr[reg] = val & R_IPR_IPR_MASK;
         break;
     case A_DMRSR:
     case A_DMRSR + 4:
@@ -302,6 +335,13 @@ static void rxicu_realize(DeviceState *dev, Error **errp)
     RXICUState *icu = RX_ICU(dev);
     int i;
 
+    if (icu->ipr_count == 0 || icu->ipr_count > 256) {
+        error_setg(errp, "rx_icu: ipr-count must be between 1 and 256");
+        return;
+    }
+
+    icu->ipr = g_new0(uint8_t, icu->ipr_count);
+
     if (icu->init_sense == NULL) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "rx_icu: trigger-level property must be set.");
@@ -334,15 +374,25 @@ static void rxicu_init(Object *obj)
     sysbus_init_irq(d, &icu->_swi);
 }
 
+static void rxicu_finalize(Object *obj)
+{
+    RXICUState *icu = RX_ICU(obj);
+
+    g_free(icu->ipr);
+}
+
 static const VMStateDescription vmstate_rxicu = {
     .name = "rx-icu",
-    .version_id = 1,
-    .minimum_version_id = 1,
+    /* Version 2 checks the configured count before loading IPR bytes. */
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT8_ARRAY(ir, RXICUState, NR_IRQS),
         VMSTATE_UINT8_ARRAY(dtcer, RXICUState, NR_IRQS),
         VMSTATE_UINT8_ARRAY(ier, RXICUState, NR_IRQS / 8),
-        VMSTATE_UINT8_ARRAY(ipr, RXICUState, 142),
+        VMSTATE_UINT32_EQUAL(ipr_count, RXICUState),
+        VMSTATE_VARRAY_UINT32(ipr, RXICUState, ipr_count, 0,
+                             vmstate_info_uint8, uint8_t),
         VMSTATE_UINT8_ARRAY(dmasr, RXICUState, 4),
         VMSTATE_UINT16(fir, RXICUState),
         VMSTATE_UINT8(nmisr, RXICUState),
@@ -355,6 +405,7 @@ static const VMStateDescription vmstate_rxicu = {
 };
 
 static const Property rxicu_properties[] = {
+    DEFINE_PROP_UINT32("ipr-count", RXICUState, ipr_count, 142),
     DEFINE_PROP_ARRAY("ipr-map", RXICUState, nr_irqs, map,
                       qdev_prop_uint8, uint8_t),
     DEFINE_PROP_ARRAY("trigger-level", RXICUState, nr_sense, init_sense,
@@ -375,6 +426,7 @@ static const TypeInfo rxicu_info = {
     .parent = TYPE_SYS_BUS_DEVICE,
     .instance_size = sizeof(RXICUState),
     .instance_init = rxicu_init,
+    .instance_finalize = rxicu_finalize,
     .class_init = rxicu_class_init,
 };
 

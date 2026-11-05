@@ -57,7 +57,8 @@ struct RXICUState {
     uint8_t ir[NR_IRQS];
     uint8_t dtcer[NR_IRQS];
     uint8_t ier[NR_IRQS / 8];
-    uint8_t ipr[142];
+    uint32_t ipr_count;
+    uint8_t *ipr;
     uint8_t dmasr[4];
     uint16_t fir;
     uint8_t nmisr;
