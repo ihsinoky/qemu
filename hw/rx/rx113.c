@@ -588,7 +588,7 @@ static void rx113_realize(DeviceState *dev, Error **errp)
                                 &s->c_flash);
 
     /* Initialize CPU */
-    object_initialize_child(OBJECT(s), "cpu", &s->cpu, TYPE_RX62N_CPU);
+    object_initialize_child(OBJECT(s), "cpu", &s->cpu, TYPE_RX113_CPU);
     qdev_realize(DEVICE(&s->cpu), NULL, &error_abort);
 
     register_system(s);

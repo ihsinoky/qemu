@@ -88,8 +88,8 @@ static void rx113_machine_class_init(ObjectClass *oc, const void *data)
     mc->desc = "Renesas RX113 (R5F51138, internal flash and RAM)";
     mc->init = rx113_init;
     mc->reset = rx113_reset;
-    /* RXv1 execution core; RX113 FPU restrictions are not yet modeled. */
-    mc->default_cpu_type = TYPE_RX62N_CPU;
+    /* RXv1 execution core without FPU */
+    mc->default_cpu_type = TYPE_RX113_CPU;
     mc->default_ram_size = 0;
     mc->max_cpus = 1;
 }

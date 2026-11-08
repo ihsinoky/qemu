@@ -2,6 +2,7 @@
 
 tests_rx_system_quick = [
   'rx113',
+  'rx113_fpu',
 ]
 
 tests_rx_system_thorough = [
