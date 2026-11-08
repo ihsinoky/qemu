@@ -256,6 +256,15 @@ static void rx_cpu_class_init(ObjectClass *klass, const void *data)
 
     cc->gdb_core_xml_file = "rx-core.xml";
     cc->tcg_ops = &rx_tcg_ops;
+    rcc->has_fpu = true;
+}
+
+static void rx113_cpu_class_init(ObjectClass *klass, const void *data)
+{
+    RXCPUClass *rcc = RX_CPU_CLASS(klass);
+
+    /* RX113 has no FPU in any variant */
+    rcc->has_fpu = false;
 }
 
 static const TypeInfo rx_cpu_info = {
@@ -274,10 +283,17 @@ static const TypeInfo rx62n_rx_cpu_info = {
     .parent = TYPE_RX_CPU,
 };
 
+static const TypeInfo rx113_rx_cpu_info = {
+    .name = TYPE_RX113_CPU,
+    .parent = TYPE_RX_CPU,
+    .class_init = rx113_cpu_class_init,
+};
+
 static void rx_cpu_register_types(void)
 {
     type_register_static(&rx_cpu_info);
     type_register_static(&rx62n_rx_cpu_info);
+    type_register_static(&rx113_rx_cpu_info);
 }
 
 type_init(rx_cpu_register_types)

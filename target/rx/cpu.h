@@ -121,6 +121,7 @@ struct ArchCPU {
  * RXCPUClass:
  * @parent_realize: The parent class' realize handler.
  * @parent_phases: The parent class' reset phase handlers.
+ * @has_fpu: Whether the core implements the FPU instructions and FPSW.
  *
  * A RX CPU model.
  */
@@ -129,6 +130,7 @@ struct RXCPUClass {
 
     DeviceRealize parent_realize;
     ResettablePhases parent_phases;
+    bool has_fpu;
 };
 
 #define CPU_RESOLVING_TYPE TYPE_RX_CPU

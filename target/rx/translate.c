@@ -37,6 +37,7 @@ typedef struct DisasContext {
     CPURXState *env;
     uint32_t pc;
     uint32_t tb_flags;
+    bool has_fpu;
 } DisasContext;
 
 typedef struct DisasCompare {
@@ -339,6 +340,12 @@ static void move_from_cr(DisasContext *ctx, TCGv_i32 ret, int cr, uint32_t pc)
         }
         break;
     case 3:     /* FPSW */
+        if (!ctx->has_fpu) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "FPSW read on a CPU without FPU");
+            tcg_gen_movi_i32(ret, 0);
+            break;
+        }
         tcg_gen_mov_i32(ret, cpu_fpsw);
         break;
     case 8:     /* BPSW */
@@ -393,6 +400,11 @@ static void move_to_cr(DisasContext *ctx, TCGv_i32 val, int cr)
         }
         break;
     case 3:     /* FPSW */
+        if (!ctx->has_fpu) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "FPSW write on a CPU without FPU");
+            break;
+        }
         gen_helper_set_fpsw(tcg_env, val);
         break;
     case 8:     /* BPSW */
@@ -1838,7 +1850,11 @@ static bool trans_SATR(DisasContext *ctx, arg_SATR *a)
     static bool cat3(trans_, name, _ir)(DisasContext *ctx,              \
                                         cat3(arg_, name, _ir) * a)      \
     {                                                                   \
-        TCGv_i32 imm = tcg_constant_i32(li(ctx, 0));                    \
+        TCGv_i32 imm;                                                   \
+        if (!ctx->has_fpu) {                                            \
+            return false;                                               \
+        }                                                               \
+        imm = tcg_constant_i32(li(ctx, 0));                             \
         gen_helper_##op(cpu_regs[a->rd], tcg_env,                       \
                         cpu_regs[a->rd], imm);                          \
         return true;                                                    \
@@ -1847,6 +1863,9 @@ static bool trans_SATR(DisasContext *ctx, arg_SATR *a)
                                         cat3(arg_, name, _mr) * a)      \
     {                                                                   \
         TCGv_i32 val, mem;                                              \
+        if (!ctx->has_fpu) {                                            \
+            return false;                                               \
+        }                                                               \
         mem = tcg_temp_new_i32();                                       \
         val = rx_load_source(ctx, mem, a->ld, MO_32, a->rs);            \
         gen_helper_##op(cpu_regs[a->rd], tcg_env,                       \
@@ -1858,6 +1877,9 @@ static bool trans_SATR(DisasContext *ctx, arg_SATR *a)
     static bool trans_##name(DisasContext *ctx, arg_##name * a) \
     {                                                           \
         TCGv_i32 val, mem;                                      \
+        if (!ctx->has_fpu) {                                    \
+            return false;                                       \
+        }                                                       \
         mem = tcg_temp_new_i32();                               \
         val = rx_load_source(ctx, mem, a->ld, MO_32, a->rs);    \
         gen_helper_##op(cpu_regs[a->rd], tcg_env, val);         \
@@ -1872,7 +1894,11 @@ FOP(FDIV, fdiv)
 /* fcmp #imm, rd */
 static bool trans_FCMP_ir(DisasContext *ctx, arg_FCMP_ir * a)
 {
-    TCGv_i32 imm = tcg_constant_i32(li(ctx, 0));
+    TCGv_i32 imm;
+    if (!ctx->has_fpu) {
+        return false;
+    }
+    imm = tcg_constant_i32(li(ctx, 0));
     gen_helper_fcmp(tcg_env, cpu_regs[a->rd], imm);
     return true;
 }
@@ -1882,6 +1908,9 @@ static bool trans_FCMP_ir(DisasContext *ctx, arg_FCMP_ir * a)
 static bool trans_FCMP_mr(DisasContext *ctx, arg_FCMP_mr *a)
 {
     TCGv_i32 val, mem;
+    if (!ctx->has_fpu) {
+        return false;
+    }
     mem = tcg_temp_new_i32();
     val = rx_load_source(ctx, mem, a->ld, MO_32, a->rs);
     gen_helper_fcmp(tcg_env, cpu_regs[a->rd], val);
@@ -1896,6 +1925,9 @@ FCONVOP(ROUND, round)
 static bool trans_ITOF(DisasContext *ctx, arg_ITOF * a)
 {
     TCGv_i32 val, mem;
+    if (!ctx->has_fpu) {
+        return false;
+    }
     mem = tcg_temp_new_i32();
     val = rx_load_source(ctx, mem, a->ld, a->mi, a->rs);
     gen_helper_itof(cpu_regs[a->rd], tcg_env, val);
@@ -2207,6 +2239,7 @@ static void rx_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cs)
     DisasContext *ctx = container_of(dcbase, DisasContext, base);
     ctx->env = cpu_env(cs);
     ctx->tb_flags = ctx->base.tb->flags;
+    ctx->has_fpu = RX_CPU_GET_CLASS(cs)->has_fpu;
 }
 
 static void rx_tr_tb_start(DisasContextBase *dcbase, CPUState *cs)
