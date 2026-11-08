@@ -66,3 +66,16 @@ AI-generated content, and requires a Signed-off-by (DCO) certification
 from the submitter. If upstreaming is ever pursued, the code to be
 submitted must first be personally reviewed (and where necessary
 rewritten) by the PO, who alone can make that certification.
+
+### Known fork-local surface to rework before upstreaming
+
+- **LCDC QOM properties** (`hw/rx/rx113-lcdc.c`: `display-ram`,
+  `segments`, `pattern`, `driving`, `time-slices`, `blink-phase`).
+  Added in Issue #14 so tests can assert the displayed segment state
+  without image inspection; the scope was adopted by the PO at the
+  PR #15 merge gate (2026-11-09). The concern: once published, QOM
+  properties become a de-facto stable API, so a wide observability
+  surface raises the maintenance cost of the model and would likely
+  need to be reduced or replaced with an upstream-acceptable
+  mechanism before submission. A matching note sits at the property
+  registration site in the source.

@@ -284,6 +284,15 @@ static void lcdc_init(Object *obj)
     sysbus_init_mmio(sbd, &s->iomem);
     qdev_init_gpio_in_named(DEVICE(obj), lcdc_prd_set, "prd", 1);
 
+    /*
+     * Fork-local observability: these properties expose the displayed
+     * segment state so tests can assert on it instead of inspecting an
+     * image. They are not part of the hardware interface. Before any
+     * upstream submission, this surface must be reconsidered (reduced
+     * or replaced with an upstream-acceptable mechanism): published
+     * QOM properties become a de-facto stable API and a maintenance
+     * cost. See docs/rx113/project.md, "Contribution policy note".
+     */
     object_property_add_str(obj, "display-ram", lcdc_get_display_ram, NULL);
     object_property_add_str(obj, "segments", lcdc_get_segments, NULL);
     object_property_add_str(obj, "pattern", lcdc_get_pattern, NULL);
