@@ -13,6 +13,7 @@
 #include "qemu/timer.h"
 #include "migration/vmstate.h"
 #include "hw/rx/rx113.h"
+#include "hw/rx/rx113_lcdc.h"
 #include "hw/misc/unimp.h"
 #include "hw/core/sysbus.h"
 #include "hw/core/qdev-properties.h"
@@ -33,6 +34,7 @@
 #define RX113_ICU_BASE  0x00087000
 #define RX113_TMR_BASE  0x00088200
 #define RX113_CMT_BASE  0x00088000
+#define RX113_LCDC_BASE 0x000a0800
 
 /*
  * RX113 Peripheral IRQ
@@ -538,6 +540,16 @@ static void register_sci(RX113State *s, unsigned unit)
                                 sci_channels[unit].extension_size);
 }
 
+/* Section 34; the LCDC defines no interrupt request (Table 14.3). */
+static void register_lcdc(RX113State *s)
+{
+    DeviceState *dev = qdev_new(TYPE_RX113_LCDC);
+
+    object_property_add_child(OBJECT(s), "lcdc", OBJECT(dev));
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_abort);
+    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, RX113_LCDC_BASE);
+}
+
 /* Table 5.1 register blocks; these stubs log accesses with -d unimp. */
 static void register_stubs(void)
 {
@@ -560,7 +572,6 @@ static void register_stubs(void)
         { "rx113-mpc", 0x0008c100, 0x100 },
         { "rx113-rtc", 0x0008c400, 0x100 },
         { "rx113-usb0", 0x000a0000, 0x200 },
-        { "rx113-lcdc", 0x000a0800, 0x100 },
         { "rx113-ctsu", 0x000a0900, 0x100 },
     };
     unsigned i;
@@ -601,6 +612,7 @@ static void rx113_realize(DeviceState *dev, Error **errp)
     for (unsigned i = 0; i < ARRAY_SIZE(sci_channels); i++) {
         register_sci(s, i);
     }
+    register_lcdc(s);
     register_stubs();
 }
 
