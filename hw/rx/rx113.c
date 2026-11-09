@@ -629,6 +629,37 @@ static void rx113_class_init(ObjectClass *klass, const void *data)
     device_class_set_props(dc, rx113_properties);
 }
 
+/* R01UH0448EJ0120 Rev.1.20, Table 1.3: ROM, RAM and E2 DataFlash. */
+static void r5f51135_class_init(ObjectClass *oc, const void *data)
+{
+    RX113Class *rxc = RX113_MCU_CLASS(oc);
+
+    rxc->ram_size = 32 * KiB;
+    rxc->rom_flash_size = 128 * KiB;
+    rxc->data_flash_size = 8 * KiB;
+}
+
+/* R01UH0448EJ0120 Rev.1.20, Table 1.3: ROM, RAM and E2 DataFlash. */
+static void r5f51136_class_init(ObjectClass *oc, const void *data)
+{
+    RX113Class *rxc = RX113_MCU_CLASS(oc);
+
+    rxc->ram_size = 32 * KiB;
+    rxc->rom_flash_size = 256 * KiB;
+    rxc->data_flash_size = 8 * KiB;
+}
+
+/* R01UH0448EJ0120 Rev.1.20, Table 1.3: ROM, RAM and E2 DataFlash. */
+static void r5f51137_class_init(ObjectClass *oc, const void *data)
+{
+    RX113Class *rxc = RX113_MCU_CLASS(oc);
+
+    rxc->ram_size = 64 * KiB;
+    rxc->rom_flash_size = 384 * KiB;
+    rxc->data_flash_size = 8 * KiB;
+}
+
+/* R01UH0448EJ0120 Rev.1.20, Table 1.3: ROM, RAM and E2 DataFlash. */
 static void r5f51138_class_init(ObjectClass *oc, const void *data)
 {
     RX113Class *rxc = RX113_MCU_CLASS(oc);
@@ -646,6 +677,18 @@ static const TypeInfo rx113_types[] = {
         .instance_init = rx113_system_init,
         .instance_finalize = rx113_system_finalize,
         .class_init = rx113_system_class_init,
+    }, {
+        .name = TYPE_R5F51135_MCU,
+        .parent = TYPE_RX113_MCU,
+        .class_init = r5f51135_class_init,
+    }, {
+        .name = TYPE_R5F51136_MCU,
+        .parent = TYPE_RX113_MCU,
+        .class_init = r5f51136_class_init,
+    }, {
+        .name = TYPE_R5F51137_MCU,
+        .parent = TYPE_RX113_MCU,
+        .class_init = r5f51137_class_init,
     }, {
         .name = TYPE_R5F51138_MCU,
         .parent = TYPE_RX113_MCU,
