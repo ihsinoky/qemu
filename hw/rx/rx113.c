@@ -15,6 +15,7 @@
 #include "hw/rx/rx113.h"
 #include "hw/rx/rx113_lcdc.h"
 #include "hw/rx/rx113_rtc.h"
+#include "hw/rx/rx113_port.h"
 #include "hw/misc/unimp.h"
 #include "hw/core/sysbus.h"
 #include "hw/core/irq.h"
@@ -591,6 +592,20 @@ static void register_rtc(RX113State *s, DeviceState *lcdc)
                        qdev_get_gpio_in_named(lcdc, "prd", 0));
 }
 
+/* Sections 18/19: PORT and MPC, IRQ input selectors (Table 19.1). */
+static void register_port(RX113State *s)
+{
+    DeviceState *dev = qdev_new(TYPE_RX113_PORT);
+
+    object_property_add_child(OBJECT(s), "port", OBJECT(dev));
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_abort);
+    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, RX113_PORT_BASE);
+    for (unsigned i = 0; i < 8; i++) {
+        qdev_connect_gpio_out_named(dev, "irq", i,
+                                   qdev_get_gpio_in(DEVICE(&s->icu), 64 + i));
+    }
+}
+
 /* Table 5.1 register blocks; these stubs log accesses with -d unimp. */
 static void register_stubs(void)
 {
@@ -609,8 +624,6 @@ static void register_stubs(void)
         { "rx113-cac", 0x0008b000, 0x20 },
         { "rx113-doc", 0x0008b080, 0x10 },
         { "rx113-elc", 0x0008b100, 0x30 },
-        { "rx113-port", 0x0008c000, 0x100 },
-        { "rx113-mpc", 0x0008c100, 0x100 },
         { "rx113-usb0", 0x000a0000, 0x200 },
         { "rx113-ctsu", 0x000a0900, 0x100 },
     };
@@ -653,6 +666,7 @@ static void rx113_realize(DeviceState *dev, Error **errp)
         register_sci(s, i);
     }
     register_rtc(s, register_lcdc(s));
+    register_port(s);
     register_stubs();
 }
 
