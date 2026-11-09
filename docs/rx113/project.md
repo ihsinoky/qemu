@@ -9,7 +9,11 @@ Provide a QEMU machine that runs firmware built for the Renesas RX113
 group, so the firmware can be exercised in a virtual-product test
 environment (model-driven development: the machine/peripheral models
 are the design artifact; fidelity is added where the firmware actually
-touches hardware).
+touches hardware). The machine exists so that an AI can run firmware on
+the simulator and verify behavior; per D-006, documented hardware
+behavior is implemented by default, and leaving behavior unimplemented
+is justified only when a faithful implementation is genuinely heavy or
+complex.
 
 ## Starting point
 
@@ -32,7 +36,8 @@ The RX113 hardware manual is the source of truth for all constants.
 In scope:
 - New MCU/machine definitions for RX113 alongside the RX62N ones.
 - Peripheral models only to the fidelity the target firmware needs;
-  unimplemented regions start as logged stubs.
+  unimplemented regions start as logged stubs (a starting point, not an
+  end state — see D-006).
 - An LCD controller model that exposes segment/display-RAM state for
   assertions (display correctness is checked from state, not images).
 

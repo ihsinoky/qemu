@@ -36,3 +36,18 @@ interface. Updating those properties alone would not reschedule timers or
 refresh cached SCI timing; zero frequency is unsupported. Separate design
 and shared-model interface work are therefore required, preserving RX62N
 behavior. See `issue-8-clock-tree-report.md` for the blocking evidence.
+
+## D-006: Implement by default; unimplemented only when genuinely heavy
+Date: 2026-11-09. Decided by: PO.
+This machine is infrastructure for model-driven development: its purpose
+is that an AI can run firmware on the simulator and verify behavior.
+Casually leaving behavior unimplemented (stubs, stored-only registers)
+defeats that purpose, because tests against silent no-ops pass for the
+wrong reason. The default is therefore to implement documented hardware
+behavior. Leaving something unimplemented is acceptable only when a
+faithful implementation is genuinely heavy or complex; in that case the
+worker records the reason and the expected cost in the issue report, and
+the PMO raises it at the merge gate as an explicit decision, not a
+footnote. Existing recorded simplifications are revisited under this
+rule (e.g. Issue #20 implements the RTC registers that Issue #18 stored
+only).
