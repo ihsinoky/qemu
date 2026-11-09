@@ -1,5 +1,5 @@
 /*
- * Renesas RX113 R5F51138 machine
+ * Renesas RX113 machines
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
@@ -14,8 +14,16 @@
 #include "system/system.h"
 #include "system/reset.h"
 
-#define TYPE_RX113_MACHINE MACHINE_TYPE_NAME("rx113-r5f51138")
+#define TYPE_RX113_MACHINE MACHINE_TYPE_NAME("rx113")
 OBJECT_DECLARE_SIMPLE_TYPE(RX113MachineState, RX113_MACHINE)
+
+typedef struct RX113MachineClass {
+    MachineClass parent_class;
+    const char *mcu_type;
+} RX113MachineClass;
+
+DECLARE_CLASS_CHECKERS(RX113MachineClass, RX113_MACHINE,
+                       TYPE_RX113_MACHINE)
 
 struct RX113MachineState {
     MachineState parent_obj;
@@ -26,6 +34,7 @@ struct RX113MachineState {
 static void rx113_init(MachineState *machine)
 {
     RX113MachineState *s = RX113_MACHINE(machine);
+    RX113MachineClass *rmc = RX113_MACHINE_GET_CLASS(machine);
     uint64_t flash_size, flash_base;
 
     if (machine->kernel_filename && machine->firmware) {
@@ -34,7 +43,7 @@ static void rx113_init(MachineState *machine)
     }
 
     object_initialize_child(OBJECT(machine), "mcu", &s->mcu,
-                            TYPE_R5F51138_MCU);
+                            rmc->mcu_type);
     object_property_set_link(OBJECT(&s->mcu), "main-bus",
                              OBJECT(get_system_memory()), &error_abort);
     qdev_realize(DEVICE(&s->mcu), NULL, &error_fatal);
@@ -85,7 +94,6 @@ static void rx113_machine_class_init(ObjectClass *oc, const void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
 
-    mc->desc = "Renesas RX113 (R5F51138, internal flash and RAM)";
     mc->init = rx113_init;
     mc->reset = rx113_reset;
     /* RXv1 execution core without FPU */
@@ -94,16 +102,67 @@ static void rx113_machine_class_init(ObjectClass *oc, const void *data)
     mc->max_cpus = 1;
 }
 
-static const TypeInfo rx113_machine_type = {
-    .name = TYPE_RX113_MACHINE,
-    .parent = TYPE_MACHINE,
-    .instance_size = sizeof(RX113MachineState),
-    .class_init = rx113_machine_class_init,
-};
-
-static void rx113_machine_register_types(void)
+static void rx113_r5f51135_class_init(ObjectClass *oc, const void *data)
 {
-    type_register_static(&rx113_machine_type);
+    MachineClass *mc = MACHINE_CLASS(oc);
+    RX113MachineClass *rmc = RX113_MACHINE_CLASS(oc);
+
+    mc->desc = "Renesas RX113 (R5F51135, internal flash and RAM)";
+    rmc->mcu_type = TYPE_R5F51135_MCU;
 }
 
-type_init(rx113_machine_register_types)
+static void rx113_r5f51136_class_init(ObjectClass *oc, const void *data)
+{
+    MachineClass *mc = MACHINE_CLASS(oc);
+    RX113MachineClass *rmc = RX113_MACHINE_CLASS(oc);
+
+    mc->desc = "Renesas RX113 (R5F51136, internal flash and RAM)";
+    rmc->mcu_type = TYPE_R5F51136_MCU;
+}
+
+static void rx113_r5f51137_class_init(ObjectClass *oc, const void *data)
+{
+    MachineClass *mc = MACHINE_CLASS(oc);
+    RX113MachineClass *rmc = RX113_MACHINE_CLASS(oc);
+
+    mc->desc = "Renesas RX113 (R5F51137, internal flash and RAM)";
+    rmc->mcu_type = TYPE_R5F51137_MCU;
+}
+
+static void rx113_r5f51138_class_init(ObjectClass *oc, const void *data)
+{
+    MachineClass *mc = MACHINE_CLASS(oc);
+    RX113MachineClass *rmc = RX113_MACHINE_CLASS(oc);
+
+    mc->desc = "Renesas RX113 (R5F51138, internal flash and RAM)";
+    rmc->mcu_type = TYPE_R5F51138_MCU;
+}
+
+static const TypeInfo rx113_machine_types[] = {
+    {
+        .name = TYPE_RX113_MACHINE,
+        .parent = TYPE_MACHINE,
+        .instance_size = sizeof(RX113MachineState),
+        .class_size = sizeof(RX113MachineClass),
+        .class_init = rx113_machine_class_init,
+        .abstract = true,
+    }, {
+        .name = MACHINE_TYPE_NAME("rx113-r5f51135"),
+        .parent = TYPE_RX113_MACHINE,
+        .class_init = rx113_r5f51135_class_init,
+    }, {
+        .name = MACHINE_TYPE_NAME("rx113-r5f51136"),
+        .parent = TYPE_RX113_MACHINE,
+        .class_init = rx113_r5f51136_class_init,
+    }, {
+        .name = MACHINE_TYPE_NAME("rx113-r5f51137"),
+        .parent = TYPE_RX113_MACHINE,
+        .class_init = rx113_r5f51137_class_init,
+    }, {
+        .name = MACHINE_TYPE_NAME("rx113-r5f51138"),
+        .parent = TYPE_RX113_MACHINE,
+        .class_init = rx113_r5f51138_class_init,
+    }
+};
+
+DEFINE_TYPES(rx113_machine_types)

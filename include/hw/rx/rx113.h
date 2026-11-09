@@ -18,6 +18,9 @@
 #define TYPE_RX113_MCU "rx113-mcu"
 OBJECT_DECLARE_SIMPLE_TYPE(RX113State, RX113_MCU)
 
+#define TYPE_R5F51135_MCU "r5f51135-mcu"
+#define TYPE_R5F51136_MCU "r5f51136-mcu"
+#define TYPE_R5F51137_MCU "r5f51137-mcu"
 #define TYPE_R5F51138_MCU "r5f51138-mcu"
 
 struct RX113State {
