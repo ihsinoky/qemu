@@ -32,9 +32,13 @@
 #define RCR1_AIE    0x01
 #define RCR1_CIE    0x02
 #define RCR1_PIE    0x04
+#define RCR1_RTCOS  0x08
 #define RCR2_START  0x01
 #define RCR2_RESET  0x02
 #define RCR2_ADJ30  0x04
+#define RCR2_RTCOE  0x08
+#define RCR2_AADJE  0x10
+#define RCR2_AADJP  0x20
 #define RCR2_HR24   0x40
 #define RCR2_CNTMD  0x80
 
@@ -427,6 +431,306 @@ static void test_lcdc_blink(void)
     qtest_quit(qts);
 }
 
+/* Ceiling in nanoseconds of an exact number of 32768-Hz source cycles. */
+static int64_t source_cycles(unsigned cycles)
+{
+    return ((int64_t)cycles * SEC + 32767) / 32768;
+}
+
+static void test_radj_software(void)
+{
+    const uint8_t t0[7] = { 0x24, 1, 1, 1, 0, 0, 0 };
+
+    for (unsigned subtract = 0; subtract < 2; subtract++) {
+        QTestState *qts = rtc_init();
+        int64_t deadline = SEC + (subtract ? source_cycles(63) :
+                                            -source_cycles(63) + 1);
+
+        set_time(qts, t0, RCR2_HR24);
+        enable_irq(qts, VEC_CUP);
+        enable_irq(qts, VEC_ALM);
+        enable_irq(qts, VEC_PRD);
+        qtest_writeb(qts, RSECAR, 0x81);
+        qtest_writeb(qts, RCR1, 0xe7); /* 1-second PRD, ALM and CUP */
+        qtest_clock_step(qts, SEC / 4);
+        qtest_writeb(qts, RADJ, (subtract ? 0x80 : 0x40) | 63);
+        g_assert_cmphex(qtest_readb(qts, RADJ), ==,
+                        (subtract ? 0x80 : 0x40) | 63);
+        qtest_clock_step(qts, deadline - SEC / 4 - 1);
+        g_assert_cmphex(qtest_readb(qts, RSECCNT), ==, 0);
+        g_assert_cmpuint(qtest_readb(qts, ICU_IR(VEC_CUP)), ==, 0);
+        g_assert_cmpuint(qtest_readb(qts, ICU_IR(VEC_ALM)), ==, 0);
+        g_assert_cmpuint(qtest_readb(qts, ICU_IR(VEC_PRD)), ==, 0);
+        qtest_clock_step(qts, 1);
+        g_assert_cmphex(qtest_readb(qts, RSECCNT), ==, 1);
+        g_assert_cmpuint(qtest_readb(qts, ICU_IR(VEC_CUP)), ==, 1);
+        g_assert_cmpuint(qtest_readb(qts, ICU_IR(VEC_ALM)), ==, 1);
+        g_assert_cmpuint(qtest_readb(qts, ICU_IR(VEC_PRD)), ==, 1);
+        /* Software adjustment is one-shot, even while RADJ is retained. */
+        qtest_clock_step(qts, SEC - 1);
+        g_assert_cmphex(qtest_readb(qts, RSECCNT), ==, 1);
+        qtest_clock_step(qts, 1);
+        g_assert_cmphex(qtest_readb(qts, RSECCNT), ==, 2);
+        qtest_quit(qts);
+    }
+}
+
+static void test_radj_single_cycle(void)
+{
+    QTestState *qts = rtc_init();
+    int64_t advance = source_cycles(128);
+
+    qtest_writeb(qts, RCR2, RCR2_CNTMD | RCR2_START);
+    for (unsigned i = 0; i < 128; i++) {
+        qtest_writeb(qts, RADJ, 0x41);
+        /* More than the minimum 320 source cycles between writes. */
+        qtest_clock_step(qts, 10 * MS);
+    }
+    qtest_clock_step(qts, 2 * SEC - 1280 * MS - advance - 1);
+    g_assert_cmphex(qtest_readb(qts, RSECCNT), ==, 1);
+    qtest_clock_step(qts, 1);
+    g_assert_cmphex(qtest_readb(qts, RSECCNT), ==, 2);
+    qtest_quit(qts);
+}
+
+static void test_radj_automatic(void)
+{
+    const uint8_t t0[7] = { 0x24, 1, 1, 1, 0, 0, 0 };
+
+    for (unsigned mode = 0; mode < 4; mode++) {
+        unsigned period = mode & 2 ? (mode & 1 ? 8 : 32) :
+                                    (mode & 1 ? 10 : 60);
+        uint8_t control = (mode & 2 ? RCR2_CNTMD : RCR2_HR24) |
+                          (mode & 1 ? RCR2_AADJP : 0) | RCR2_AADJE;
+
+        for (unsigned subtract = 0; subtract < 2; subtract++) {
+            QTestState *qts = rtc_init();
+            int64_t correction = subtract ? source_cycles(32) :
+                                           -(32 * SEC / 32768);
+            uint8_t expected = mode & 2 ? period + 1 :
+                               ((period + 1) % 60 / 10) * 16 +
+                               (period + 1) % 10;
+
+            set_time(qts, t0, control);
+            qtest_writeb(qts, RADJ, (subtract ? 0x80 : 0x40) | 32);
+            /* No immediate correction when AADJE is enabled. */
+            qtest_clock_step(qts, period * SEC - 1);
+            g_assert_cmphex(qtest_readb(qts, R64CNT), ==, 127);
+            qtest_clock_step(qts, 1);
+            g_assert_cmphex(qtest_readb(qts, R64CNT), ==, 0);
+            qtest_clock_step(qts, SEC + correction - 1);
+            g_assert_cmphex(qtest_readb(qts, RSECCNT), !=, expected);
+            qtest_clock_step(qts, 1);
+            g_assert_cmphex(qtest_readb(qts, RSECCNT), ==, expected);
+            /* The next automatic boundary applies the adjustment again. */
+            expected = mode & 2 ? 2 * period + 1 :
+                       ((2 * period + 1) % 60 / 10) * 16 +
+                       (2 * period + 1) % 10;
+            qtest_clock_step(qts, period * SEC +
+                             (subtract ? source_cycles(64) :
+                                         -source_cycles(64)) - correction - 1);
+            g_assert_cmphex(qtest_readb(qts, RSECCNT), !=, expected);
+            qtest_clock_step(qts, 1);
+            g_assert_cmphex(qtest_readb(qts, RSECCNT), ==, expected);
+            qtest_quit(qts);
+        }
+    }
+}
+
+static void test_radj_periodic_deadline(void)
+{
+    QTestState *qts = rtc_init();
+    const uint8_t t0[7] = { 0x24, 1, 1, 1, 0, 0, 9 };
+    int64_t deadline = 2 * SEC - 32 * SEC / 32768;
+
+    set_time(qts, t0, RCR2_HR24 | RCR2_AADJE | RCR2_AADJP);
+    qtest_writeb(qts, LCDM1, LCDM1_LCDON | LCDM1_BLON);
+    qtest_writeb(qts, RADJ, 0x60);
+    enable_irq(qts, VEC_PRD);
+    qtest_writeb(qts, RCR1, 0xf4); /* 2-second PRD, no CUP or ALM */
+    /* Adjustment at second 10 must reschedule the later PRD deadline. */
+    qtest_clock_step(qts, deadline - 1);
+    g_assert_cmpuint(qtest_readb(qts, ICU_IR(VEC_PRD)), ==, 0);
+    g_assert_false(qtest_qom_get_bool(qts, "/machine/mcu/lcdc",
+                                    "blink-phase"));
+    qtest_clock_step(qts, 1);
+    g_assert_cmpuint(qtest_readb(qts, ICU_IR(VEC_PRD)), ==, 1);
+    g_assert_true(qtest_qom_get_bool(qts, "/machine/mcu/lcdc", "blink-phase"));
+    qtest_quit(qts);
+}
+
+static void test_rtcout(void)
+{
+    const char *rtc = "/machine/mcu/rtc";
+
+    for (unsigned fast = 0; fast < 2; fast++) {
+        QTestState *qts = rtc_init();
+        int64_t half = fast ? SEC / 128 : SEC / 2;
+
+        qtest_writeb(qts, RCR1, fast ? RCR1_RTCOS : 0);
+        qtest_writeb(qts, RCR2, RCR2_RTCOE);
+        qtest_writeb(qts, RCR2, RCR2_RTCOE | RCR2_START);
+        for (unsigned edge = 0; edge < 6; edge++) {
+            g_assert_cmpint(qtest_qom_get_bool(qts, rtc, "rtcout"), ==,
+                            edge & 1);
+            qtest_clock_step(qts, half - 1);
+            g_assert_cmpint(qtest_qom_get_bool(qts, rtc, "rtcout"), ==,
+                            edge & 1);
+            qtest_clock_step(qts, 1);
+        }
+        /* Pause at a high phase, then resume without restarting it. */
+        qtest_clock_step(qts, half);
+        qtest_writeb(qts, RCR2, RCR2_RTCOE);
+        qtest_clock_step(qts, SEC);
+        g_assert_true(qtest_qom_get_bool(qts, rtc, "rtcout"));
+        qtest_writeb(qts, RCR2, 0);
+        g_assert_false(qtest_qom_get_bool(qts, rtc, "rtcout"));
+        qtest_writeb(qts, RCR2, RCR2_RTCOE);
+        g_assert_true(qtest_qom_get_bool(qts, rtc, "rtcout"));
+        qtest_writeb(qts, RCR2, RCR2_RTCOE | RCR2_START);
+        qtest_clock_step(qts, half);
+        g_assert_false(qtest_qom_get_bool(qts, rtc, "rtcout"));
+        qtest_clock_step(qts, half);
+        g_assert_true(qtest_qom_get_bool(qts, rtc, "rtcout"));
+        qtest_writeb(qts, RCR2, RCR2_START | RCR2_RTCOE | RCR2_RESET);
+        g_assert_false(qtest_qom_get_bool(qts, rtc, "rtcout"));
+        qtest_writeb(qts, RADJ, 0x60);
+        qtest_clock_step(qts, half - 32 * SEC / 32768 - 1);
+        g_assert_false(qtest_qom_get_bool(qts, rtc, "rtcout"));
+        qtest_clock_step(qts, 1);
+        g_assert_true(qtest_qom_get_bool(qts, rtc, "rtcout"));
+        qtest_system_reset(qts);
+        g_assert_false(qtest_qom_get_bool(qts, rtc, "rtcout"));
+        qtest_quit(qts);
+    }
+}
+
+static void test_radj_rtcout_reset(void)
+{
+    QTestState *qts = rtc_init();
+    const char *rtc = "/machine/mcu/rtc";
+    /* 32 cycles = 976562.5 ns. Two writes add an exact 1953125 ns. */
+    int64_t advance = source_cycles(64);
+
+    qtest_writeb(qts, RCR2, RCR2_RTCOE);
+    qtest_writeb(qts, RCR2, RCR2_RTCOE | RCR2_START);
+    qtest_writeb(qts, RADJ, 0x60);
+    qtest_clock_step(qts, SEC / 4);
+    qtest_writeb(qts, RADJ, 0x60);
+    qtest_clock_step(qts, SEC / 4 - advance - 1);
+    g_assert_false(qtest_qom_get_bool(qts, rtc, "rtcout"));
+    qtest_clock_step(qts, 1);
+    g_assert_true(qtest_qom_get_bool(qts, rtc, "rtcout"));
+    /* System reset retains the accumulated fractional prescaler phase. */
+    qtest_system_reset(qts);
+    qtest_clock_step(qts, SEC / 2);
+    g_assert_cmphex(qtest_readb(qts, RSECCNT), ==, 1);
+    qtest_writeb(qts, RCR2, RCR2_RESET | RCR2_START);
+    qtest_clock_step(qts, SEC - 1);
+    g_assert_cmphex(qtest_readb(qts, RSECCNT), ==, 1);
+    qtest_clock_step(qts, 1);
+    g_assert_cmphex(qtest_readb(qts, RSECCNT), ==, 2);
+    /* PMADJ=00 and ADJ=0 cause no adjustment. */
+    qtest_writeb(qts, RADJ, 0x3f);
+    qtest_writeb(qts, RADJ, 0x40);
+    qtest_clock_step(qts, SEC - 1);
+    g_assert_cmphex(qtest_readb(qts, RSECCNT), ==, 2);
+    qtest_clock_step(qts, 1);
+    g_assert_cmphex(qtest_readb(qts, RSECCNT), ==, 3);
+    qtest_writeb(qts, RADJ, 0x60);
+    qtest_writeb(qts, RCR2, RCR2_START | RCR2_ADJ30);
+    qtest_clock_step(qts, SEC - 1);
+    g_assert_cmphex(qtest_readb(qts, RSECCNT), ==, 0);
+    qtest_clock_step(qts, 1);
+    g_assert_cmphex(qtest_readb(qts, RSECCNT), ==, 1);
+    qtest_quit(qts);
+}
+
+static void test_rcr3(void)
+{
+    QTestState *qts = rtc_init();
+    const char *rtc = "/machine/mcu/rtc";
+
+    qtest_writeb(qts, RCR2, RCR2_START);
+    qtest_clock_step(qts, SEC / 4);
+    /* Withdraw SYSTEM's oscillator request at the RTC's input. */
+    qtest_set_irq_in(qts, rtc, "system-subclock", 0, 0);
+    g_assert_false(qtest_qom_get_bool(qts, rtc, "subclock-running"));
+    qtest_clock_step(qts, 2 * SEC);
+    g_assert_cmphex(qtest_readb(qts, RSECCNT), ==, 0);
+    g_assert_cmphex(qtest_readb(qts, R64CNT), ==, 32);
+    qtest_writeb(qts, RCR3, 1);
+    g_assert_true(qtest_qom_get_bool(qts, rtc, "subclock-running"));
+    qtest_clock_step(qts, 3 * SEC / 4);
+    g_assert_cmphex(qtest_readb(qts, RSECCNT), ==, 1);
+    /* All valid drive capacities leave the nominal frequency unchanged. */
+    for (unsigned drive = 0; drive <= 4; drive++) {
+        if (drive == 3) {
+            continue;
+        }
+        qtest_writeb(qts, RCR3, drive << 1);
+        qtest_writeb(qts, RCR3, (drive << 1) | 1);
+        qtest_clock_step(qts, SEC);
+        g_assert_cmphex(qtest_readb(qts, RSECCNT), ==,
+                        drive < 3 ? drive + 2 : 5);
+    }
+    qtest_set_irq_in(qts, rtc, "system-subclock", 0, 1);
+    qtest_writeb(qts, RCR3, 0);
+    g_assert_true(qtest_qom_get_bool(qts, rtc, "subclock-running"));
+    qtest_clock_step(qts, SEC);
+    g_assert_cmphex(qtest_readb(qts, RSECCNT), ==, 6);
+    qtest_quit(qts);
+}
+
+static void test_rcr3_system(void)
+{
+    QTestState *qts = rtc_init();
+    const char *rtc = "/machine/mcu/rtc";
+    const uint32_t sosccr = 0x80033;
+    const uint32_t prcr = 0x803fe;
+
+    g_assert_cmphex(qtest_readb(qts, sosccr), ==, 0);
+    qtest_writeb(qts, RCR2, RCR2_START);
+    qtest_clock_step(qts, SEC / 4);
+    /* Protected writes must not withdraw the SYSTEM oscillator request. */
+    qtest_writeb(qts, sosccr, 1);
+    g_assert_cmphex(qtest_readb(qts, sosccr), ==, 0);
+    g_assert_true(qtest_qom_get_bool(qts, rtc, "subclock-running"));
+    qtest_writew(qts, prcr, 0xa501);
+    qtest_writeb(qts, sosccr, 1);
+    g_assert_false(qtest_qom_get_bool(qts, rtc, "subclock-running"));
+    qtest_clock_step(qts, 2 * SEC);
+    g_assert_cmphex(qtest_readb(qts, RSECCNT), ==, 0);
+    g_assert_cmphex(qtest_readb(qts, R64CNT), ==, 32);
+    qtest_writeb(qts, RCR3, 1);
+    g_assert_true(qtest_qom_get_bool(qts, rtc, "subclock-running"));
+    qtest_clock_step(qts, 3 * SEC / 4);
+    g_assert_cmphex(qtest_readb(qts, RSECCNT), ==, 1);
+    qtest_writeb(qts, sosccr, 0);
+    qtest_writeb(qts, RCR3, 0);
+    qtest_clock_step(qts, SEC);
+    g_assert_cmphex(qtest_readb(qts, RSECCNT), ==, 2);
+    qtest_writeb(qts, sosccr, 1);
+    qtest_clock_step(qts, SEC);
+    g_assert_cmphex(qtest_readb(qts, RSECCNT), ==, 2);
+    /* System reset reasserts SYSTEM's request and retains RTC phase. */
+    qtest_system_reset(qts);
+    g_assert_cmphex(qtest_readb(qts, sosccr), ==, 0);
+    g_assert_true(qtest_qom_get_bool(qts, rtc, "subclock-running"));
+    qtest_clock_step(qts, SEC);
+    g_assert_cmphex(qtest_readb(qts, RSECCNT), ==, 3);
+    /* RTCEN survives reset even when SYSTEM was not requesting a clock. */
+    qtest_writew(qts, prcr, 0xa501);
+    qtest_writeb(qts, RCR3, 9);
+    qtest_writeb(qts, sosccr, 1);
+    qtest_clock_step(qts, SEC / 4);
+    qtest_system_reset(qts);
+    g_assert_cmphex(qtest_readb(qts, RCR3), ==, 9);
+    qtest_clock_step(qts, 3 * SEC / 4);
+    g_assert_cmphex(qtest_readb(qts, RSECCNT), ==, 4);
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -444,5 +748,14 @@ int main(int argc, char **argv)
     qtest_add_func("/rx113-rtc/system-reset-binary", test_system_reset_binary);
     qtest_add_func("/rx113-rtc/system-reset-stopped",
                    test_system_reset_stopped);
+    qtest_add_func("/rx113-rtc/radj-software", test_radj_software);
+    qtest_add_func("/rx113-rtc/radj-automatic", test_radj_automatic);
+    qtest_add_func("/rx113-rtc/radj-single-cycle", test_radj_single_cycle);
+    qtest_add_func("/rx113-rtc/rtcout", test_rtcout);
+    qtest_add_func("/rx113-rtc/radj-periodic-deadline",
+                   test_radj_periodic_deadline);
+    qtest_add_func("/rx113-rtc/radj-rtcout-reset", test_radj_rtcout_reset);
+    qtest_add_func("/rx113-rtc/rcr3", test_rcr3);
+    qtest_add_func("/rx113-rtc/rcr3-system", test_rcr3_system);
     return g_test_run();
 }

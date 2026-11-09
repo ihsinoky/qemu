@@ -8,15 +8,13 @@
  * 1/256 s step is 3906250 ns, so the 128 Hz reference clock, R64CNT and the
  * periodic interrupt periods (RCR1.PES) are exact.
  *
- * Register writes are applied immediately; the "wait until the bit has
- * changed" delays of 24.2 do not exist. Not modelled: the sub-clock
- * oscillator (RCR3 is retained for readback only), RTCOUT (RCR1.RTCOS and
- * RCR2.RTCOE are retained only), the time error adjustment (RADJ and
- * RCR2.AADJE/AADJP are retained only; they have no effect on the count),
- * and the CUP condition "carry to R64CNT while R64CNT is read" (24.4 (3));
- * CUP is raised only on the carry to the second counter/BCNT0. The counters
- * and reset-retained register bits keep their state across system resets
- * (24.2); undefined power-on values are initialized to zero.
+ * Register writes are applied immediately; count-source synchronization
+ * delays are not modelled. RADJ changes the prescaler at sub-clock cycle
+ * resolution (24.3.8). RTCOUT is observable through a read-only QOM property.
+ * The CUP condition "carry to R64CNT while R64CNT is read" (24.4 (3)) is
+ * not modelled; CUP is raised on the carry to the second counter/BCNT0.
+ * Counters and reset-retained bits survive system reset (24.2); undefined
+ * power-on values are initialized to zero.
  *
  * The ICU vectors are ALM = 92, PRD = 93 and CUP = 63 (Table 14.3). The PRD
  * is also delivered to the LCDC blinking input (34.4.2) through a second
@@ -76,12 +74,18 @@
 #define RCR2_STORED     (RCR2_START | RCR2_RTCOE | RCR2_AADJE | RCR2_AADJP | \
                          RCR2_HR24 | RCR2_CNTMD)
 
+#define RCR3_RTCEN      0x01
+
 #define HR_PM           0x40
 #define ALARM_ENB       0x80
 
 /* 24.1: the count source is divided into a 128 Hz reference clock */
 #define TICK_NS         (NANOSECONDS_PER_SECOND / 256)
 #define TICKS_PER_SEC   256
+/* 1/128 ns units represent both nanoseconds and 32768-Hz cycles exactly. */
+#define PHASE_SCALE     128
+#define TICK_UNITS      (TICK_NS * PHASE_SCALE)
+#define SUBCLK_UNITS    3906250LL
 
 static unsigned bcd2bin(uint8_t v)
 {
@@ -98,9 +102,15 @@ static bool rtc_binary_mode(RX113RTCState *s)
     return s->rcr2 & RCR2_CNTMD;
 }
 
+static bool rtc_subclock_running(RX113RTCState *s)
+{
+    /* 24.2.19: either SYSTEM or RTC can request sub-clock operation. */
+    return s->system_subclock || (s->rcr3 & RCR3_RTCEN);
+}
+
 static bool rtc_running(RX113RTCState *s)
 {
-    return s->rcr2 & RCR2_START;
+    return (s->rcr2 & RCR2_START) && rtc_subclock_running(s);
 }
 
 /* 24.2.17: PES = 0110b..1111b select 1/256 s..2 s; others disable PRD. */
@@ -250,6 +260,36 @@ static void rtc_alarm_check(RX113RTCState *s)
     s->alarm_match = match;
 }
 
+/* 24.2.20: PMADJ=01 adds cycles, PMADJ=10 subtracts cycles. */
+static void rtc_adjust(RX113RTCState *s)
+{
+    int64_t units = (s->radj & 0x3f) * SUBCLK_UNITS;
+
+    switch (s->radj >> 6) {
+    case 1:
+        s->phase_units += units;
+        break;
+    case 2:
+        s->phase_units -= units;
+        break;
+    default:
+        break;
+    }
+}
+
+static bool rtc_adjustment_due(RX113RTCState *s)
+{
+    bool short_period = s->rcr2 & RCR2_AADJP;
+
+    if (!(s->rcr2 & RCR2_AADJE)) {
+        return false;
+    }
+    if (rtc_binary_mode(s)) {
+        return !(s->bcnt & (short_period ? 7 : 31));
+    }
+    return bcd2bin(s->sec) % (short_period ? 10 : 60) == 0;
+}
+
 /* The prescaler overflows: the second counter or BCNT0 is incremented. */
 static void rtc_carry_second(RX113RTCState *s)
 {
@@ -262,6 +302,9 @@ static void rtc_carry_second(RX113RTCState *s)
         qemu_irq_pulse(s->cup);
     }
     rtc_alarm_check(s);
+    if (rtc_adjustment_due(s)) {
+        rtc_adjust(s);
+    }
 }
 
 static void rtc_tick(RX113RTCState *s)
@@ -314,7 +357,9 @@ static void rtc_update_timer(RX113RTCState *s)
     if (period) {
         ticks = period - (s->prd_phase & (period - 1));
     }
-    if (s->rcr1 & (RCR1_AIE | RCR1_CIE)) {
+    /* An automatic correction can move a later PRD deadline forward. */
+    if ((s->rcr1 & (RCR1_AIE | RCR1_CIE)) ||
+        (s->rcr2 & RCR2_AADJE)) {
         int64_t to_second = TICKS_PER_SEC - s->sub;
 
         if (ticks < 0 || to_second < ticks) {
@@ -324,7 +369,22 @@ static void rtc_update_timer(RX113RTCState *s)
     if (ticks < 0) {
         timer_del(&s->timer);
     } else {
-        timer_mod_ns(&s->timer, s->last_ns + ticks * TICK_NS);
+        int64_t units = ticks * TICK_UNITS - s->phase_units;
+
+        timer_mod_ns(&s->timer, s->last_ns +
+                     DIV_ROUND_UP(units, PHASE_SCALE));
+    }
+}
+
+/* Consume complete divider ticks, stopping at each adjustment boundary. */
+static void rtc_consume_phase(RX113RTCState *s)
+{
+    while (s->phase_units >= TICK_UNITS) {
+        unsigned ticks = MIN(s->phase_units / TICK_UNITS,
+                             TICKS_PER_SEC - s->sub);
+
+        s->phase_units -= ticks * TICK_UNITS;
+        rtc_advance(s, ticks);
     }
 }
 
@@ -332,17 +392,51 @@ static void rtc_update_timer(RX113RTCState *s)
 static void rtc_sync(RX113RTCState *s)
 {
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t elapsed = now - s->last_ns;
 
     if (rtc_running(s)) {
-        int64_t ticks = (now - s->last_ns) / TICK_NS;
+        /* Bounded chunks avoid overflowing the scaled time accumulator. */
+        while (elapsed > 0) {
+            int64_t ns = MIN(elapsed, NANOSECONDS_PER_SECOND);
 
-        if (ticks > 0) {
-            s->last_ns += ticks * TICK_NS;
-            rtc_advance(s, ticks);
+            s->phase_units += ns * PHASE_SCALE;
+            rtc_consume_phase(s);
+            elapsed -= ns;
         }
-    } else {
-        s->last_ns = now;
     }
+    s->last_ns = now;
+}
+
+/* Fork-local observability, like the LCDC's displayed-state properties. */
+static bool rtc_get_rtcout(Object *obj, Error **errp)
+{
+    RX113RTCState *s = RX113_RTC(obj);
+    unsigned bit = (s->rcr1 & RCR1_RTCOS) ? 1 : 7;
+
+    rtc_sync(s);
+    return (s->rcr2 & RCR2_RTCOE) && (s->sub & (1u << bit));
+}
+
+static bool rtc_get_subclock_running(Object *obj, Error **errp)
+{
+    return rtc_subclock_running(RX113_RTC(obj));
+}
+
+static void rtc_set_system_subclock(void *opaque, int n, int level)
+{
+    RX113RTCState *s = opaque;
+
+    /* Reset wiring must not emit interrupts while other devices reset. */
+    if (!device_is_in_reset(DEVICE(s))) {
+        rtc_sync(s);
+    } else if (!rtc_running(s)) {
+        s->last_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    }
+    s->system_subclock = level;
+    if (rtc_running(s) && !device_is_in_reset(DEVICE(s))) {
+        rtc_consume_phase(s);
+    }
+    rtc_update_timer(s);
 }
 
 static void rtc_timer_cb(void *opaque)
@@ -421,6 +515,7 @@ static void rtc_software_reset(RX113RTCState *s)
 {
     s->sub = 0;
     s->prd_phase = 0;
+    s->phase_units = 0;
     s->secar = s->minar = s->hourar = s->wdayar = 0;
     s->dayar = s->monar = s->yeararen = 0;
     s->yearar = 0;
@@ -439,6 +534,7 @@ static void rtc_adjust_30(RX113RTCState *s)
     s->sec = 0;
     s->sub = 0;
     s->prd_phase = 0;
+    s->phase_units = 0;
     if (round_up) {
         rtc_add_minute(s);
     }
@@ -576,11 +672,17 @@ static void rtc_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
         break;
     case RADJ:
         s->radj = v;
+        if (!(s->rcr2 & RCR2_AADJE)) {
+            rtc_adjust(s);
+        }
         break;
     case R64CNT:
     default:
         /* Read-only R64CNT, odd bytes and gaps ignore writes. */
         break;
+    }
+    if (rtc_running(s)) {
+        rtc_consume_phase(s);
     }
     rtc_update_timer(s);
 }
@@ -623,19 +725,33 @@ static void rtc_init(Object *obj)
     sysbus_init_irq(sbd, &s->cup);
     sysbus_init_irq(sbd, &s->prd_lcdc);
     timer_init_ns(&s->timer, QEMU_CLOCK_VIRTUAL, rtc_timer_cb, s);
+    /* SOSCCR.SOSTP resets to 0: SYSTEM initially requests the sub-clock. */
+    s->system_subclock = true;
+    qdev_init_gpio_in_named(DEVICE(obj), rtc_set_system_subclock,
+                           "system-subclock", 1);
+    object_property_add_bool(obj, "rtcout", rtc_get_rtcout, NULL);
+    object_property_add_bool(obj, "subclock-running",
+                             rtc_get_subclock_running, NULL);
     /* QOM zero-initializes the registers, including undefined power-on bits. */
     s->last_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 }
 
 static int rtc_post_load(void *opaque, int version_id)
 {
-    rtc_update_timer(opaque);
+    RX113RTCState *s = opaque;
+
+    if (version_id == 1) {
+        s->system_subclock = true;
+        /* Version 1's fractional tick remains in now - last_ns. */
+        s->phase_units = 0;
+    }
+    rtc_update_timer(s);
     return 0;
 }
 
 static const VMStateDescription vmstate_rx113_rtc = {
     .name = TYPE_RX113_RTC,
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .post_load = rtc_post_load,
     .fields = (const VMStateField[]) {
@@ -665,6 +781,8 @@ static const VMStateDescription vmstate_rx113_rtc = {
         VMSTATE_UINT16(prd_phase, RX113RTCState),
         VMSTATE_BOOL(alarm_match, RX113RTCState),
         VMSTATE_INT64(last_ns, RX113RTCState),
+        VMSTATE_INT64_V(phase_units, RX113RTCState, 2),
+        VMSTATE_BOOL_V(system_subclock, RX113RTCState, 2),
         VMSTATE_END_OF_LIST()
     },
 };
