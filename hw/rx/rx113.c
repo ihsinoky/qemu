@@ -17,6 +17,7 @@
 #include "hw/rx/rx113_rtc.h"
 #include "hw/rx/rx113_port.h"
 #include "hw/rx/rx113_iwdt.h"
+#include "hw/rx/rx113_mtu.h"
 #include "hw/misc/unimp.h"
 #include "hw/core/sysbus.h"
 #include "hw/core/irq.h"
@@ -199,6 +200,8 @@ static void rx113_system_update_clocks(RX113SystemState *s)
     }
     pclkb = source >> div;
 gates:
+    rx113_mtu_set_clock(s->mcu->mtu, pclkb,
+                        s->regs[SYS_MSTPCRA] & (1U << 9));
     for (i = 0; i < 2; i++) {
         renesas_cmt_set_clock(&s->mcu->cmt[i], pclkb,
                              s->regs[SYS_MSTPCRA] & (1U << (15 - i)));
@@ -709,7 +712,6 @@ static void register_stubs(void)
     } stubs[] = {
         { "rx113-dtc", 0x00082400, 0x10 },
         { "rx113-dac", 0x00088040, 0x10 },
-        { "rx113-mtu", 0x00088600, 0x300 },
         { "rx113-s12ad", 0x00089000, 0x100 },
         { "rx113-cac", 0x0008b000, 0x20 },
         { "rx113-doc", 0x0008b080, 0x10 },
@@ -762,6 +764,15 @@ static void rx113_realize(DeviceState *dev, Error **errp)
     register_system(s);
     register_icu(s);
     s->cpu.env.ack = qdev_get_gpio_in_named(DEVICE(&s->icu), "ack", 0);
+    s->mtu = qdev_new(TYPE_RX113_MTU);
+    object_property_add_child(OBJECT(s), "mtu", OBJECT(s->mtu));
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(s->mtu), &error_abort);
+    sysbus_mmio_map(SYS_BUS_DEVICE(s->mtu), 0, 0x00088600);
+    /* Table 14.3: all 28 MTU interrupts are consecutive edge sources. */
+    for (unsigned i = 0; i < RX113_MTU_IRQS; i++) {
+        sysbus_connect_irq(SYS_BUS_DEVICE(s->mtu), i,
+                           qdev_get_gpio_in(DEVICE(&s->icu), 114 + i));
+    }
     register_tmr(s, 0);
     register_tmr(s, 1);
     register_cmt(s, 0);
