@@ -28,6 +28,7 @@
 #include "hw/core/qdev-properties.h"
 #include "hw/timer/renesas_cmt.h"
 #include "migration/vmstate.h"
+#include "hw/timer/renesas_timer.h"
 
 /*
  *  +0 CMSTR - common control
@@ -51,10 +52,39 @@ REG16(CMCR, 0)
 REG16(CMCNT, 2)
 REG16(CMCOR, 4)
 
+static unsigned cmt_div(RCMTState *cmt, int ch)
+{
+    return 1 << (3 + FIELD_EX16(cmt->cmcr[ch], CMCR, CKS) * 2);
+}
+
+static void cmt_sync(RCMTState *cmt, int ch)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    if (!cmt->module_stopped && (cmt->cmstr & (1 << ch))) {
+        cmt->cmcnt[ch] += renesas_timer_ticks(now - cmt->tick[ch],
+                                             cmt->input_freq, cmt_div(cmt, ch),
+                                             &cmt->phase[ch]);
+    }
+    cmt->tick[ch] = now;
+}
+
 static void update_events(RCMTState *cmt, int ch)
 {
     int64_t next_time;
 
+    if (cmt->clock_managed) {
+        unsigned ticks = (uint16_t)(cmt->cmcor[ch] - cmt->cmcnt[ch]);
+
+        timer_del(&cmt->timer[ch]);
+        if (!cmt->module_stopped && (cmt->cmstr & (1 << ch))) {
+            timer_mod(&cmt->timer[ch],
+                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                      renesas_timer_delay(MAX(1, ticks), cmt->input_freq,
+                                          cmt_div(cmt, ch), cmt->phase[ch]));
+        }
+        return;
+    }
     if ((cmt->cmstr & (1 << ch)) == 0) {
         /* count disable, so not happened next event. */
         return;
@@ -78,6 +108,10 @@ static int64_t read_cmcnt(RCMTState *cmt, int ch)
 {
     int64_t delta, now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
+    if (cmt->clock_managed) {
+        cmt_sync(cmt, ch);
+        return cmt->cmcnt[ch];
+    }
     if (cmt->cmstr & (1 << ch)) {
         delta = (now - cmt->tick[ch]);
         delta /= NANOSECONDS_PER_SECOND;
@@ -96,6 +130,9 @@ static uint64_t cmt_read(void *opaque, hwaddr offset, unsigned size)
     int ch = offset / 0x08;
     uint64_t ret;
 
+    if (cmt->module_stopped) {
+        return 0;
+    }
     if (offset == A_CMSTR) {
         ret = 0;
         ret = FIELD_DP16(ret, CMSTR, STR,
@@ -128,6 +165,9 @@ static uint64_t cmt_read(void *opaque, hwaddr offset, unsigned size)
 
 static void start_stop(RCMTState *cmt, int ch, int st)
 {
+    if (cmt->clock_managed && !(cmt->cmstr & (1 << ch))) {
+        cmt->phase[ch] = 0;
+    }
     if (st) {
         update_events(cmt, ch);
     } else {
@@ -140,6 +180,13 @@ static void cmt_write(void *opaque, hwaddr offset, uint64_t val, unsigned size)
     RCMTState *cmt = opaque;
     int ch = offset / 0x08;
 
+    if (cmt->module_stopped) {
+        return;
+    }
+    if (cmt->clock_managed) {
+        cmt_sync(cmt, 0);
+        cmt_sync(cmt, 1);
+    }
     if (offset == A_CMSTR) {
         cmt->cmstr = FIELD_EX16(val, CMSTR, STR);
         start_stop(cmt, 0, FIELD_EX16(cmt->cmstr, CMSTR, STR0));
@@ -155,9 +202,14 @@ static void cmt_write(void *opaque, hwaddr offset, uint64_t val, unsigned size)
                                        FIELD_EX16(val, CMCR, CKS));
             cmt->cmcr[ch] = FIELD_DP16(cmt->cmcr[ch], CMCR, CMIE,
                                        FIELD_EX16(val, CMCR, CMIE));
+            if (cmt->clock_managed) {
+                cmt->phase[ch] %= (uint64_t)cmt_div(cmt, ch) *
+                                  NANOSECONDS_PER_SECOND;
+            }
             break;
         case 2:
             cmt->cmcnt[ch] = val;
+            cmt->phase[ch] = 0;
             break;
         case 4:
             cmt->cmcor[ch] = val;
@@ -177,7 +229,7 @@ static void cmt_write(void *opaque, hwaddr offset, uint64_t val, unsigned size)
 static const MemoryRegionOps cmt_ops = {
     .write = cmt_write,
     .read  = cmt_read,
-    .endianness = DEVICE_NATIVE_ENDIAN,
+    .endianness = DEVICE_LITTLE_ENDIAN,
     .impl = {
         .min_access_size = 2,
         .max_access_size = 2,
@@ -190,6 +242,9 @@ static const MemoryRegionOps cmt_ops = {
 
 static void timer_events(RCMTState *cmt, int ch)
 {
+    if (cmt->clock_managed) {
+        cmt_sync(cmt, ch);
+    }
     cmt->cmcnt[ch] = 0;
     cmt->tick[ch] = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     update_events(cmt, ch);
@@ -212,9 +267,45 @@ static void timer_event1(void *opaque)
     timer_events(cmt, 1);
 }
 
+void renesas_cmt_set_clock(RCMTState *cmt, uint64_t freq, bool stopped)
+{
+    int ch;
+
+    assert(freq && freq <= NANOSECONDS_PER_SECOND);
+    if (!cmt->legacy_input_freq) {
+        cmt->legacy_input_freq = cmt->input_freq;
+    }
+    if (cmt->clock_managed && cmt->input_freq == freq &&
+        cmt->module_stopped == stopped) {
+        return;
+    }
+    for (ch = 0; ch < CMT_CH; ch++) {
+        if (cmt->clock_managed) {
+            cmt_sync(cmt, ch);
+        } else {
+            cmt->cmcnt[ch] = read_cmcnt(cmt, ch);
+            cmt->tick[ch] = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        }
+    }
+    cmt->clock_managed = true;
+    cmt->input_freq = freq;
+    cmt->module_stopped = stopped;
+    for (ch = 0; ch < CMT_CH; ch++) {
+        update_events(cmt, ch);
+    }
+}
+
 static void rcmt_reset(DeviceState *dev)
 {
     RCMTState *cmt = RCMT(dev);
+
+    if (cmt->clock_managed) {
+        for (int ch = 0; ch < CMT_CH; ch++) {
+            timer_del(&cmt->timer[ch]);
+            cmt->phase[ch] = 0;
+            cmt->tick[ch] = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        }
+    }
     cmt->cmstr = 0;
     cmt->cmcr[0] = cmt->cmcr[1] = 0;
     cmt->cmcnt[0] = cmt->cmcnt[1] = 0;
@@ -238,10 +329,62 @@ static void rcmt_init(Object *obj)
     timer_init_ns(&cmt->timer[1], QEMU_CLOCK_VIRTUAL, timer_event1, cmt);
 }
 
+static int cmt_pre_load(void *opaque)
+{
+    RCMTState *s = opaque;
+
+    /* An absent clock subsection selects the original realization clock. */
+    if (s->legacy_input_freq) {
+        s->input_freq = s->legacy_input_freq;
+    }
+    s->clock_managed = false;
+    s->module_stopped = false;
+    return 0;
+}
+
+static int cmt_clock_post_load(void *opaque, int version_id)
+{
+    RCMTState *s = opaque;
+
+    if (!s->clock_managed || !s->input_freq ||
+        s->input_freq > NANOSECONDS_PER_SECOND) {
+        return -EINVAL;
+    }
+    for (int ch = 0; ch < CMT_CH; ch++) {
+        if (s->phase[ch] >= 512ULL * NANOSECONDS_PER_SECOND) {
+            return -EINVAL;
+        }
+    }
+    return 0;
+}
+
+static bool cmt_clock_needed(void *opaque)
+{
+    RCMTState *s = opaque;
+
+    return s->clock_managed;
+}
+
+static const VMStateDescription vmstate_cmt_clock = {
+    .name = "rx-cmt/clock",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = cmt_clock_needed,
+    .post_load = cmt_clock_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_BOOL(clock_managed, RCMTState),
+        VMSTATE_BOOL(module_stopped, RCMTState),
+        VMSTATE_UINT64(input_freq, RCMTState),
+        VMSTATE_UINT64_ARRAY(phase, RCMTState, CMT_CH),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static const VMStateDescription vmstate_rcmt = {
     .name = "rx-cmt",
     .version_id = 1,
     .minimum_version_id = 1,
+    .pre_load = cmt_pre_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT16(cmstr, RCMTState),
         VMSTATE_UINT16_ARRAY(cmcr, RCMTState, CMT_CH),
@@ -250,7 +393,11 @@ static const VMStateDescription vmstate_rcmt = {
         VMSTATE_INT64_ARRAY(tick, RCMTState, CMT_CH),
         VMSTATE_TIMER_ARRAY(timer, RCMTState, CMT_CH),
         VMSTATE_END_OF_LIST()
-    }
+    },
+    .subsections = (const VMStateDescription * const[]) {
+        &vmstate_cmt_clock,
+        NULL
+    },
 };
 
 static const Property rcmt_properties[] = {

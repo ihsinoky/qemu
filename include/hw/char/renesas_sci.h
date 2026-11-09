@@ -48,7 +48,26 @@ struct RSCIState {
     uint8_t read_ssr;
     int64_t trtime;
     int64_t rx_next;
+    /* Set only by renesas_sci_set_clock(); legacy behavior is the default. */
+    QEMUTimer rx_timer;
+    /* Remaining work in billionths of an input cycle, not wall time. */
+    int64_t clock_tick;
+    int64_t tx_remaining;
+    int64_t rx_remaining;
+    bool tx_pending;
+    uint64_t legacy_input_freq;
+    bool clock_managed;
+    bool module_stopped;
     uint64_t input_freq;
 };
+
+/*
+ * Opt in under the BQL after realization, before guest execution starts.
+ * Subsequent calls update running or stopped modules at runtime.
+ * freq is a nonzero input clock in Hz, at most 1 GHz; stop retains state
+ * and blocks MMIO (reads return zero). The legacy input-freq property
+ * remains realization-only. Subsequent reset retains this clock policy.
+ */
+void renesas_sci_set_clock(RSCIState *s, uint64_t freq, bool stopped);
 
 #endif

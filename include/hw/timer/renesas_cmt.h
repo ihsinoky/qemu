@@ -28,6 +28,11 @@ struct RCMTState {
     SysBusDevice parent_obj;
     /*< public >*/
 
+    /* Set only by renesas_cmt_set_clock(); legacy behavior is the default. */
+    uint64_t phase[CMT_CH];
+    uint64_t legacy_input_freq;
+    bool clock_managed;
+    bool module_stopped;
     uint64_t input_freq;
     MemoryRegion memory;
 
@@ -39,5 +44,14 @@ struct RCMTState {
     qemu_irq cmi[CMT_CH];
     QEMUTimer timer[CMT_CH];
 };
+
+/*
+ * Opt in under the BQL after realization, before guest execution starts.
+ * Subsequent calls update running or stopped modules at runtime.
+ * freq is a nonzero input clock in Hz, at most 1 GHz; stop retains state
+ * and blocks MMIO (reads return zero). The legacy input-freq property
+ * remains realization-only. Subsequent reset retains this clock policy.
+ */
+void renesas_cmt_set_clock(RCMTState *s, uint64_t freq, bool stopped);
 
 #endif

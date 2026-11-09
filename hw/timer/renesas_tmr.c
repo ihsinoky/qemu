@@ -28,6 +28,7 @@
 #include "hw/core/qdev-properties.h"
 #include "hw/timer/renesas_tmr.h"
 #include "migration/vmstate.h"
+#include "hw/timer/renesas_timer.h"
 
 REG8(TCR, 0)
   FIELD(TCR, CCLR,  3, 2)
@@ -60,12 +61,137 @@ static uint8_t concat_reg(uint8_t *reg)
     return (reg[0] << 8) | reg[1];
 }
 
+/* The managed path keeps counter epochs independent for the two channels. */
+static bool tmr_wide(RTMRState *s)
+{
+    return FIELD_EX8(s->tccr[0], TCCR, CSS) == CSS_CASCADING;
+}
+
+static unsigned tmr_div(RTMRState *s, int ch)
+{
+    if (tmr_wide(s)) {
+        if (ch || FIELD_EX8(s->tccr[1], TCCR, CSS) != CSS_INTERNAL) {
+            return 0;
+        }
+        return clkdiv[FIELD_EX8(s->tccr[1], TCCR, CKS)];
+    }
+    if (FIELD_EX8(s->tccr[ch], TCCR, CSS) != CSS_INTERNAL) {
+        return 0;
+    }
+    return clkdiv[FIELD_EX8(s->tccr[ch], TCCR, CKS)];
+}
+
+static uint16_t tmr_count(uint8_t *r, bool wide, int ch)
+{
+    return wide ? (r[0] << 8) | r[1] : r[ch];
+}
+
+static void tmr_sync(RTMRState *s)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int ch;
+
+    for (ch = 0; ch < TMR_CH; ch++) {
+        unsigned div = tmr_div(s, ch);
+
+        if (!s->module_stopped && div) {
+            uint64_t ticks = renesas_timer_ticks(now - s->clock_tick[ch],
+                                                s->input_freq, div,
+                                                &s->phase[ch]);
+            if (tmr_wide(s)) {
+                uint16_t count = tmr_count(s->tcnt, true, 0) + ticks;
+
+                s->tcnt[0] = count >> 8;
+                s->tcnt[1] = count;
+            } else {
+                s->tcnt[ch] += ticks;
+            }
+        }
+        s->clock_tick[ch] = now;
+    }
+}
+
+static void tmr_schedule(RTMRState *s, int ch)
+{
+    unsigned div = tmr_div(s, ch);
+    bool wide = tmr_wide(s);
+    uint32_t modulus = wide ? 0x10000 : 0x100;
+    uint32_t count = tmr_count(s->tcnt, wide, ch);
+    uint32_t a = (tmr_count(s->tcora, wide, ch) - count) & (modulus - 1);
+    uint32_t b = (tmr_count(s->tcorb, wide, ch) - count) & (modulus - 1);
+    uint32_t overflow = modulus - count;
+    uint32_t ticks;
+
+    timer_del(&s->timer[ch]);
+    if (!div || s->module_stopped) {
+        return;
+    }
+    a = a ? a : modulus;
+    b = b ? b : modulus;
+    ticks = MIN(MIN(a, b), overflow);
+    s->clock_event[ch] = (a == ticks ? 1 : 0) |
+                         (b == ticks ? 2 : 0) | (overflow == ticks ? 4 : 0);
+    timer_mod(&s->timer[ch], qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+              renesas_timer_delay(ticks, s->input_freq, div, s->phase[ch]));
+}
+
+static void tmr_match(RTMRState *s, int ch, unsigned events)
+{
+    unsigned clear = FIELD_EX8(s->tcr[ch], TCR, CCLR);
+
+    if ((events & 1) && FIELD_EX8(s->tcr[ch], TCR, CMIEA)) {
+        qemu_irq_pulse(s->cmia[ch]);
+    }
+    if ((events & 2) && FIELD_EX8(s->tcr[ch], TCR, CMIEB)) {
+        qemu_irq_pulse(s->cmib[ch]);
+    }
+    if ((events & 4) && FIELD_EX8(s->tcr[ch], TCR, OVIE)) {
+        qemu_irq_pulse(s->ovi[ch]);
+    }
+    if ((clear == CCLR_A && (events & 1)) ||
+        (clear == CCLR_B && (events & 2))) {
+        s->tcnt[ch] = 0;
+        if (tmr_wide(s)) {
+            s->tcnt[1] = 0;
+        }
+    }
+}
+
+static void tmr_clock_event(RTMRState *s, int ch)
+{
+    unsigned events = s->clock_event[ch];
+
+    tmr_sync(s);
+    tmr_match(s, ch, events);
+    if (!tmr_wide(s) && ch == 0 && (events & 1) &&
+        FIELD_EX8(s->tccr[1], TCCR, CSS) == CSS_CASCADING) {
+        unsigned cascaded = 0;
+
+        s->tcnt[1]++;
+        if (s->tcnt[1] == s->tcora[1]) {
+            cascaded |= 1;
+        }
+        if (s->tcnt[1] == s->tcorb[1]) {
+            cascaded |= 2;
+        }
+        if (!s->tcnt[1]) {
+            cascaded |= 4;
+        }
+        tmr_match(s, 1, cascaded);
+    }
+    tmr_schedule(s, ch);
+}
+
 static void update_events(RTMRState *tmr, int ch)
 {
     uint16_t diff[TMR_NR_EVENTS], min;
     int64_t next_time;
     int i, event;
 
+    if (tmr->clock_managed) {
+        tmr_schedule(tmr, ch);
+        return;
+    }
     if (tmr->tccr[ch] == 0) {
         return;
     }
@@ -128,6 +254,10 @@ static uint16_t read_tcnt(RTMRState *tmr, unsigned size, int ch)
     uint16_t tcnt[2];
     uint32_t ret;
 
+    if (tmr->clock_managed) {
+        tmr_sync(tmr);
+        return tmr_count(tmr->tcnt, size == 2, ch);
+    }
     delta = (now - tmr->tick) * NANOSECONDS_PER_SECOND / tmr->input_freq;
     if (delta > 0) {
         tmr->tick = now;
@@ -196,6 +326,9 @@ static uint64_t tmr_read(void *opaque, hwaddr addr, unsigned size)
     int ch = addr & 1;
     uint64_t ret;
 
+    if (tmr->module_stopped) {
+        return 0;
+    }
     if (size == 2 && (ch != 0 || addr == A_TCR || addr == A_TCSR)) {
         qemu_log_mask(LOG_GUEST_ERROR, "renesas_tmr: Invalid read size 0x%"
                                        HWADDR_PRIX "\n",
@@ -279,11 +412,23 @@ static void tmr_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
     RTMRState *tmr = opaque;
     int ch = addr & 1;
 
+    if (tmr->module_stopped) {
+        return;
+    }
+    if (tmr->clock_managed) {
+        tmr_sync(tmr);
+    }
     if (size == 2 && (ch != 0 || addr == A_TCR || addr == A_TCSR)) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "renesas_tmr: Invalid write size 0x%" HWADDR_PRIX "\n",
                       addr);
         return;
+    }
+    if (tmr->clock_managed && (addr & 0x0e) == A_TCNT) {
+        tmr->phase[ch] = 0;
+        if (size == 2 || tmr_wide(tmr)) {
+            tmr->phase[0] = tmr->phase[1] = 0;
+        }
     }
     switch (addr & 0x0e) {
     case A_TCR:
@@ -309,6 +454,16 @@ static void tmr_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
                                  " not implemented\n",
                       addr);
         break;
+    }
+    if (tmr->clock_managed) {
+        for (int i = 0; i < TMR_CH; i++) {
+            unsigned div = tmr_div(tmr, i);
+
+            if (div) {
+                tmr->phase[i] %= (uint64_t)div * NANOSECONDS_PER_SECOND;
+            }
+            tmr_schedule(tmr, i);
+        }
     }
 }
 
@@ -376,6 +531,10 @@ static void timer_events(RTMRState *tmr, int ch)
 {
     uint16_t tcnt;
 
+    if (tmr->clock_managed) {
+        tmr_clock_event(tmr, ch);
+        return;
+    }
     tmr->tcnt[ch] = read_tcnt(tmr, 1, ch);
     if (FIELD_EX8(tmr->tccr[0], TCCR, CSS) != CSS_CASCADING) {
         tmr->tcnt[ch] = issue_event(tmr, ch, 8,
@@ -410,9 +569,48 @@ static void timer_event1(void *opaque)
     timer_events(tmr, 1);
 }
 
+void renesas_tmr_set_clock(RTMRState *s, uint64_t freq, bool stopped)
+{
+    int ch;
+
+    assert(freq && freq <= NANOSECONDS_PER_SECOND);
+    if (!s->legacy_input_freq) {
+        s->legacy_input_freq = s->input_freq;
+    }
+    if (s->clock_managed && s->input_freq == freq &&
+        s->module_stopped == stopped) {
+        return;
+    }
+    if (s->clock_managed) {
+        tmr_sync(s);
+    } else {
+        uint16_t count = read_tcnt(s, 2, 0);
+
+        s->tcnt[0] = count >> 8;
+        s->tcnt[1] = count;
+        for (ch = 0; ch < TMR_CH; ch++) {
+            s->clock_tick[ch] = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        }
+    }
+    s->clock_managed = true;
+    s->input_freq = freq;
+    s->module_stopped = stopped;
+    for (ch = 0; ch < TMR_CH; ch++) {
+        tmr_schedule(s, ch);
+    }
+}
+
 static void rtmr_reset(DeviceState *dev)
 {
     RTMRState *tmr = RTMR(dev);
+
+    if (tmr->clock_managed) {
+        for (int ch = 0; ch < TMR_CH; ch++) {
+            timer_del(&tmr->timer[ch]);
+            tmr->phase[ch] = 0;
+            tmr->clock_tick[ch] = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        }
+    }
     tmr->tcr[0]   = tmr->tcr[1]   = 0x00;
     tmr->tcsr[0]  = 0x00;
     tmr->tcsr[1]  = 0x10;
@@ -443,10 +641,64 @@ static void rtmr_init(Object *obj)
     timer_init_ns(&tmr->timer[1], QEMU_CLOCK_VIRTUAL, timer_event1, tmr);
 }
 
+static int tmr_pre_load(void *opaque)
+{
+    RTMRState *s = opaque;
+
+    /* An absent clock subsection selects the original realization clock. */
+    if (s->legacy_input_freq) {
+        s->input_freq = s->legacy_input_freq;
+    }
+    s->clock_managed = false;
+    s->module_stopped = false;
+    return 0;
+}
+
+static int tmr_clock_post_load(void *opaque, int version_id)
+{
+    RTMRState *s = opaque;
+
+    if (!s->clock_managed || !s->input_freq ||
+        s->input_freq > NANOSECONDS_PER_SECOND) {
+        return -EINVAL;
+    }
+    for (int ch = 0; ch < TMR_CH; ch++) {
+        if (s->phase[ch] >= 8192ULL * NANOSECONDS_PER_SECOND) {
+            return -EINVAL;
+        }
+    }
+    return 0;
+}
+
+static bool tmr_clock_needed(void *opaque)
+{
+    RTMRState *s = opaque;
+
+    return s->clock_managed;
+}
+
+static const VMStateDescription vmstate_tmr_clock = {
+    .name = "rx-tmr/clock",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = tmr_clock_needed,
+    .post_load = tmr_clock_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_BOOL(clock_managed, RTMRState),
+        VMSTATE_BOOL(module_stopped, RTMRState),
+        VMSTATE_UINT64(input_freq, RTMRState),
+        VMSTATE_UINT64_ARRAY(phase, RTMRState, TMR_CH),
+        VMSTATE_INT64_ARRAY(clock_tick, RTMRState, TMR_CH),
+        VMSTATE_UINT8_ARRAY(clock_event, RTMRState, TMR_CH),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static const VMStateDescription vmstate_rtmr = {
     .name = "rx-tmr",
     .version_id = 1,
     .minimum_version_id = 1,
+    .pre_load = tmr_pre_load,
     .fields = (const VMStateField[]) {
         VMSTATE_INT64(tick, RTMRState),
         VMSTATE_UINT8_ARRAY(tcnt, RTMRState, TMR_CH),
@@ -460,7 +712,11 @@ static const VMStateDescription vmstate_rtmr = {
         VMSTATE_UINT8_ARRAY(next, RTMRState, TMR_CH),
         VMSTATE_TIMER_ARRAY(timer, RTMRState, TMR_CH),
         VMSTATE_END_OF_LIST()
-    }
+    },
+    .subsections = (const VMStateDescription * const[]) {
+        &vmstate_tmr_clock,
+        NULL
+    },
 };
 
 static const Property rtmr_properties[] = {
