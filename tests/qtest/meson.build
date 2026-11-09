@@ -152,7 +152,8 @@ qtests_avr = [ 'boot-serial-test' ]
 qtests_rx = (config_all_devices.has_key('CONFIG_RX_ICU') ? ['rx-icu-test'] : []) + \
   (config_all_devices.has_key('CONFIG_RX113') ?
     ['rx113-lcdc-test', 'rx113-rtc-test', 'rx113-port-test',
-     'rx113-clock-test', 'rx113-sci-test', 'rx113-iwdt-test'] : [])
+     'rx113-clock-test', 'rx113-sci-test', 'rx113-iwdt-test',
+     'rx113-mtu-test'] : [])
 
 qtests_hppa = \
   qtests_filter + \
