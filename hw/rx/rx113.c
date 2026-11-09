@@ -50,7 +50,7 @@
 #define RTC_ALM         92
 #define RTC_PRD         93
 
-/* Fixed PCLKB until SYSTEM clock control is modeled. */
+/* Initial realization property; SYSTEM supplies the live clock at reset. */
 #define RX113_PCLKB_HZ (32 * 1000 * 1000)
 
 struct RX113Class {
@@ -68,8 +68,7 @@ DECLARE_CLASS_CHECKERS(RX113Class, RX113_MCU,
 
 /*
  * Minimal RX113 SYSTEM startup registers, R01UH0448EJ0120 Rev.1.20.
- * Clock selections and module-stop bits are retained for readback only:
- * peripheral clocks remain fixed and module-stop does not gate devices.
+ * PCLKB and module-stop updates use the shared peripherals' opt-in APIs.
  */
 #define TYPE_RX113_SYSTEM "rx113-system"
 OBJECT_DECLARE_SIMPLE_TYPE(RX113SystemState, RX113_SYSTEM)
@@ -79,7 +78,7 @@ enum {
     SYS_MSTPCRB, SYS_SCKCR, SYS_SCKCR3, SYS_PLLCR, SYS_PLLCR2,
     SYS_UPLLCR, SYS_UPLLCR2, SYS_MOSCCR, SYS_SOSCCR, SYS_LOCOCR,
     SYS_HOCOCR, SYS_MOSCWTCR, SYS_HOCOWTCR, SYS_PRCR, SYS_MOFCR,
-    SYS_REG_COUNT,
+    SYS_MSTPCRA, SYS_REG_COUNT,
 };
 
 static const struct {
@@ -89,7 +88,8 @@ static const struct {
     uint32_t mask;
     unsigned protect;
 } system_regs[SYS_REG_COUNT] = {
-    /* §11.2.3: reserved bits read as one; PRC1 protects module stop. */
+    /* §11.2.2-3: reserved bits read as one; PRC1 protects module stop. */
+    [SYS_MSTPCRA] = { 0x10, 4, 0xefffffff, 0x1006c230, 2 },
     [SYS_MSTPCRB] = { 0x14, 4, 0xffffffff, 0xe6aa0650, 2 },
     /* §9.2.1-6: clock selections; PRC0 protects these registers. */
     [SYS_SCKCR] = { 0x20, 4, 0x33000303, 0xff000f0f, 1 },
@@ -132,7 +132,64 @@ struct RX113SystemState {
     int64_t deadline[OSC_COUNT];
     QEMUTimer *osc_timer;
     qemu_irq subclock;
+    RX113State *mcu;
+    uint64_t main_clock_hz;
 };
+
+/* §9.2.1-3, §9.7.2: UPLL feeds UCLK and never PCLKB. */
+static void rx113_system_update_clocks(RX113SystemState *s)
+{
+    static const unsigned sci_stop[] = { 31, 30, 29, 26, 25, 4 };
+    uint64_t source, pclkb = s->mcu->cmt[0].input_freq;
+    unsigned div = extract32(s->regs[SYS_SCKCR], 8, 4);
+    unsigned select = extract32(s->regs[SYS_SCKCR3], 8, 3);
+    unsigned i;
+
+    switch (select) {
+    case 0:
+        source = 4000000; /* nominal LOCO */
+        break;
+    case 1:
+        source = 32000000; /* HOCO */
+        break;
+    case 2:
+        source = s->main_clock_hz;
+        break;
+    case 3:
+        source = 32768; /* sub-clock crystal */
+        break;
+    case 4: {
+        unsigned plidiv = extract32(s->regs[SYS_PLLCR], 0, 2);
+        unsigned stc = extract32(s->regs[SYS_PLLCR], 8, 6);
+
+        if (plidiv > 2 || (stc != 0x0b && stc != 0x0f)) {
+            qemu_log_mask(LOG_GUEST_ERROR, "rx113: prohibited PLL setting\n");
+            goto gates;
+        }
+        source = (s->main_clock_hz >> plidiv) * (stc == 0x0b ? 6 : 8);
+        break;
+    }
+    default:
+        qemu_log_mask(LOG_GUEST_ERROR, "rx113: prohibited clock source\n");
+        goto gates;
+    }
+    if (div > 6) {
+        qemu_log_mask(LOG_GUEST_ERROR, "rx113: prohibited PCLKB divider\n");
+        goto gates;
+    }
+    pclkb = source >> div;
+gates:
+    for (i = 0; i < 2; i++) {
+        renesas_cmt_set_clock(&s->mcu->cmt[i], pclkb,
+                             s->regs[SYS_MSTPCRA] & (1U << (15 - i)));
+        renesas_tmr_set_clock(&s->mcu->tmr[i], pclkb,
+                             s->regs[SYS_MSTPCRA] & (1U << (5 - i)));
+    }
+    for (i = 0; i < ARRAY_SIZE(sci_stop); i++) {
+        renesas_sci_set_clock(&s->mcu->sci[i], pclkb,
+                             s->regs[SYS_MSTPCRB] & (1U << sci_stop[i]));
+    }
+}
 
 /* Nominal LOCO is 4 MHz, even when LOCOCR.LOSTP is set (§9.2.17-18). */
 static int64_t rx113_system_wait_ns(RX113SystemState *s, unsigned osc)
@@ -244,6 +301,10 @@ static void rx113_system_write(void *opaque, hwaddr addr, uint64_t value,
 
             s->regs[i] = (value & mask) | (system_regs[i].reset & ~mask);
             rx113_system_update_oscillators(s);
+            if (i == SYS_SCKCR || i == SYS_SCKCR3 || i == SYS_PLLCR ||
+                i == SYS_MSTPCRA || i == SYS_MSTPCRB) {
+                rx113_system_update_clocks(s);
+            }
             if (i == SYS_SOSCCR) {
                 qemu_set_irq(s->subclock, !(s->regs[SYS_SOSCCR] & 1));
             }
@@ -313,6 +374,7 @@ static void rx113_system_reset_exit(Object *obj, ResetType type)
     s->regs[SYS_HOCOCR] = (ldl_le_p(flash + flash_size - 0x78) >> 8) & 1;
     /* §9.2.18 note 2: hardware secures tHOCO before CPU reset release. */
     s->oscovfsr = s->regs[SYS_HOCOCR] ? 0 : 8;
+    rx113_system_update_clocks(s);
     qemu_set_irq(s->subclock, !(s->regs[SYS_SOSCCR] & 1));
 }
 
@@ -361,11 +423,13 @@ static int rx113_system_post_load(void *opaque, int version_id)
 
 static const VMStateDescription vmstate_rx113_system = {
     .name = TYPE_RX113_SYSTEM,
-    .version_id = 2,
+    .version_id = 3,
     .minimum_version_id = 1,
     .post_load = rx113_system_post_load,
     .fields = (const VMStateField[]) {
-        VMSTATE_UINT32_ARRAY(regs, RX113SystemState, SYS_REG_COUNT),
+        /* Keep the original array layout for incoming v1/v2 streams. */
+        VMSTATE_UINT32_SUB_ARRAY(regs, RX113SystemState, 0, SYS_MSTPCRA),
+        VMSTATE_UINT32_V(regs[SYS_MSTPCRA], RX113SystemState, 3),
         VMSTATE_UINT8_V(oscovfsr, RX113SystemState, 2),
         VMSTATE_INT64_ARRAY_V(deadline, RX113SystemState, OSC_COUNT, 2),
         VMSTATE_TIMER_PTR_V(osc_timer, RX113SystemState, 2),
@@ -391,6 +455,8 @@ static void register_system(RX113State *s)
 
     object_property_add_child(OBJECT(s), "system", OBJECT(dev));
     sys->flash = &s->c_flash;
+    sys->mcu = s;
+    sys->main_clock_hz = s->main_clock_hz;
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_abort);
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, 0x00080000);
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 1, 0x0008c290);
@@ -651,6 +717,11 @@ static void rx113_realize(DeviceState *dev, Error **errp)
     memory_region_add_subregion(s->sysmem, (1ULL << 32) - rxc->rom_flash_size,
                                 &s->c_flash);
 
+    if (s->main_clock_hz < 64 || s->main_clock_hz > 20000000) {
+        error_setg(errp, "RX113 main-clock-hz must be between 64 and 20000000");
+        return;
+    }
+
     /* Initialize CPU */
     object_initialize_child(OBJECT(s), "cpu", &s->cpu, TYPE_RX113_CPU);
     qdev_realize(DEVICE(&s->cpu), NULL, &error_abort);
@@ -671,6 +742,8 @@ static void rx113_realize(DeviceState *dev, Error **errp)
 }
 
 static const Property rx113_properties[] = {
+    /* Explicit board crystal assumption, matching the FIT generic RX113 BSP. */
+    DEFINE_PROP_UINT64("main-clock-hz", RX113State, main_clock_hz, 16000000),
     DEFINE_PROP_LINK("main-bus", RX113State, sysmem, TYPE_MEMORY_REGION,
                      MemoryRegion *),
 };

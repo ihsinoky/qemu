@@ -14,8 +14,13 @@ class RX113Machine(QemuSystemTest):
     FLASH_SIZE = 512 * 1024
     RAM_SIZE = 64 * 1024
     MACHINE = 'rx113-r5f51138'
+    # Unlock PRC1, release SCI0 module stop, then relock.
     # mov.l #0x8a000,r1; mov.b #0x20,2[r1]; mov.b #'R',3[r1]; bra.b .
-    PROGRAM = bytes.fromhex('fb1200a00800 f9140220 f9140352 2e00')
+    SCI_ENABLE = bytes.fromhex(
+        'fb1efe0308f81902a5fb1e140008f812ffffff7f'
+        'fb1efe0308f81900a5')
+    PROGRAM = SCI_ENABLE + bytes.fromhex(
+        'fb1200a00800 f9140220 f9140352 2e00')
 
     def make_elf(self):
         path = self.scratch_file('rx113.elf')
@@ -50,7 +55,9 @@ class RX113Machine(QemuSystemTest):
         self.vm.cmd('stop')
         registers = self.vm.cmd('human-monitor-command',
                                 command_line='info registers')
-        self.assertIn(f'pc=0x{self.FLASH_BASE + 14:08x}', registers.lower())
+        self.assertIn(
+            f'pc=0x{self.FLASH_BASE + len(self.PROGRAM) - 2:08x}',
+            registers.lower())
         self.vm.cmd('system_reset')
         self.vm.cmd('cont')
         wait_for_console_pattern(self, 'R')

@@ -36,6 +36,13 @@ struct RTMRState {
     SysBusDevice parent_obj;
     /*< public >*/
 
+    /* Set only by renesas_tmr_set_clock(); legacy behavior is the default. */
+    int64_t clock_tick[TMR_CH];
+    uint8_t clock_event[TMR_CH];
+    uint64_t phase[TMR_CH];
+    uint64_t legacy_input_freq;
+    bool clock_managed;
+    bool module_stopped;
     uint64_t input_freq;
     MemoryRegion memory;
 
@@ -54,5 +61,14 @@ struct RTMRState {
     qemu_irq ovi[TMR_CH];
     QEMUTimer timer[TMR_CH];
 };
+
+/*
+ * Opt in under the BQL after realization, before guest execution starts.
+ * Subsequent calls update running or stopped modules at runtime.
+ * freq is a nonzero input clock in Hz, at most 1 GHz; stop retains state
+ * and blocks MMIO (reads return zero). The legacy input-freq property
+ * remains realization-only. Subsequent reset retains this clock policy.
+ */
+void renesas_tmr_set_clock(RTMRState *s, uint64_t freq, bool stopped);
 
 #endif

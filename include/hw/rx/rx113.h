@@ -32,6 +32,7 @@ struct RX113State {
     RCMTState cmt[2];
     RSCIState sci[6];
 
+    uint64_t main_clock_hz;
     MemoryRegion *sysmem;
     MemoryRegion iram;
     MemoryRegion d_flash;

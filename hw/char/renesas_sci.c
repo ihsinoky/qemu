@@ -69,9 +69,26 @@ REG8(SEMR, 7)
   FIELD(SEMR, ACS0, 0, 1)
   FIELD(SEMR, ABCS, 4, 1)
 
+static void sci_clock_sync(RSCIState *s)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t elapsed = now - s->clock_tick;
+
+    if (!s->module_stopped) {
+        s->tx_remaining = elapsed > s->tx_remaining / s->input_freq ? 0 :
+                          s->tx_remaining - elapsed * s->input_freq;
+        s->rx_remaining = elapsed > s->rx_remaining / s->input_freq ? 0 :
+                          s->rx_remaining - elapsed * s->input_freq;
+    }
+    s->clock_tick = now;
+}
+
 static int can_receive(void *opaque)
 {
     RSCIState *sci = RSCI(opaque);
+    if (sci->module_stopped) {
+        return 0;
+    }
     if (sci->rx_next > qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)) {
         return 0;
     } else {
@@ -82,7 +99,15 @@ static int can_receive(void *opaque)
 static void receive(void *opaque, const uint8_t *buf, int size)
 {
     RSCIState *sci = RSCI(opaque);
+    if (sci->module_stopped) {
+        return;
+    }
     sci->rx_next = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + sci->trtime;
+    if (sci->clock_managed) {
+        sci_clock_sync(sci);
+        sci->rx_remaining = sci->trtime * sci->input_freq;
+        timer_mod(&sci->rx_timer, sci->rx_next);
+    }
     if (FIELD_EX8(sci->ssr, SSR, RDRF) || size > 1) {
         sci->ssr = FIELD_DP8(sci->ssr, SSR, ORER, 1);
         if (FIELD_EX8(sci->scr, SCR, RIE)) {
@@ -99,6 +124,10 @@ static void receive(void *opaque, const uint8_t *buf, int size)
 
 static void send_byte(RSCIState *sci)
 {
+    if (sci->clock_managed) {
+        sci_clock_sync(sci);
+        sci->tx_remaining = sci->trtime * sci->input_freq;
+    }
     if (qemu_chr_fe_backend_connected(&sci->chr)) {
         qemu_chr_fe_write_all(&sci->chr, &sci->tdr, 1);
     }
@@ -146,6 +175,9 @@ static void sci_write(void *opaque, hwaddr offset, uint64_t val, unsigned size)
 {
     RSCIState *sci = RSCI(opaque);
 
+    if (sci->module_stopped) {
+        return;
+    }
     switch (offset) {
     case A_SMR:
         if (!sci_is_tr_enabled(sci)) {
@@ -211,6 +243,9 @@ static uint64_t sci_read(void *opaque, hwaddr offset, unsigned size)
 {
     RSCIState *sci = RSCI(opaque);
 
+    if (sci->module_stopped) {
+        return 0;
+    }
     switch (offset) {
     case A_SMR:
         return sci->smr;
@@ -240,14 +275,70 @@ static uint64_t sci_read(void *opaque, hwaddr offset, unsigned size)
 static const MemoryRegionOps sci_ops = {
     .write = sci_write,
     .read  = sci_read,
-    .endianness = DEVICE_NATIVE_ENDIAN,
+    .endianness = DEVICE_LITTLE_ENDIAN,
     .impl.max_access_size = 1,
     .valid.max_access_size = 1,
 };
 
+/* Wake a backend that had been throttled by the managed receive clock. */
+static void sci_rx_ready(void *opaque)
+{
+    RSCIState *s = opaque;
+
+    if (!s->module_stopped) {
+        qemu_chr_fe_accept_input(&s->chr);
+    }
+}
+
+void renesas_sci_set_clock(RSCIState *s, uint64_t freq, bool stopped)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    assert(freq && freq <= NANOSECONDS_PER_SECOND);
+    if (!s->legacy_input_freq) {
+        s->legacy_input_freq = s->input_freq;
+    }
+    if (s->clock_managed && s->input_freq == freq &&
+        s->module_stopped == stopped) {
+        return;
+    }
+    if (s->clock_managed) {
+        sci_clock_sync(s);
+    } else {
+        s->tx_remaining = timer_pending(&s->timer) ?
+            MAX(0, timer_expire_time_ns(&s->timer) - now) * s->input_freq : 0;
+        s->rx_remaining = MAX(0, s->rx_next - now) * s->input_freq;
+        s->clock_tick = now;
+    }
+    if (!s->module_stopped) {
+        s->tx_pending = timer_pending(&s->timer);
+    }
+    timer_del(&s->timer);
+    timer_del(&s->rx_timer);
+    s->clock_managed = true;
+    s->input_freq = freq;
+    s->module_stopped = stopped;
+    update_trtime(s);
+    if (!stopped) {
+        s->rx_next = now + DIV_ROUND_UP(s->rx_remaining, freq);
+        if (s->tx_pending) {
+            timer_mod(&s->timer, now + DIV_ROUND_UP(s->tx_remaining, freq));
+        }
+        timer_mod(&s->rx_timer, s->rx_next);
+    }
+}
+
 static void rsci_reset(DeviceState *dev)
 {
     RSCIState *sci = RSCI(dev);
+
+    if (sci->clock_managed) {
+        timer_del(&sci->timer);
+        timer_del(&sci->rx_timer);
+        sci->clock_tick = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        sci->tx_pending = false;
+        sci->tx_remaining = sci->rx_remaining = 0;
+    }
     sci->smr = sci->scr = 0x00;
     sci->brr = 0xff;
     sci->tdr = 0xff;
@@ -256,12 +347,15 @@ static void rsci_reset(DeviceState *dev)
     sci->scmr = 0x00;
     sci->semr = 0x00;
     sci->rx_next = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    if (sci->clock_managed) {
+        update_trtime(sci);
+    }
 }
 
 static void sci_event(void *opaque, QEMUChrEvent event)
 {
     RSCIState *sci = RSCI(opaque);
-    if (event == CHR_EVENT_BREAK) {
+    if (!sci->module_stopped && event == CHR_EVENT_BREAK) {
         sci->ssr = FIELD_DP8(sci->ssr, SSR, FER, 1);
         if (FIELD_EX8(sci->scr, SCR, RIE)) {
             qemu_set_irq(sci->irq[ERI], 1);
@@ -296,12 +390,68 @@ static void rsci_init(Object *obj)
         sysbus_init_irq(d, &sci->irq[i]);
     }
     timer_init_ns(&sci->timer, QEMU_CLOCK_VIRTUAL, txend, sci);
+    timer_init_ns(&sci->rx_timer, QEMU_CLOCK_VIRTUAL, sci_rx_ready, sci);
 }
+
+static int sci_pre_load(void *opaque)
+{
+    RSCIState *s = opaque;
+
+    /* An absent clock subsection selects the original realization clock. */
+    if (s->legacy_input_freq) {
+        s->input_freq = s->legacy_input_freq;
+    }
+    s->clock_managed = false;
+    s->module_stopped = false;
+    timer_del(&s->rx_timer);
+    return 0;
+}
+
+static int sci_clock_post_load(void *opaque, int version_id)
+{
+    RSCIState *s = opaque;
+
+    if (!s->clock_managed || !s->input_freq ||
+        s->input_freq > NANOSECONDS_PER_SECOND) {
+        return -EINVAL;
+    }
+    if (s->tx_remaining < 0 || s->rx_remaining < 0) {
+        return -EINVAL;
+    }
+    return 0;
+}
+
+static bool sci_clock_needed(void *opaque)
+{
+    RSCIState *s = opaque;
+
+    return s->clock_managed;
+}
+
+static const VMStateDescription vmstate_sci_clock = {
+    .name = "renesas-sci/clock",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = sci_clock_needed,
+    .post_load = sci_clock_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_BOOL(clock_managed, RSCIState),
+        VMSTATE_BOOL(module_stopped, RSCIState),
+        VMSTATE_UINT64(input_freq, RSCIState),
+        VMSTATE_INT64(clock_tick, RSCIState),
+        VMSTATE_INT64(tx_remaining, RSCIState),
+        VMSTATE_INT64(rx_remaining, RSCIState),
+        VMSTATE_BOOL(tx_pending, RSCIState),
+        VMSTATE_TIMER(rx_timer, RSCIState),
+        VMSTATE_END_OF_LIST()
+    },
+};
 
 static const VMStateDescription vmstate_rsci = {
     .name = "renesas-sci",
     .version_id = 1,
     .minimum_version_id = 1,
+    .pre_load = sci_pre_load,
     .fields = (const VMStateField[]) {
         VMSTATE_INT64(trtime, RSCIState),
         VMSTATE_INT64(rx_next, RSCIState),
@@ -316,7 +466,11 @@ static const VMStateDescription vmstate_rsci = {
         VMSTATE_UINT8(read_ssr, RSCIState),
         VMSTATE_TIMER(timer, RSCIState),
         VMSTATE_END_OF_LIST()
-    }
+    },
+    .subsections = (const VMStateDescription * const[]) {
+        &vmstate_sci_clock,
+        NULL
+    },
 };
 
 static const Property rsci_properties[] = {
