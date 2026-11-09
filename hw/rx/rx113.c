@@ -16,6 +16,7 @@
 #include "hw/rx/rx113_lcdc.h"
 #include "hw/rx/rx113_rtc.h"
 #include "hw/rx/rx113_port.h"
+#include "hw/rx/rx113_iwdt.h"
 #include "hw/misc/unimp.h"
 #include "hw/core/sysbus.h"
 #include "hw/core/irq.h"
@@ -285,6 +286,12 @@ static uint64_t rx113_system_read(void *opaque, hwaddr addr, unsigned size)
     RX113SystemState *s = opaque;
     unsigned i;
 
+    if (addr == 0x35 && size == 1) {
+        return rx113_iwdt_ilococr(s->mcu->iwdt);
+    }
+    if (addr == 0xc0 && size == 1) {
+        return rx113_iwdt_reset_status(s->mcu->iwdt);
+    }
     if (addr == 0x3c && size == 1) {
         return s->oscovfsr;
     }
@@ -304,6 +311,16 @@ static void rx113_system_write(void *opaque, hwaddr addr, uint64_t value,
     RX113SystemState *s = opaque;
     unsigned i;
 
+    if (addr == 0x35 && size == 1) {
+        if ((s->regs[SYS_PRCR] & 1) && !(value & 1)) {
+            rx113_iwdt_start_clock(s->mcu->iwdt);
+        }
+        return;
+    }
+    if (addr == 0xc0 && size == 1) {
+        rx113_iwdt_clear_reset_status(s->mcu->iwdt, value);
+        return;
+    }
     if (addr == 0x3c && size == 1) {
         return; /* §9.2.12: all oscillator status bits are read-only. */
     }
@@ -691,7 +708,6 @@ static void register_stubs(void)
         hwaddr size;
     } stubs[] = {
         { "rx113-dtc", 0x00082400, 0x10 },
-        { "rx113-iwdt", 0x00088030, 0x10 },
         { "rx113-dac", 0x00088040, 0x10 },
         { "rx113-mtu", 0x00088600, 0x300 },
         { "rx113-s12ad", 0x00089000, 0x100 },
@@ -733,6 +749,15 @@ static void rx113_realize(DeviceState *dev, Error **errp)
     /* Initialize CPU */
     object_initialize_child(OBJECT(s), "cpu", &s->cpu, TYPE_RX113_CPU);
     qdev_realize(DEVICE(&s->cpu), NULL, &error_abort);
+
+    s->iwdt = qdev_new(TYPE_RX113_IWDT);
+    object_property_add_child(OBJECT(s), "iwdt", OBJECT(s->iwdt));
+    object_property_set_link(OBJECT(s->iwdt), "flash", OBJECT(&s->c_flash),
+                             &error_abort);
+    object_property_set_link(OBJECT(s->iwdt), "cpu", OBJECT(&s->cpu),
+                             &error_abort);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(s->iwdt), &error_abort);
+    sysbus_mmio_map(SYS_BUS_DEVICE(s->iwdt), 0, 0x00088030);
 
     register_system(s);
     register_icu(s);

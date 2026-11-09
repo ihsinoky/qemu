@@ -28,6 +28,7 @@ struct RX113State {
 
     RXCPU cpu;
     RXICUState icu;
+    DeviceState *iwdt;
     RTMRState tmr[2];
     RCMTState cmt[2];
     RSCIState sci[8];
