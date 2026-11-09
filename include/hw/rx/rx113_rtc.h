@@ -64,6 +64,9 @@ struct RX113RTCState {
     uint16_t prd_phase;
     bool alarm_match;
     int64_t last_ns;
+    /* Fractional divider tick, in 1/128 ns; negative for retardation. */
+    int64_t phase_units;
+    bool system_subclock;
 };
 
 #endif /* HW_RX_RX113_RTC_H */

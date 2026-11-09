@@ -17,6 +17,7 @@
 #include "hw/rx/rx113_rtc.h"
 #include "hw/misc/unimp.h"
 #include "hw/core/sysbus.h"
+#include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
 #include "system/system.h"
 #include "qobject/qlist.h"
@@ -98,7 +99,7 @@ static const struct {
     [SYS_UPLLCR2] = { 0x2e, 1, 1, 1, 1 },
     /* §9.2.7-11: stop controls; HOCO reset depends on OFS1.HOCOEN. */
     [SYS_MOSCCR] = { 0x32, 1, 1, 1, 1 },
-    [SYS_SOSCCR] = { 0x33, 1, 1, 1, 1 },
+    [SYS_SOSCCR] = { 0x33, 1, 0, 1, 1 },
     [SYS_LOCOCR] = { 0x34, 1, 0, 1, 1 },
     [SYS_HOCOCR] = { 0x36, 1, 1, 1, 1 },
     /* §9.2.17-18: LOCO-based oscillator wait settings. */
@@ -129,6 +130,7 @@ struct RX113SystemState {
     uint8_t oscovfsr;
     int64_t deadline[OSC_COUNT];
     QEMUTimer *osc_timer;
+    qemu_irq subclock;
 };
 
 /* Nominal LOCO is 4 MHz, even when LOCOCR.LOSTP is set (§9.2.17-18). */
@@ -241,6 +243,9 @@ static void rx113_system_write(void *opaque, hwaddr addr, uint64_t value,
 
             s->regs[i] = (value & mask) | (system_regs[i].reset & ~mask);
             rx113_system_update_oscillators(s);
+            if (i == SYS_SOSCCR) {
+                qemu_set_irq(s->subclock, !(s->regs[SYS_SOSCCR] & 1));
+            }
         }
         return;
     }
@@ -307,12 +312,14 @@ static void rx113_system_reset_exit(Object *obj, ResetType type)
     s->regs[SYS_HOCOCR] = (ldl_le_p(flash + flash_size - 0x78) >> 8) & 1;
     /* §9.2.18 note 2: hardware secures tHOCO before CPU reset release. */
     s->oscovfsr = s->regs[SYS_HOCOCR] ? 0 : 8;
+    qemu_set_irq(s->subclock, !(s->regs[SYS_SOSCCR] & 1));
 }
 
 static void rx113_system_init(Object *obj)
 {
     RX113SystemState *s = RX113_SYSTEM(obj);
 
+    qdev_init_gpio_out_named(DEVICE(obj), &s->subclock, "subclock", 1);
     s->osc_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                 rx113_system_update_oscillators, s);
     memory_region_init_io(&s->iomem, obj, &rx113_system_ops, s,
@@ -347,6 +354,7 @@ static int rx113_system_post_load(void *opaque, int version_id)
             }
         }
     }
+    qemu_set_irq(s->subclock, !(s->regs[SYS_SOSCCR] & 1));
     return 0;
 }
 
@@ -564,8 +572,13 @@ static void register_rtc(RX113State *s, DeviceState *lcdc)
 {
     DeviceState *dev = qdev_new(TYPE_RX113_RTC);
     SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
+    DeviceState *sys = DEVICE(object_resolve_path_component(OBJECT(s),
+                                                           "system"));
 
     object_property_add_child(OBJECT(s), "rtc", OBJECT(dev));
+    qdev_connect_gpio_out_named(sys, "subclock", 0,
+                               qdev_get_gpio_in_named(dev,
+                                                      "system-subclock", 0));
     sysbus_realize_and_unref(sbd, &error_abort);
     sysbus_mmio_map(sbd, 0, RX113_RTC_BASE);
     sysbus_connect_irq(sbd, RX113_RTC_IRQ_ALM,
