@@ -78,7 +78,7 @@ enum {
     SYS_MSTPCRB, SYS_SCKCR, SYS_SCKCR3, SYS_PLLCR, SYS_PLLCR2,
     SYS_UPLLCR, SYS_UPLLCR2, SYS_MOSCCR, SYS_SOSCCR, SYS_LOCOCR,
     SYS_HOCOCR, SYS_MOSCWTCR, SYS_HOCOWTCR, SYS_PRCR, SYS_MOFCR,
-    SYS_MSTPCRA, SYS_REG_COUNT,
+    SYS_MSTPCRA, SYS_MSTPCRC, SYS_REG_COUNT,
 };
 
 static const struct {
@@ -88,9 +88,10 @@ static const struct {
     uint32_t mask;
     unsigned protect;
 } system_regs[SYS_REG_COUNT] = {
-    /* §11.2.2-3: reserved bits read as one; PRC1 protects module stop. */
+    /* §11.2.2-4: reserved bits read as one; PRC1 protects module stop. */
     [SYS_MSTPCRA] = { 0x10, 4, 0xefffffff, 0x1006c230, 2 },
     [SYS_MSTPCRB] = { 0x14, 4, 0xffffffff, 0xe6aa0650, 2 },
+    [SYS_MSTPCRC] = { 0x18, 4, 0x7ffffffe, 0x8c180001, 2 },
     /* §9.2.1-6: clock selections; PRC0 protects these registers. */
     [SYS_SCKCR] = { 0x20, 4, 0x33000303, 0xff000f0f, 1 },
     [SYS_SCKCR3] = { 0x26, 2, 0, 0x700, 1 },
@@ -136,10 +137,28 @@ struct RX113SystemState {
     uint64_t main_clock_hz;
 };
 
+/* Table 5.1 addresses and Table 14.3 ERI/RXI/TXI/TEI vector bases. */
+static const struct {
+    hwaddr base;
+    unsigned irq;
+    unsigned stop_reg;
+    unsigned stop_bit;
+    const char *extensions;
+    unsigned extension_size;
+} sci_channels[] = {
+    { 0x0008a000, 214, SYS_MSTPCRB, 31, "rx113-sci0-extensions", 0x18 },
+    { 0x0008a020, 218, SYS_MSTPCRB, 30, "rx113-sci1-extensions", 0x18 },
+    { 0x0008a040, 186, SYS_MSTPCRB, 29, "rx113-sci2-extensions", 0x18 },
+    { 0x0008a0a0, 222, SYS_MSTPCRB, 26, "rx113-sci5-extensions", 0x18 },
+    { 0x0008a0c0, 226, SYS_MSTPCRB, 25, "rx113-sci6-extensions", 0x18 },
+    { 0x0008b300, 238, SYS_MSTPCRB, 4, "rx113-sci12-extensions", 0x2c },
+    { 0x0008a100, 230, SYS_MSTPCRC, 27, "rx113-sci8-extensions", 0x18 },
+    { 0x0008a120, 234, SYS_MSTPCRC, 26, "rx113-sci9-extensions", 0x18 },
+};
+
 /* §9.2.1-3, §9.7.2: UPLL feeds UCLK and never PCLKB. */
 static void rx113_system_update_clocks(RX113SystemState *s)
 {
-    static const unsigned sci_stop[] = { 31, 30, 29, 26, 25, 4 };
     uint64_t source, pclkb = s->mcu->cmt[0].input_freq;
     unsigned div = extract32(s->regs[SYS_SCKCR], 8, 4);
     unsigned select = extract32(s->regs[SYS_SCKCR3], 8, 3);
@@ -185,9 +204,10 @@ gates:
         renesas_tmr_set_clock(&s->mcu->tmr[i], pclkb,
                              s->regs[SYS_MSTPCRA] & (1U << (5 - i)));
     }
-    for (i = 0; i < ARRAY_SIZE(sci_stop); i++) {
+    for (i = 0; i < ARRAY_SIZE(sci_channels); i++) {
         renesas_sci_set_clock(&s->mcu->sci[i], pclkb,
-                             s->regs[SYS_MSTPCRB] & (1U << sci_stop[i]));
+                             s->regs[sci_channels[i].stop_reg] &
+                             (1U << sci_channels[i].stop_bit));
     }
 }
 
@@ -302,7 +322,8 @@ static void rx113_system_write(void *opaque, hwaddr addr, uint64_t value,
             s->regs[i] = (value & mask) | (system_regs[i].reset & ~mask);
             rx113_system_update_oscillators(s);
             if (i == SYS_SCKCR || i == SYS_SCKCR3 || i == SYS_PLLCR ||
-                i == SYS_MSTPCRA || i == SYS_MSTPCRB) {
+                i == SYS_MSTPCRA || i == SYS_MSTPCRB ||
+                i == SYS_MSTPCRC) {
                 rx113_system_update_clocks(s);
             }
             if (i == SYS_SOSCCR) {
@@ -405,6 +426,9 @@ static int rx113_system_post_load(void *opaque, int version_id)
     RX113SystemState *s = opaque;
     unsigned i;
 
+    if (version_id < 4) {
+        s->regs[SYS_MSTPCRC] = system_regs[SYS_MSTPCRC].reset;
+    }
     if (version_id == 1) {
         /* Version 1 reported enabled oscillators as immediately stable. */
         s->oscovfsr = 0;
@@ -423,13 +447,14 @@ static int rx113_system_post_load(void *opaque, int version_id)
 
 static const VMStateDescription vmstate_rx113_system = {
     .name = TYPE_RX113_SYSTEM,
-    .version_id = 3,
+    .version_id = 4,
     .minimum_version_id = 1,
     .post_load = rx113_system_post_load,
     .fields = (const VMStateField[]) {
-        /* Keep the original array layout for incoming v1/v2 streams. */
+        /* Preserve earlier array layouts; append new registers by version. */
         VMSTATE_UINT32_SUB_ARRAY(regs, RX113SystemState, 0, SYS_MSTPCRA),
         VMSTATE_UINT32_V(regs[SYS_MSTPCRA], RX113SystemState, 3),
+        VMSTATE_UINT32_V(regs[SYS_MSTPCRC], RX113SystemState, 4),
         VMSTATE_UINT8_V(oscovfsr, RX113SystemState, 2),
         VMSTATE_INT64_ARRAY_V(deadline, RX113SystemState, OSC_COUNT, 2),
         VMSTATE_TIMER_PTR_V(osc_timer, RX113SystemState, 2),
@@ -581,21 +606,6 @@ static void register_cmt(RX113State *s, unsigned unit)
     sysbus_mmio_map(cmt, 0, RX113_CMT_BASE + unit * 0x10);
 }
 
-/* Table 5.1 addresses and Table 14.3 ERI/RXI/TXI/TEI vector bases. */
-static const struct {
-    hwaddr base;
-    unsigned irq;
-    const char *extensions;
-    unsigned extension_size;
-} sci_channels[] = {
-    { 0x0008a000, 214, "rx113-sci0-extensions", 0x18 },
-    { 0x0008a020, 218, "rx113-sci1-extensions", 0x18 },
-    { 0x0008a040, 186, "rx113-sci2-extensions", 0x18 },
-    { 0x0008a0a0, 222, "rx113-sci5-extensions", 0x18 },
-    { 0x0008a0c0, 226, "rx113-sci6-extensions", 0x18 },
-    { 0x0008b300, 238, "rx113-sci12-extensions", 0x2c },
-};
-
 static void register_sci(RX113State *s, unsigned unit)
 {
     SysBusDevice *sci;
@@ -604,7 +614,7 @@ static void register_sci(RX113State *s, unsigned unit)
     object_initialize_child(OBJECT(s), "sci[*]",
                             &s->sci[unit], TYPE_RENESAS_SCI);
     sci = SYS_BUS_DEVICE(&s->sci[unit]);
-    /* Serial backends are ordered SCI0, SCI1, SCI2, SCI5, SCI6, SCI12. */
+    /* Keep the original six backends; append SCI8 and SCI9. */
     qdev_prop_set_chr(DEVICE(sci), "chardev", serial_hd(unit));
     qdev_prop_set_uint64(DEVICE(sci), "input-freq", RX113_PCLKB_HZ);
     sysbus_realize(sci, &error_abort);
@@ -685,8 +695,6 @@ static void register_stubs(void)
         { "rx113-dac", 0x00088040, 0x10 },
         { "rx113-mtu", 0x00088600, 0x300 },
         { "rx113-s12ad", 0x00089000, 0x100 },
-        { "rx113-sci8", 0x0008a100, 0x20 },
-        { "rx113-sci9", 0x0008a120, 0x20 },
         { "rx113-cac", 0x0008b000, 0x20 },
         { "rx113-doc", 0x0008b080, 0x10 },
         { "rx113-elc", 0x0008b100, 0x30 },
