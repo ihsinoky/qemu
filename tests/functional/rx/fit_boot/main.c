@@ -28,7 +28,7 @@ void main(void)
     SYSTEM.PRCR.WORD = 0xa500;
     SCI0.SCR.BYTE = 0;
     SCI0.SMR.BYTE = 0;
-    SCI0.BRR = 8; /* Fixed 32 MHz PCLKB, approx. 115200 baud. */
+    SCI0.BRR = 8; /* FIT selects 32 MHz PCLKB, approx. 115200 baud. */
     SCI0.SCR.BYTE = 0x20;
     while (*p) {
         while (!(SCI0.SSR.BYTE & 0x80)) {

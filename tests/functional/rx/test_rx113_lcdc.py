@@ -39,6 +39,10 @@ class RX113Lcdc(QemuSystemTest):
         code += self.store(self.LCDC0, 0x11)
         code += self.store(self.LCDM1, 0xc0)    # SCOC = LCDON = 1, A-pattern
         # mov.l #0x8a000,r1; mov.b #0x20,2[r1]; mov.b #'R',3[r1]; bra.b .
+        # Unlock PRC1 and release SCI0 module stop before transmitting.
+        code += bytes.fromhex(
+            'fb1efe0308f81902a5fb1e140008f812ffffff7f'
+            'fb1efe0308f81900a5')
         code += bytes.fromhex('fb1200a00800 f9140220 f9140352 2e00')
         return code
 
