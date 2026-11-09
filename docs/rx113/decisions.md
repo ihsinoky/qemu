@@ -51,3 +51,14 @@ the PMO raises it at the merge gate as an explicit decision, not a
 footnote. Existing recorded simplifications are revisited under this
 rule (e.g. Issue #20 implements the RTC registers that Issue #18 stored
 only).
+
+## D-007: Shared-model changes approved for Issue #10 scope
+Date: 2026-11-09. Decided by: PO.
+The PO approves modifying the shared CMT/TMR/SCI models for Issue #10
+(runtime input-frequency updates and a module-stop gate interface),
+which D-005 had deferred pending this decision. The binding condition
+is behavioral invariance: unless the new interfaces are used, existing
+behavior — RX62N above all — must remain completely unchanged, and the
+RX62N regression suite takes priority over the RX113-side wiring.
+D-003's "RX62N code stays untouched" is therefore read as "RX62N
+behavior stays unchanged" for this scope; RX113 remains alongside.
