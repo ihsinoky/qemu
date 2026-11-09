@@ -14,9 +14,9 @@
  * RCR2.RTCOE are retained only), the time error adjustment (RADJ and
  * RCR2.AADJE/AADJP are retained only; they have no effect on the count),
  * and the CUP condition "carry to R64CNT while R64CNT is read" (24.4 (3));
- * CUP is raised only on the carry to the second counter/BCNT0. Registers
- * are cleared by a system reset (the real counters keep running through a
- * reset, 24.2).
+ * CUP is raised only on the carry to the second counter/BCNT0. The counters
+ * and reset-retained register bits keep their state across system resets
+ * (24.2); undefined power-on values are initialized to zero.
  *
  * The ICU vectors are ALM = 92, PRD = 93 and CUP = 63 (Table 14.3). The PRD
  * is also delivered to the LCDC blinking input (34.4.2) through a second
@@ -60,18 +60,20 @@
 #define RCR1_AIE        0x01
 #define RCR1_CIE        0x02
 #define RCR1_PIE        0x04
+#define RCR1_RTCOS      0x08
 #define RCR1_PES_SHIFT  4
 
 /* 24.2.18 RCR2 */
 #define RCR2_START      0x01
 #define RCR2_RESET      0x02
 #define RCR2_ADJ30      0x04
+#define RCR2_RTCOE      0x08
 #define RCR2_AADJE      0x10
 #define RCR2_AADJP      0x20
 #define RCR2_HR24       0x40
 #define RCR2_CNTMD      0x80
 /* Bits that hold a value; RESET and ADJ30 are self-clearing actions */
-#define RCR2_STORED     (RCR2_START | 0x08 | RCR2_AADJE | RCR2_AADJP | \
+#define RCR2_STORED     (RCR2_START | RCR2_RTCOE | RCR2_AADJE | RCR2_AADJP | \
                          RCR2_HR24 | RCR2_CNTMD)
 
 #define HR_PM           0x40
@@ -597,24 +599,15 @@ static void rtc_reset_hold(Object *obj, ResetType type)
 {
     RX113RTCState *s = RX113_RTC(obj);
 
-    timer_del(&s->timer);
-    s->sec = s->min = s->hour = s->wday = 0;
-    s->day = s->mon = 0;
-    s->year = 0;
-    s->bcnt = 0;
-    s->secar = s->minar = s->hourar = s->wdayar = 0;
-    s->dayar = s->monar = s->yeararen = 0;
-    s->yearar = 0;
-    s->bcntar = 0;
-    s->bcntaer = 0;
-    s->rcr1 = 0;
-    s->rcr2 = 0;
-    s->rcr3 = 0;
-    s->radj = 0;
-    s->sub = 0;
-    s->prd_phase = 0;
-    s->alarm_match = false;
-    s->last_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    /*
+     * 24.2: x bits are not initialized by a reset, and counting continues.
+     * Only CIE, RTCOS (24.2.17) and RTCOE (24.2.18) are cleared here; the
+     * action bits RESET/ADJ30 already read as zero. Keep last_ns and the
+     * prescaler phases so that the next sync includes time across reset.
+     */
+    s->rcr1 &= ~(RCR1_CIE | RCR1_RTCOS);
+    s->rcr2 &= ~RCR2_RTCOE;
+    rtc_update_timer(s);
 }
 
 static void rtc_init(Object *obj)
@@ -630,6 +623,8 @@ static void rtc_init(Object *obj)
     sysbus_init_irq(sbd, &s->cup);
     sysbus_init_irq(sbd, &s->prd_lcdc);
     timer_init_ns(&s->timer, QEMU_CLOCK_VIRTUAL, rtc_timer_cb, s);
+    /* QOM zero-initializes the registers, including undefined power-on bits. */
+    s->last_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 }
 
 static int rtc_post_load(void *opaque, int version_id)

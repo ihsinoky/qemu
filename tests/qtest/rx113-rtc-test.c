@@ -26,6 +26,8 @@
 #define RYRAREN     (RTC_BASE + 0x1e)
 #define RCR1        (RTC_BASE + 0x22)
 #define RCR2        (RTC_BASE + 0x24)
+#define RCR3        (RTC_BASE + 0x26)
+#define RADJ        (RTC_BASE + 0x2e)
 
 #define RCR1_AIE    0x01
 #define RCR1_CIE    0x02
@@ -124,6 +126,69 @@ static void test_set_read_count(void)
     qtest_quit(qts);
 }
 
+/* Undefined power-on bits are deterministically zero in the model. */
+static void test_power_on(void)
+{
+    QTestState *qts = rtc_init();
+
+    for (unsigned off = 0; off <= 0x2e; off += 2) {
+        g_assert_cmphex(qtest_readb(qts, RTC_BASE + off), ==, 0);
+    }
+    qtest_clock_step(qts, 2 * SEC);
+    g_assert_cmphex(qtest_readb(qts, RSECCNT), ==, 0);
+    g_assert_cmphex(qtest_readb(qts, R64CNT), ==, 0);
+    qtest_quit(qts);
+}
+
+static void test_system_reset_binary(void)
+{
+    QTestState *qts = rtc_init();
+
+    qtest_writeb(qts, RCR2, RCR2_CNTMD);
+    qtest_writeb(qts, RSECCNT, 0xfe);
+    qtest_writeb(qts, RMINCNT, 0xff);
+    qtest_writeb(qts, RHRCNT, 0x34);
+    qtest_writeb(qts, RWKCNT, 0x12);
+    for (unsigned i = 0; i < 8; i++) {
+        qtest_writeb(qts, RSECAR + 2 * i, 0x10 + i);
+    }
+    qtest_writeb(qts, RCR2, RCR2_CNTMD | RCR2_START);
+    /* No interrupt timers or reads: last_ns must survive the reset too. */
+    qtest_clock_step(qts, SEC + SEC / 4);
+    qtest_system_reset(qts);
+    g_assert_cmphex(qtest_readb(qts, RCR2), ==, RCR2_CNTMD | RCR2_START);
+    g_assert_cmphex(qtest_readb(qts, RSECCNT), ==, 0xff);
+    g_assert_cmphex(qtest_readb(qts, R64CNT), ==, 32);
+    for (unsigned i = 0; i < 8; i++) {
+        g_assert_cmphex(qtest_readb(qts, RSECAR + 2 * i), ==, 0x10 + i);
+    }
+    qtest_clock_step(qts, 3 * SEC / 4);
+    g_assert_cmphex(qtest_readb(qts, RSECCNT), ==, 0x00);
+    g_assert_cmphex(qtest_readb(qts, RMINCNT), ==, 0x00);
+    g_assert_cmphex(qtest_readb(qts, RHRCNT), ==, 0x35);
+    g_assert_cmphex(qtest_readb(qts, RWKCNT), ==, 0x12);
+    qtest_quit(qts);
+}
+
+static void test_system_reset_stopped(void)
+{
+    QTestState *qts = rtc_init();
+    const uint8_t t0[7] = { 0x26, 0x11, 0x09, 1, 0x12, 0x34, 0x56 };
+
+    set_time(qts, t0, RCR2_HR24);
+    qtest_clock_step(qts, SEC / 4);
+    qtest_writeb(qts, RCR2, RCR2_HR24);
+    qtest_system_reset(qts);
+    qtest_clock_step(qts, 10 * SEC);
+    check_time(qts, t0);
+    g_assert_cmphex(qtest_readb(qts, RCR2), ==, RCR2_HR24);
+    g_assert_cmphex(qtest_readb(qts, R64CNT), ==, 32);
+    qtest_writeb(qts, RCR2, RCR2_HR24 | RCR2_START);
+    qtest_clock_step(qts, 3 * SEC / 4);
+    g_assert_cmphex(qtest_readb(qts, RSECCNT), ==, 0x57);
+    qtest_quit(qts);
+}
+
 static void test_12_hour(void)
 {
     QTestState *qts = rtc_init();
@@ -201,6 +266,68 @@ static void enable_irq(QTestState *qts, unsigned vec)
     qtest_writeb(qts, ICU_IER(vec),
                  qtest_readb(qts, ICU_IER(vec)) | (1 << (vec & 7)));
     qtest_writeb(qts, ICU_IR(vec), 0);
+}
+
+static void test_system_reset_calendar(void)
+{
+    QTestState *qts = rtc_init();
+    const uint8_t t0[7] = { 0x24, 0x02, 0x28, 3, 0x23, 0x59, 0x58 };
+    const uint8_t t1[7] = { 0x24, 0x02, 0x28, 3, 0x23, 0x59, 0x59 };
+    const uint8_t t2[7] = { 0x24, 0x02, 0x29, 4, 0x00, 0x00, 0x00 };
+    /* Alarm at second 00; other alarm fields are retained but disabled. */
+    const uint8_t alarms[8] = { 0x80, 0x12, 0x23, 4, 0x29, 2, 0x24, 0 };
+
+    set_time(qts, t0, RCR2_HR24);
+    for (unsigned i = 0; i < G_N_ELEMENTS(alarms); i++) {
+        qtest_writeb(qts, RSECAR + 2 * i, alarms[i]);
+    }
+    /* Enable 1/2-second PRD, CUP, ALM and RTCOUT; store adjustment bits. */
+    qtest_writeb(qts, RCR1, 0xdf);
+    qtest_writeb(qts, RCR2, 0x79);
+    qtest_writeb(qts, RCR3, 0x09);
+    qtest_writeb(qts, RADJ, 0x45);
+    qtest_clock_step(qts, SEC + SEC / 4 + 1);
+    check_time(qts, t1);
+    g_assert_cmphex(qtest_readb(qts, R64CNT), ==, 32);
+
+    qtest_system_reset(qts);
+    check_time(qts, t1);
+    g_assert_cmphex(qtest_readb(qts, R64CNT), ==, 32);
+    /* Only CIE, RTCOS and RTCOE clear on a system reset (24.2.17-18). */
+    g_assert_cmphex(qtest_readb(qts, RCR1), ==, 0xd5);
+    g_assert_cmphex(qtest_readb(qts, RCR2), ==, 0x71);
+    g_assert_cmphex(qtest_readb(qts, RCR3), ==, 0x09);
+    g_assert_cmphex(qtest_readb(qts, RADJ), ==, 0x45);
+    for (unsigned i = 0; i < G_N_ELEMENTS(alarms); i++) {
+        g_assert_cmphex(qtest_readb(qts, RSECAR + 2 * i), ==, alarms[i]);
+    }
+
+    enable_irq(qts, VEC_PRD);
+    enable_irq(qts, VEC_ALM);
+    enable_irq(qts, VEC_CUP);
+    /* Neither the PRD phase nor the fractional tick is restarted. */
+    qtest_clock_step(qts, SEC / 4 - 2);
+    g_assert_cmpuint(qtest_readb(qts, ICU_IR(VEC_PRD)), ==, 0);
+    qtest_clock_step(qts, 1);
+    g_assert_cmpuint(qtest_readb(qts, ICU_IR(VEC_PRD)), ==, 1);
+    qtest_clock_step(qts, SEC / 2);
+    check_time(qts, t2);
+    g_assert_cmphex(qtest_readb(qts, R64CNT), ==, 0);
+    g_assert_cmpuint(qtest_readb(qts, ICU_IR(VEC_ALM)), ==, 1);
+    g_assert_cmpuint(qtest_readb(qts, ICU_IR(VEC_CUP)), ==, 0);
+
+    /* A second reset still retains the running time and alarm settings. */
+    qtest_system_reset(qts);
+    qtest_clock_step(qts, SEC);
+    g_assert_cmphex(qtest_readb(qts, RSECCNT), ==, 0x01);
+    g_assert_cmphex(qtest_readb(qts, RSECAR), ==, 0x80);
+    /* Guest software reset still clears its targets, not calendar time. */
+    qtest_writeb(qts, RCR2, 0x71 | RCR2_RESET);
+    g_assert_cmphex(qtest_readb(qts, RSECCNT), ==, 0x01);
+    g_assert_cmphex(qtest_readb(qts, RSECAR), ==, 0);
+    g_assert_cmphex(qtest_readb(qts, RADJ), ==, 0);
+    g_assert_cmphex(qtest_readb(qts, RCR2), ==, 0x41);
+    qtest_quit(qts);
 }
 
 static void test_periodic(void)
@@ -311,5 +438,11 @@ int main(int argc, char **argv)
     qtest_add_func("/rx113-rtc/periodic", test_periodic);
     qtest_add_func("/rx113-rtc/alarm-carry", test_alarm_and_carry);
     qtest_add_func("/rx113-rtc/lcdc-blink", test_lcdc_blink);
+    qtest_add_func("/rx113-rtc/power-on", test_power_on);
+    qtest_add_func("/rx113-rtc/system-reset-calendar",
+                   test_system_reset_calendar);
+    qtest_add_func("/rx113-rtc/system-reset-binary", test_system_reset_binary);
+    qtest_add_func("/rx113-rtc/system-reset-stopped",
+                   test_system_reset_stopped);
     return g_test_run();
 }
