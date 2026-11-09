@@ -14,6 +14,7 @@
 #include "migration/vmstate.h"
 #include "hw/rx/rx113.h"
 #include "hw/rx/rx113_lcdc.h"
+#include "hw/rx/rx113_rtc.h"
 #include "hw/misc/unimp.h"
 #include "hw/core/sysbus.h"
 #include "hw/core/qdev-properties.h"
@@ -35,6 +36,7 @@
 #define RX113_TMR_BASE  0x00088200
 #define RX113_CMT_BASE  0x00088000
 #define RX113_LCDC_BASE 0x000a0800
+#define RX113_RTC_BASE  0x0008c400
 
 /*
  * RX113 Peripheral IRQ
@@ -42,6 +44,9 @@
  */
 #define RX113_TMR_IRQ   174
 #define RX113_CMT_IRQ   28
+#define RTC_CUP         63
+#define RTC_ALM         92
+#define RTC_PRD         93
 
 /* Fixed PCLKB until SYSTEM clock control is modeled. */
 #define RX113_PCLKB_HZ (32 * 1000 * 1000)
@@ -541,13 +546,36 @@ static void register_sci(RX113State *s, unsigned unit)
 }
 
 /* Section 34; the LCDC defines no interrupt request (Table 14.3). */
-static void register_lcdc(RX113State *s)
+static DeviceState *register_lcdc(RX113State *s)
 {
     DeviceState *dev = qdev_new(TYPE_RX113_LCDC);
 
     object_property_add_child(OBJECT(s), "lcdc", OBJECT(dev));
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_abort);
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, RX113_LCDC_BASE);
+    return dev;
+}
+
+/*
+ * Section 24; Table 14.3 gives CUP vector 63, ALM vector 92 and PRD vector
+ * 93. The PRD also drives the LCDC blinking input (34.4.2).
+ */
+static void register_rtc(RX113State *s, DeviceState *lcdc)
+{
+    DeviceState *dev = qdev_new(TYPE_RX113_RTC);
+    SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
+
+    object_property_add_child(OBJECT(s), "rtc", OBJECT(dev));
+    sysbus_realize_and_unref(sbd, &error_abort);
+    sysbus_mmio_map(sbd, 0, RX113_RTC_BASE);
+    sysbus_connect_irq(sbd, RX113_RTC_IRQ_ALM,
+                       qdev_get_gpio_in(DEVICE(&s->icu), RTC_ALM));
+    sysbus_connect_irq(sbd, RX113_RTC_IRQ_PRD,
+                       qdev_get_gpio_in(DEVICE(&s->icu), RTC_PRD));
+    sysbus_connect_irq(sbd, RX113_RTC_IRQ_CUP,
+                       qdev_get_gpio_in(DEVICE(&s->icu), RTC_CUP));
+    sysbus_connect_irq(sbd, RX113_RTC_IRQ_PRD_LCDC,
+                       qdev_get_gpio_in_named(lcdc, "prd", 0));
 }
 
 /* Table 5.1 register blocks; these stubs log accesses with -d unimp. */
@@ -570,7 +598,6 @@ static void register_stubs(void)
         { "rx113-elc", 0x0008b100, 0x30 },
         { "rx113-port", 0x0008c000, 0x100 },
         { "rx113-mpc", 0x0008c100, 0x100 },
-        { "rx113-rtc", 0x0008c400, 0x100 },
         { "rx113-usb0", 0x000a0000, 0x200 },
         { "rx113-ctsu", 0x000a0900, 0x100 },
     };
@@ -612,7 +639,7 @@ static void rx113_realize(DeviceState *dev, Error **errp)
     for (unsigned i = 0; i < ARRAY_SIZE(sci_channels); i++) {
         register_sci(s, i);
     }
-    register_lcdc(s);
+    register_rtc(s, register_lcdc(s));
     register_stubs();
 }
 
