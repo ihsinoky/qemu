@@ -30,7 +30,7 @@ struct RX113State {
     RXICUState icu;
     RTMRState tmr[2];
     RCMTState cmt[2];
-    RSCIState sci[6];
+    RSCIState sci[8];
 
     uint64_t main_clock_hz;
     MemoryRegion *sysmem;

@@ -12,6 +12,7 @@
 #define PLLCR 0x80028
 #define MSTPCRA 0x80010
 #define MSTPCRB 0x80014
+#define MSTPCRC 0x80018
 #define PRCR 0x803fe
 #define IR(n) (0x87000 + (n))
 
@@ -43,7 +44,7 @@ static void test_sources(void)
     QTestState *qts = clock_init();
     const char *children[] = { "cmt[0]", "cmt[1]", "tmr[0]", "tmr[1]",
                               "sci[0]", "sci[1]", "sci[2]", "sci[3]",
-                              "sci[4]", "sci[5]" };
+                              "sci[4]", "sci[5]", "sci[6]", "sci[7]" };
 
     /* All reset-stopped children still receive frequency changes. */
     for (unsigned i = 0; i < G_N_ELEMENTS(children); i++) {
@@ -186,15 +187,18 @@ static void test_sci(void)
 {
     static const unsigned base[] = {
         0x8a000, 0x8a020, 0x8a040, 0x8a0a0, 0x8a0c0, 0x8b300,
+        0x8a100, 0x8a120,
     };
-    static const unsigned bit[] = { 31, 30, 29, 26, 25, 4 };
+    static const unsigned bit[] = { 31, 30, 29, 26, 25, 4, 27, 26 };
     QTestState *qts = clock_init();
 
     for (unsigned ch = 0; ch < G_N_ELEMENTS(base); ch++) {
-        uint32_t run = 0xffffffff & ~(1U << bit[ch]);
+        unsigned mstp = ch < 6 ? MSTPCRB : MSTPCRC;
+        uint32_t reset = ch < 6 ? 0xffffffff : 0x7ffffffe;
+        uint32_t run = reset & ~(1U << bit[ch]);
 
         qtest_writel(qts, SCKCR, 0);
-        qtest_writel(qts, MSTPCRB, run);
+        qtest_writel(qts, mstp, run);
         qtest_writeb(qts, base[ch] + 1, 8);
         qtest_writeb(qts, base[ch] + 2, 0x20);
         qtest_writeb(qts, base[ch] + 3, 'A');
@@ -202,7 +206,7 @@ static void test_sci(void)
         qtest_writel(qts, SCKCR, 0x100);
         qtest_clock_step(qts, 35999);
         g_assert_cmphex(qtest_readb(qts, base[ch] + 4) & 4, ==, 0);
-        qtest_writel(qts, MSTPCRB, 0xffffffff);
+        qtest_writel(qts, mstp, reset);
         qtest_writeb(qts, base[ch] + 1, 100); /* blocked */
         /* Repeated changes while stopped must not consume fractional work. */
         for (unsigned i = 0; i < 16; i++) {
@@ -211,7 +215,7 @@ static void test_sci(void)
         }
         qtest_clock_step(qts, 1000000);
         g_assert_cmpuint(qtest_readb(qts, base[ch] + 4), ==, 0);
-        qtest_writel(qts, MSTPCRB, run);
+        qtest_writel(qts, mstp, run);
         g_assert_cmpuint(qtest_readb(qts, base[ch] + 1), ==, 8);
         qtest_clock_step(qts, 36000);
         g_assert_cmphex(qtest_readb(qts, base[ch] + 4) & 4, ==, 0);
@@ -316,11 +320,18 @@ static void test_migration(const void *opaque)
     qtest_writeb(src, 0x8a001, 8);
     qtest_writeb(src, 0x8a002, 0x20);
     qtest_writeb(src, 0x8a003, 'A');
+    qtest_writel(src, MSTPCRC, 0x73fffffe);
+    for (unsigned base = 0x8a100; base <= 0x8a120; base += 0x20) {
+        qtest_writeb(src, base + 1, 8);
+        qtest_writeb(src, base + 2, 0x20);
+        qtest_writeb(src, base + 3, 'A');
+    }
     now = qtest_clock_step(src, 10125);
     qtest_writel(src, SCKCR, 0x100);
     if (stopped) {
         qtest_writel(src, MSTPCRA, 0xefffffff);
         qtest_writel(src, MSTPCRB, 0xffffffff);
+        qtest_writel(src, MSTPCRC, 0x7ffffffe);
     }
     qtest_qmp_assert_success(src, "{'execute':'migrate',"
                             "'arguments':{'uri':%s}}", uri);
@@ -332,13 +343,21 @@ static void test_migration(const void *opaque)
                             "'arguments':{'uri':%s}}", uri);
     wait_migration(dst);
     g_assert_cmpuint(frequency(dst, "cmt[0]"), ==, 16000000);
+    g_assert_cmphex(qtest_readl(dst, MSTPCRC), ==,
+                    stopped ? 0x7ffffffe : 0x73fffffe);
+    g_assert_cmpuint(frequency(dst, "sci[6]"), ==, 16000000);
+    g_assert_cmpuint(frequency(dst, "sci[7]"), ==, 16000000);
     if (stopped) {
         qtest_clock_step(dst, 1000000);
         g_assert_cmpuint(qtest_readb(dst, IR(28)), ==, 0);
         g_assert_cmpuint(qtest_readb(dst, IR(174)), ==, 0);
         g_assert_cmpuint(qtest_readb(dst, 0x8a004), ==, 0);
         qtest_writel(dst, MSTPCRA, 0xefff7fdf);
+        for (unsigned base = 0x8a100; base <= 0x8a120; base += 0x20) {
+            g_assert_cmpuint(qtest_readb(dst, base + 4), ==, 0);
+        }
         qtest_writel(dst, MSTPCRB, 0x7fffffff);
+        qtest_writel(dst, MSTPCRC, 0x73fffffe);
     }
     g_assert_cmpuint(qtest_readw(dst, 0x88004), ==, 40);
     g_assert_cmpuint(qtest_readb(dst, 0x88208), ==, 40);
@@ -348,10 +367,19 @@ static void test_migration(const void *opaque)
     qtest_clock_step(dst, 1);
     g_assert_cmpuint(qtest_readb(dst, IR(28)), ==, 1);
     g_assert_cmpuint(qtest_readb(dst, IR(174)), ==, 1);
+    for (unsigned base = 0x8a100; base <= 0x8a120; base += 0x20) {
+        g_assert_cmpuint(qtest_readb(dst, base + 1), ==, 8);
+    }
     qtest_clock_step(dst, 93999);
+    for (unsigned base = 0x8a100; base <= 0x8a120; base += 0x20) {
+        g_assert_cmphex(qtest_readb(dst, base + 4) & 4, ==, 0);
+    }
     g_assert_cmphex(qtest_readb(dst, 0x8a004) & 4, ==, 0);
     qtest_clock_step(dst, 1);
     g_assert_cmphex(qtest_readb(dst, 0x8a004) & 4, ==, 4);
+    for (unsigned base = 0x8a100; base <= 0x8a120; base += 0x20) {
+        g_assert_cmphex(qtest_readb(dst, base + 4) & 4, ==, 4);
+    }
     qtest_quit(dst);
     qtest_quit(src);
     unlink(file);
