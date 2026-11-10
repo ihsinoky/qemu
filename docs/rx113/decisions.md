@@ -62,3 +62,20 @@ behavior — RX62N above all — must remain completely unchanged, and the
 RX62N regression suite takes priority over the RX113-side wiring.
 D-003's "RX62N code stays untouched" is therefore read as "RX62N
 behavior stays unchanged" for this scope; RX113 remains alongside.
+
+## D-008: Independent event interfaces for ELC (extends D-007)
+Date: 2026-11-10. Decided by: PMO under the D-007 pattern; reported to
+the PO, whose merge gate remains the final decision.
+The Issue #35 audit showed that the shared CMT/TMR/SCI models and the
+RX113 MTU expose only interrupt outputs, which are gated by the
+peripheral interrupt enables, while ELC event signals are independent
+of those enables (17.1, Figure 17.2). Routing IRQ wires into the ELC
+would silently drop events whenever an interrupt is disabled, so a
+faithful ELC requires independent event interfaces on the sources.
+Under the same conditions as D-007, the following are permitted:
+additive, opt-in event outputs on the shared CMT/TMR/SCI models that
+pulse on the documented event regardless of interrupt enables and
+change nothing when unconnected; event outputs and ELC operation
+inputs on the RX113 MTU; and the ELC device plus its wiring on
+RX113. IRQ behavior and RX62N behavior must remain completely
+unchanged, with the existing regression suites as the gate.
