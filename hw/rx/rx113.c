@@ -18,6 +18,7 @@
 #include "hw/rx/rx113_port.h"
 #include "hw/rx/rx113_iwdt.h"
 #include "hw/rx/rx113_mtu.h"
+#include "hw/rx/rx113_s12ad.h"
 #include "hw/misc/unimp.h"
 #include "hw/core/sysbus.h"
 #include "hw/core/irq.h"
@@ -162,6 +163,8 @@ static const struct {
 static void rx113_system_update_clocks(RX113SystemState *s)
 {
     uint64_t source, pclkb = s->mcu->cmt[0].input_freq;
+    uint64_t pclkd = 0;
+    unsigned adiv = extract32(s->regs[SYS_SCKCR], 0, 4);
     unsigned div = extract32(s->regs[SYS_SCKCR], 8, 4);
     unsigned select = extract32(s->regs[SYS_SCKCR3], 8, 3);
     unsigned i;
@@ -199,7 +202,14 @@ static void rx113_system_update_clocks(RX113SystemState *s)
         goto gates;
     }
     pclkb = source >> div;
+    if (adiv <= 6) {
+        pclkd = source >> adiv;
+    } else {
+        qemu_log_mask(LOG_GUEST_ERROR, "rx113: prohibited PCLKD divider\n");
+    }
 gates:
+    rx113_s12ad_set_clock(s->mcu->s12ad, pclkb, pclkd,
+                          s->regs[SYS_MSTPCRA] & (1U << 17));
     rx113_mtu_set_clock(s->mcu->mtu, pclkb,
                         s->regs[SYS_MSTPCRA] & (1U << 9));
     for (i = 0; i < 2; i++) {
@@ -689,7 +699,7 @@ static void register_rtc(RX113State *s, DeviceState *lcdc)
 }
 
 /* Sections 18/19: PORT and MPC, IRQ input selectors (Table 19.1). */
-static void register_port(RX113State *s)
+static DeviceState *register_port(RX113State *s)
 {
     DeviceState *dev = qdev_new(TYPE_RX113_PORT);
 
@@ -699,6 +709,23 @@ static void register_port(RX113State *s)
     for (unsigned i = 0; i < 8; i++) {
         qdev_connect_gpio_out_named(dev, "irq", i,
                                    qdev_get_gpio_in(DEVICE(&s->icu), 64 + i));
+    }
+    return dev;
+}
+
+static void register_s12ad(RX113State *s, DeviceState *port)
+{
+    DeviceState *dev = qdev_new(TYPE_RX113_S12AD);
+
+    s->s12ad = dev;
+    object_property_add_child(OBJECT(s), "s12ad", OBJECT(dev));
+    object_property_set_link(OBJECT(dev), "port", OBJECT(port), &error_abort);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_abort);
+    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, 0x00089000);
+    /* Table 14.3: S12ADI0 and GBADI are edge sources 102 and 103. */
+    for (unsigned i = 0; i < 2; i++) {
+        sysbus_connect_irq(SYS_BUS_DEVICE(dev), i,
+                           qdev_get_gpio_in(DEVICE(&s->icu), 102 + i));
     }
 }
 
@@ -712,7 +739,6 @@ static void register_stubs(void)
     } stubs[] = {
         { "rx113-dtc", 0x00082400, 0x10 },
         { "rx113-dac", 0x00088040, 0x10 },
-        { "rx113-s12ad", 0x00089000, 0x100 },
         { "rx113-cac", 0x0008b000, 0x20 },
         { "rx113-doc", 0x0008b080, 0x10 },
         { "rx113-elc", 0x0008b100, 0x30 },
@@ -781,7 +807,7 @@ static void rx113_realize(DeviceState *dev, Error **errp)
         register_sci(s, i);
     }
     register_rtc(s, register_lcdc(s));
-    register_port(s);
+    register_s12ad(s, register_port(s));
     register_stubs();
 }
 
