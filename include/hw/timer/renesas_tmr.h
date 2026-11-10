@@ -56,6 +56,10 @@ struct RTMRState {
     uint8_t tcsr[TMR_CH];
     int64_t div_round[TMR_CH];
     uint8_t next[TMR_CH];
+    qemu_irq event[TMR_NR_IRQ];
+    bool has_elc;
+    uint8_t elc_mode;
+    bool elc_started;
     qemu_irq cmia[TMR_CH];
     qemu_irq cmib[TMR_CH];
     qemu_irq ovi[TMR_CH];
@@ -70,5 +74,8 @@ struct RTMRState {
  * remains realization-only. Subsequent reset retains this clock policy.
  */
 void renesas_tmr_set_clock(RTMRState *s, uint64_t freq, bool stopped);
+
+/* RX113 ELC operation select: start, restart, event count, disabled. */
+void renesas_tmr_set_elc_mode(RTMRState *s, unsigned mode);
 
 #endif

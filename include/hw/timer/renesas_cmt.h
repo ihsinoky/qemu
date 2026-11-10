@@ -42,6 +42,8 @@ struct RCMTState {
     uint16_t cmcor[CMT_CH];
     int64_t tick[CMT_CH];
     qemu_irq cmi[CMT_CH];
+    qemu_irq event[CMT_CH];
+    uint8_t elc_mode[CMT_CH];
     QEMUTimer timer[CMT_CH];
 };
 
@@ -53,5 +55,8 @@ struct RCMTState {
  * remains realization-only. Subsequent reset retains this clock policy.
  */
 void renesas_cmt_set_clock(RCMTState *s, uint64_t freq, bool stopped);
+
+/* RX113 ELC operation select: start, restart, event count, disabled. */
+void renesas_cmt_set_elc_mode(RCMTState *s, unsigned ch, unsigned mode);
 
 #endif

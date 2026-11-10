@@ -61,7 +61,8 @@ static void cmt_sync(RCMTState *cmt, int ch)
 {
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
-    if (!cmt->module_stopped && (cmt->cmstr & (1 << ch))) {
+    if (!cmt->module_stopped && cmt->elc_mode[ch] != 2 &&
+        (cmt->cmstr & (1 << ch))) {
         cmt->cmcnt[ch] += renesas_timer_ticks(now - cmt->tick[ch],
                                              cmt->input_freq, cmt_div(cmt, ch),
                                              &cmt->phase[ch]);
@@ -77,7 +78,8 @@ static void update_events(RCMTState *cmt, int ch)
         unsigned ticks = (uint16_t)(cmt->cmcor[ch] - cmt->cmcnt[ch]);
 
         timer_del(&cmt->timer[ch]);
-        if (!cmt->module_stopped && (cmt->cmstr & (1 << ch))) {
+        if (!cmt->module_stopped && cmt->elc_mode[ch] != 2 &&
+            (cmt->cmstr & (1 << ch))) {
             timer_mod(&cmt->timer[ch],
                       qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
                       renesas_timer_delay(MAX(1, ticks), cmt->input_freq,
@@ -251,6 +253,48 @@ static void timer_events(RCMTState *cmt, int ch)
     if (FIELD_EX16(cmt->cmcr[ch], CMCR, CMIE)) {
         qemu_irq_pulse(cmt->cmi[ch]);
     }
+    qemu_irq_pulse(cmt->event[ch]);
+}
+
+void renesas_cmt_set_elc_mode(RCMTState *s, unsigned ch, unsigned mode)
+{
+    assert(ch < CMT_CH && mode < 4);
+    if (s->elc_mode[ch] == mode) {
+        return;
+    }
+    cmt_sync(s, ch);
+    s->elc_mode[ch] = mode;
+    update_events(s, ch);
+}
+
+static void cmt_elc_input(void *opaque, int ch, int level)
+{
+    RCMTState *s = opaque;
+
+    if (!level || s->module_stopped || !s->clock_managed ||
+        s->elc_mode[ch] == 3 ||
+        (s->elc_mode[ch] == 0 && (s->cmstr & (1 << ch)))) {
+        return;
+    }
+    cmt_sync(s, ch);
+    switch (s->elc_mode[ch]) {
+    case 0:
+        s->cmstr |= 1 << ch;
+        break;
+    case 1:
+        s->cmcnt[ch] = 0;
+        s->phase[ch] = 0;
+        break;
+    case 2:
+        if (s->cmstr & (1 << ch)) {
+            s->cmcnt[ch]++;
+            if (s->cmcnt[ch] == s->cmcor[ch]) {
+                timer_events(s, ch);
+            }
+        }
+        break;
+    }
+    update_events(s, ch);
 }
 
 static void timer_event0(void *opaque)
@@ -306,6 +350,7 @@ static void rcmt_reset(DeviceState *dev)
             cmt->tick[ch] = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
         }
     }
+    memset(cmt->elc_mode, 3, sizeof(cmt->elc_mode));
     cmt->cmstr = 0;
     cmt->cmcr[0] = cmt->cmcr[1] = 0;
     cmt->cmcnt[0] = cmt->cmcnt[1] = 0;
@@ -325,6 +370,9 @@ static void rcmt_init(Object *obj)
     for (i = 0; i < ARRAY_SIZE(cmt->cmi); i++) {
         sysbus_init_irq(d, &cmt->cmi[i]);
     }
+    memset(cmt->elc_mode, 3, sizeof(cmt->elc_mode));
+    qdev_init_gpio_out_named(DEVICE(obj), cmt->event, "event", CMT_CH);
+    qdev_init_gpio_in_named(DEVICE(obj), cmt_elc_input, "elc", CMT_CH);
     timer_init_ns(&cmt->timer[0], QEMU_CLOCK_VIRTUAL, timer_event0, cmt);
     timer_init_ns(&cmt->timer[1], QEMU_CLOCK_VIRTUAL, timer_event1, cmt);
 }
@@ -337,6 +385,7 @@ static int cmt_pre_load(void *opaque)
     if (s->legacy_input_freq) {
         s->input_freq = s->legacy_input_freq;
     }
+    memset(s->elc_mode, 3, sizeof(s->elc_mode));
     s->clock_managed = false;
     s->module_stopped = false;
     return 0;
@@ -380,6 +429,33 @@ static const VMStateDescription vmstate_cmt_clock = {
     },
 };
 
+static bool cmt_elc_needed(void *opaque)
+{
+    RCMTState *s = opaque;
+
+    return s->elc_mode[0] != 3 || s->elc_mode[1] != 3;
+}
+
+static int cmt_elc_post_load(void *opaque, int version_id)
+{
+    RCMTState *s = opaque;
+
+    return s->clock_managed && s->elc_mode[0] < 4 && s->elc_mode[1] < 4 ?
+           0 : -EINVAL;
+}
+
+static const VMStateDescription vmstate_cmt_elc = {
+    .name = "rx-cmt/elc",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = cmt_elc_needed,
+    .post_load = cmt_elc_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT8_ARRAY(elc_mode, RCMTState, CMT_CH),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static const VMStateDescription vmstate_rcmt = {
     .name = "rx-cmt",
     .version_id = 1,
@@ -396,6 +472,7 @@ static const VMStateDescription vmstate_rcmt = {
     },
     .subsections = (const VMStateDescription * const[]) {
         &vmstate_cmt_clock,
+        &vmstate_cmt_elc,
         NULL
     },
 };

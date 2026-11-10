@@ -35,6 +35,7 @@ struct RSCIState {
     QEMUTimer timer;
     CharFrontend chr;
     qemu_irq irq[SCI_NR_IRQ];
+    qemu_irq event[SCI_NR_IRQ];
 
     uint8_t smr;
     uint8_t brr;
