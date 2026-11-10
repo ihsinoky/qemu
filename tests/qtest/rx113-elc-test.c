@@ -596,11 +596,354 @@ static void test_chained_event_counts(void)
     qtest_quit(qts);
 }
 
+#define PGR1 (ELC + 0x23)
+#define PGC1 (ELC + 0x25)
+#define PDBF1 (ELC + 0x27)
+#define PEL0 (ELC + 0x29)
+#define PEL1 (ELC + 0x2a)
+#define PDRB 0x8c00b
+#define PODRB 0x8c02b
+#define PORT_PATH "/machine/mcu/port"
+
+static void port_input(QTestState *qts, unsigned bit, bool level)
+{
+    qtest_set_irq_in(qts, PORT_PATH, "pin", 11 * 8 + bit, level);
+}
+
+static void port_counter(QTestState *qts, unsigned source)
+{
+    qtest_writeb(qts, ELSR(10), source);
+    qtest_writeb(qts, ELC + 0x22, 0xfe); /* TMR0 event counter. */
+    qtest_writeb(qts, ELC, 0xff);
+}
+
+static void test_port_edges(void)
+{
+    for (unsigned channel = 0; channel < 3; channel++) {
+        for (unsigned mode = 0; mode < 4; mode++) {
+            QTestState *qts = elc_init();
+
+            if (channel < 2) {
+                qtest_writeb(qts, PEL0 + channel, 0x88 | (mode << 5));
+            } else {
+                qtest_writeb(qts, PGR1, 3);
+                qtest_writeb(qts, PGC1, 0x88 | mode);
+            }
+            port_counter(qts, channel < 2 ? 0x65 + channel : 0x63);
+            port_input(qts, 0, true);
+            qtest_clock_step(qts, 32);
+            g_assert_cmpuint(qtest_readb(qts, TMR + 8), ==, mode == 1 ? 0 : 1);
+            port_input(qts, 0, false);
+            qtest_clock_step(qts, 32);
+            g_assert_cmpuint(qtest_readb(qts, TMR + 8), ==, mode >= 2 ? 2 : 1);
+            qtest_quit(qts);
+        }
+    }
+}
+
+static void test_port_single(void)
+{
+    QTestState *qts = elc_init();
+
+    qtest_writeb(qts, PDRB, 1);
+    qtest_writeb(qts, PEL0, 0x88);
+    qtest_writeb(qts, PEL1, 0xa8);
+    qtest_writeb(qts, ELSR(24), 0x69);
+    qtest_writeb(qts, ELSR(25), 0x69);
+    qtest_writeb(qts, ELC, 0xff);
+    qtest_writeb(qts, ELSEGR, 0x7e);
+    qtest_writeb(qts, ELSEGR, 0x7f);
+    qtest_clock_step(qts, 31);
+    g_assert_cmphex(qtest_readb(qts, PODRB), ==, 0);
+    qtest_clock_step(qts, 1); /* D-014: low, then high on the same pin. */
+    g_assert_cmphex(qtest_readb(qts, PODRB), ==, 1);
+    qtest_writeb(qts, PEL1, 0xc8);
+    software(qts); /* Low then toggle. */
+    g_assert_cmphex(qtest_readb(qts, PODRB), ==, 1);
+    qtest_writeb(qts, PEL0, 0xc8);
+    qtest_writeb(qts, PEL1, 0x88);
+    software(qts); /* Toggle then low. */
+    g_assert_cmphex(qtest_readb(qts, PODRB), ==, 0);
+    qtest_writeb(qts, PEL1, 0xc8);
+    software(qts); /* Two toggles compose to identity. */
+    g_assert_cmphex(qtest_readb(qts, PODRB), ==, 0);
+    qtest_writeb(qts, ELSR(25), 0);
+    software(qts);
+    g_assert_cmphex(qtest_readb(qts, PODRB), ==, 1);
+    qtest_writeb(qts, PEL0, 0x90); /* Prohibited PSP is rejected. */
+    g_assert_cmphex(qtest_readb(qts, PEL0), ==, 0xc8);
+    qtest_quit(qts);
+}
+
+static void test_port_group(void)
+{
+    QTestState *qts = elc_init();
+    static const uint8_t rotated[] = { 0x80, 0x08, 0x01, 0x80 };
+
+    qtest_writeb(qts, PDRB, 0x99);
+    qtest_writeb(qts, PODRB, 0x10);
+    qtest_writeb(qts, PGR1, 0x89);
+    qtest_writeb(qts, PDBF1, 0x80);
+    qtest_writeb(qts, PGC1, 0xc8);
+    qtest_writeb(qts, ELSR(20), 0x69);
+    qtest_writeb(qts, PEL0, 0xa8); /* Group wins over single high. */
+    qtest_writeb(qts, ELSR(24), 0x69);
+    qtest_writeb(qts, ELC, 0xff);
+    for (unsigned i = 0; i < ARRAY_SIZE(rotated); i++) {
+        software(qts);
+        g_assert_cmphex(qtest_readb(qts, PODRB), ==, (rotated[i] | 0x10));
+    }
+    qtest_writeb(qts, PDBF1, 8);
+    qtest_writeb(qts, ELSR(20), 0x69); /* Reload rotation sequence. */
+    software(qts);
+    g_assert_cmphex(qtest_readb(qts, PODRB), ==, 0x18);
+    for (unsigned mode = 0; mode < 4; mode++) {
+        qtest_writeb(qts, PGC1, 0x88 | (mode << 4));
+        software(qts);
+        g_assert_cmphex(qtest_readb(qts, PODRB), ==,
+                        0x10 | (mode == 0 || mode == 2 ? 0 :
+                                mode == 1 ? 0x89 : 8));
+    }
+    qtest_quit(qts);
+}
+
+static void test_port_capture(void)
+{
+    QTestState *qts = elc_init();
+
+    qtest_writeb(qts, PDBF1, 0x80);
+    qtest_writeb(qts, PGR1, 3);
+    qtest_writeb(qts, ELSR(22), 0x69);
+    qtest_writeb(qts, ELC, 0xff);
+    port_input(qts, 0, true);
+    software(qts);
+    port_input(qts, 0, false);
+    port_input(qts, 1, true);
+    software(qts); /* Unread capture blocks overwrite. */
+    g_assert_cmphex(qtest_readb(qts, PDBF1), ==, 0x81);
+    software(qts); /* CPU read released protection. */
+    g_assert_cmphex(qtest_readb(qts, PDBF1), ==, 0x82);
+    software(qts);
+    qtest_writeb(qts, PGC1, 0x8c);
+    port_input(qts, 0, true);
+    software(qts); /* PGCOVE allows overwrite of unread data. */
+    g_assert_cmphex(qtest_readb(qts, PDBF1), ==, 0x83);
+    qtest_quit(qts);
+}
+
+static void test_port_write_protection(void)
+{
+    QTestState *qts = elc_init();
+
+    qtest_writeb(qts, PGR1, 3);
+    qtest_writeb(qts, PDRB, 1);
+    qtest_writeb(qts, PEL0, 0x8a); /* Single PB2. */
+    qtest_writeb(qts, PDRB, 5);
+    qtest_writeb(qts, PODRB, 0xff); /* ELCON=0: unrestricted. */
+    qtest_writeb(qts, ELC, 0xff);
+    qtest_writeb(qts, PODRB, 0);
+    g_assert_cmphex(qtest_readb(qts, PODRB), ==, 1);
+    qtest_writeb(qts, ELSR(24), 0x69);
+    qtest_writeb(qts, ELC, 0x7f);
+    qtest_writeb(qts, PODRB, 0xff);
+    qtest_writeb(qts, ELC, 0xff);
+    qtest_writeb(qts, PODRB, 0);
+    g_assert_cmphex(qtest_readb(qts, PODRB), ==, 5);
+    qtest_writeb(qts, PDBF1, 0xff); /* No capture link: writable. */
+    g_assert_cmphex(qtest_readb(qts, PDBF1), ==, 0xff);
+    qtest_writeb(qts, ELSR(22), 0x69);
+    qtest_writeb(qts, PDBF1, 0);
+    g_assert_cmphex(qtest_readb(qts, PDBF1), ==, 2);
+    qtest_writeb(qts, ELSR(22), 0x6a); /* DOC exception. */
+    qtest_writeb(qts, PDBF1, 0);
+    g_assert_cmphex(qtest_readb(qts, PDBF1), ==, 0);
+    qtest_quit(qts);
+}
+
+static void test_port_overlap(void)
+{
+    QTestState *qts = elc_init();
+
+    qtest_writeb(qts, PGR1, 3);
+    qtest_writeb(qts, PEL0, 0x88);
+    qtest_writeb(qts, PEL1, 0x88);
+    port_counter(qts, 0x63);
+    qtest_writeb(qts, ELSR(7), 0x65);
+    qtest_writeb(qts, ELC + 0x21, 0xfb);
+    qtest_writew(qts, CMT, 2);
+    adc_prepare(qts);
+    qtest_writeb(qts, ELSR(15), 0x66);
+    port_input(qts, 0, true);
+    qtest_clock_step(qts, 32);
+    g_assert_cmpuint(qtest_readb(qts, TMR + 8), ==, 1);
+    g_assert_cmpuint(qtest_readw(qts, CMT + 10), ==, 1);
+    adc_completed(qts);
+    qtest_quit(qts);
+}
+
+static void test_port_package(void)
+{
+    QTestState *qts = qtest_init(
+        "-M rx113-r5f51138 -global rx113-port.package-pins=64");
+
+    elc_configure(qts);
+    qtest_writeb(qts, PDRB, 0xc0);
+    qtest_writeb(qts, PEL0, 0xae);
+    qtest_writeb(qts, ELSR(24), 0x69);
+    qtest_writeb(qts, ELC, 0xff);
+    software(qts);
+    g_assert_cmphex(qtest_readb(qts, PODRB), ==, 0x40);
+    qtest_writeb(qts, 0x8c121, 0xc0); /* Shared pads now select PC0/1. */
+    qtest_writeb(qts, PEL0, 0x8e);
+    software(qts);
+    g_assert_cmphex(qtest_readb(qts, PODRB), ==, 0);
+    qtest_writeb(qts, 0x8c121, 0);
+    g_assert_cmphex(qtest_readb(qts, PODRB), ==, 0x40);
+    qtest_quit(qts);
+}
+
+static void port_dtc_copy(QTestState *qts, unsigned src, unsigned dst)
+{
+    qtest_writeb(qts, IR(27), 0);
+    qtest_writel(qts, 0x82404, 0x400);
+    qtest_writel(qts, 0x400 + 27 * 4, 0x1000);
+    qtest_writel(qts, 0x1000, 0); /* Normal byte transfer. */
+    qtest_writel(qts, 0x1004, src);
+    qtest_writel(qts, 0x1008, dst);
+    qtest_writel(qts, 0x100c, 0x10000);
+    qtest_writeb(qts, 0x8711b, 1);
+    qtest_writeb(qts, 0x87203, 8);
+    qtest_writeb(qts, 0x8240c, 1);
+    qtest_set_irq_in(qts, "/machine/mcu/dtc", NULL, 27, 1);
+    qtest_set_irq_in(qts, "/machine/mcu/dtc", NULL, 27, 0);
+    qtest_clock_step(qts, 1);
+}
+
+static void test_port_dtc(void)
+{
+    QTestState *qts = elc_init();
+
+    qtest_writeb(qts, PGR1, 3);
+    qtest_writeb(qts, PDRB, 1);
+    qtest_writeb(qts, PODRB, 1);
+    qtest_writeb(qts, ELSR(22), 0x69);
+    qtest_writeb(qts, ELC, 0xff);
+    port_input(qts, 1, true);
+    software(qts);
+    qtest_writeb(qts, 0x2000, 0);
+    port_dtc_copy(qts, 0x2000, PODRB);
+    g_assert_cmphex(qtest_readb(qts, PODRB), ==, 1);
+    port_dtc_copy(qts, 0x2000, PDBF1);
+    port_input(qts, 1, false);
+    software(qts);
+    port_dtc_copy(qts, PDBF1, 0x3000); /* Releases unread protection. */
+    g_assert_cmphex(qtest_readb(qts, 0x3000), ==, 2);
+    software(qts);
+    g_assert_cmphex(qtest_readb(qts, PDBF1), ==, 0);
+    qtest_quit(qts);
+}
+
+static void test_port_peripheral(void)
+{
+    QTestState *qts = elc_init();
+
+    qtest_writeb(qts, PDRB, 1);
+    qtest_writeb(qts, PEL0, 0xa8);
+    qtest_writeb(qts, ELSR(24), 0x1f); /* CMT1 compare, IRQ disabled. */
+    qtest_writeb(qts, ELC, 0xff);
+    fire_timer(qts, 0x1f);
+    g_assert_cmphex(qtest_readb(qts, PODRB), ==, 1);
+    qtest_quit(qts);
+}
+
+static void test_port_migration(const void *opaque)
+{
+    bool stopped = GPOINTER_TO_UINT(opaque);
+    QTestState *src = elc_init();
+    QTestState *dst;
+    g_autofree char *dir = g_dir_make_tmp("rx113-elc-port-XXXXXX", NULL);
+    g_autofree char *file = g_strdup_printf("%s/state", dir);
+    g_autofree char *uri = g_strdup_printf("file:%s", file);
+    int64_t now;
+
+    qtest_writeb(src, PDRB, 0x89);
+    qtest_writeb(src, PGR1, 0x8f);
+    qtest_writeb(src, PDBF1, 0x80);
+    qtest_writeb(src, PGC1, 0xc8);
+    qtest_writeb(src, ELSR(20), 0x69);
+    qtest_writeb(src, ELSR(22), 0x69);
+    qtest_writeb(src, ELC, 0xff);
+    port_input(src, 1, true);
+    software(src); /* First transfer, and unread capture of PB1. */
+    g_assert_cmphex(qtest_readb(src, PODRB), ==, 0x80);
+    port_input(src, 1, false);
+    port_input(src, 2, true);
+    port_counter(src, 0x63);
+    qtest_writeb(src, ELSEGR, 0x7f); /* Queue next rotation/capture. */
+    now = qtest_clock_step(src, 10);
+    if (stopped) {
+        qtest_writel(src, MSTPCRB, RUN_B | (1 << 9));
+        qtest_writeb(src, PDBF1, 0); /* Stopped MMIO has no effect. */
+        g_assert_cmphex(qtest_readb(src, PDBF1), ==, 0);
+    }
+    qtest_qmp_assert_success(src, "{'execute':'migrate',"
+                            "'arguments':{'uri':%s}}", uri);
+    migration_wait(src);
+    dst = qtest_init("-M rx113-r5f51138 -incoming defer");
+    qtest_clock_set(dst, now);
+    qtest_qmp_assert_success(dst, "{'execute':'migrate-incoming',"
+                            "'arguments':{'uri':%s}}", uri);
+    migration_wait(dst);
+    qtest_clock_step(dst, 22);
+    if (stopped) {
+        qtest_writel(dst, MSTPCRB, RUN_B);
+    }
+    g_assert_cmphex(qtest_readb(dst, PODRB), ==, stopped ? 0x80 : 8);
+    qtest_clock_step(dst, 32);
+    g_assert_cmpuint(qtest_readb(dst, TMR + 8), ==, 0);
+    software(dst); /* Retained rotation phase and unread protection. */
+    g_assert_cmphex(qtest_readb(dst, PODRB), ==, stopped ? 8 : 1);
+    g_assert_cmphex(qtest_readb(dst, PDBF1), ==, 0x82);
+    software(dst); /* Reading PDBF released capture protection. */
+    g_assert_cmphex(qtest_readb(dst, PDBF1), ==, 0x84);
+    qtest_qmp_assert_success(dst, "{'execute':'system_reset'}");
+    elc_configure(dst);
+    g_assert_cmphex(qtest_readb(dst, PDBF1), ==, 0);
+    g_assert_cmphex(qtest_readb(dst, PGR1), ==, 0);
+    qtest_writeb(dst, PDRB, 0x89);
+    qtest_writeb(dst, PGR1, 0x89);
+    qtest_writeb(dst, PDBF1, 0x80);
+    qtest_writeb(dst, PGC1, 0xc8);
+    qtest_writeb(dst, ELSR(20), 0x69);
+    qtest_writeb(dst, ELC, 0xff);
+    software(dst);
+    g_assert_cmphex(qtest_readb(dst, PODRB), ==, 0x80);
+    qtest_quit(dst);
+    qtest_quit(src);
+    unlink(file);
+    rmdir(dir);
+}
+
 int main(int argc, char **argv)
 {
     static const unsigned timers[] = { 8, 12, 16, 21, 0x1f, 0x22, 0x28 };
 
     g_test_init(&argc, &argv, NULL);
+    qtest_add_func("/rx113-elc/port-edges", test_port_edges);
+    qtest_add_func("/rx113-elc/port-peripheral", test_port_peripheral);
+    qtest_add_func("/rx113-elc/port-dtc", test_port_dtc);
+    qtest_add_data_func("/rx113-elc/port-migration", GUINT_TO_POINTER(0),
+                        test_port_migration);
+    qtest_add_data_func("/rx113-elc/port-migration-stopped",
+                        GUINT_TO_POINTER(1),
+                        test_port_migration);
+    qtest_add_func("/rx113-elc/port-single", test_port_single);
+    qtest_add_func("/rx113-elc/port-group", test_port_group);
+    qtest_add_func("/rx113-elc/port-capture", test_port_capture);
+    qtest_add_func("/rx113-elc/port-write-protection",
+                   test_port_write_protection);
+    qtest_add_func("/rx113-elc/port-overlap", test_port_overlap);
+    qtest_add_func("/rx113-elc/port-package", test_port_package);
     for (unsigned id = 8; id < 0x1a; id++) {
         g_autofree char *name = g_strdup_printf(
             "/rx113-elc/mtu-event/%02x", id);
