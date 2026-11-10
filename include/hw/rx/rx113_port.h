@@ -30,6 +30,7 @@ struct RX113PortState {
     qemu_irq irq[8];
     qemu_irq cacref;
     bool ctsu_fixed, ctsu_level;
+    uint16_t mtioc, mtioc_oe;
 };
 
 void rx113_port_set_ctsu(RX113PortState *s, bool fixed, bool level);

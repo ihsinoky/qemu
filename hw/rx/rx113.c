@@ -822,6 +822,13 @@ static DeviceState *register_port(RX113State *s)
     }
     qdev_connect_gpio_out_named(dev, "cacref", 0,
                                qdev_get_gpio_in_named(s->cac, "cacref", 0));
+    for (unsigned i = 0; i < RX113_MTIOC_PINS; i++) {
+        qdev_connect_gpio_out_named(s->mtu, "mtioc", i,
+                                   qdev_get_gpio_in_named(dev, "mtioc", i));
+        qdev_connect_gpio_out_named(s->mtu, "mtioc-oe", i,
+                                   qdev_get_gpio_in_named(dev, "mtioc",
+                                                       i + RX113_MTIOC_PINS));
+    }
     return dev;
 }
 

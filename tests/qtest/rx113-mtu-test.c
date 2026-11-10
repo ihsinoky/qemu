@@ -680,9 +680,472 @@ static void test_migrate_continuous(void)
     rmdir(dir);
 }
 
+#define PORT_BASE 0x8c000
+
+static const unsigned tior[] = { 0x102, 0x182, 0x202, 4, 6 };
+/* One pad per actual MTIOC signal; all are bonded in the 100-pin part. */
+static const unsigned output_pad[][4] = {
+    { 0x14, 0x15, 0x32, 0x02 }, { 0x20, 0x21 }, { 0x26, 0x27 },
+    { 0x17, 0x22, 0x16, 0x23 }, { 0x24, 0x30, 0x25, 0x31 },
+};
+
+static unsigned pad_property(QTestState *qts, const char *property,
+                             unsigned name)
+{
+    QDict *rsp = qtest_qmp(qts,
+        "{'execute':'qom-get','arguments':{'path':'/machine/mcu/port',"
+        "'property':%s}}", property);
+    const char *str = qdict_get_str(rsp, "return");
+    unsigned value;
+
+    g_assert_cmpint(sscanf(str + (name >> 4) * 2, "%2x", &value), ==, 1);
+    qobject_unref(rsp);
+    return (value >> (name & 7)) & 1;
+}
+
+static void select_pad(QTestState *qts, unsigned name, unsigned psel)
+{
+    unsigned port = name >> 4, bit = name & 7;
+    unsigned pmr = PORT_BASE + 0x60 + port;
+    unsigned old = qtest_readb(qts, pmr);
+
+    qtest_writeb(qts, pmr, old & ~(1 << bit));
+    qtest_writeb(qts, PORT_BASE + 0x11f, 0);
+    qtest_writeb(qts, PORT_BASE + 0x11f, 0x40);
+    qtest_writeb(qts, PORT_BASE + 0x140 + port * 8 + bit, psel);
+    qtest_writeb(qts, pmr, old | (1 << bit));
+}
+
+static void assert_pad(QTestState *qts, unsigned name, bool driven, bool level)
+{
+    g_assert_cmpuint(pad_property(qts, "driving", name), ==, driven);
+    g_assert_cmpuint(pad_property(qts, "levels", name), ==, level);
+    g_assert_cmpuint((qtest_readb(qts, PORT_BASE + 0x40 + (name >> 4)) >>
+                     (name & 7)) & 1, ==, level);
+}
+
+static void set_io(QTestState *qts, unsigned ch, unsigned gr, unsigned io)
+{
+    unsigned addr = BASE + tior[ch] + gr / 2;
+    unsigned shift = (gr & 1) * 4;
+    unsigned old = qtest_readb(qts, addr);
+
+    qtest_writeb(qts, addr, (old & ~(15 << shift)) | (io << shift));
+}
+
+/* Tables 20.12-27: every output's initial, set, clear and toggle levels. */
+static void test_pad_normal(void)
+{
+    static const unsigned ngr[] = { 4, 2, 2, 4, 4 };
+    QTestState *qts = mtu_init();
+
+    qtest_writeb(qts, BASE + 0xa, 0xff);
+    for (unsigned ch = 0; ch < 5; ch++) {
+        qtest_writeb(qts, BASE + tcr[ch], 0x21);
+        for (unsigned gr = 0; gr < ngr[ch]; gr++) {
+            unsigned pad = output_pad[ch][gr];
+            unsigned psel = pad == 0x14 ? 3 : 1;
+
+            select_pad(qts, pad, psel);
+            for (unsigned io = 0; io < 8; io++) {
+                bool initial = io & 4;
+                bool enabled = io & 3;
+                bool result = (io & 3) == 3 ? !initial : (io & 3) == 2;
+
+                start_channel(qts, ch, false);
+                qtest_writew(qts, BASE + count[ch], 0);
+                qtest_writew(qts, BASE + tgr[ch][0], 19);
+                qtest_writew(qts, BASE + tgr[ch][gr], 9);
+                set_io(qts, ch, gr, io);
+                assert_pad(qts, pad, enabled, enabled && initial);
+                start_channel(qts, ch, true);
+                qtest_clock_step(qts, 1249);
+                assert_pad(qts, pad, enabled, enabled && initial);
+                qtest_clock_step(qts, 1);
+                assert_pad(qts, pad, enabled, enabled && result);
+                /* Stopping retains the output; rewriting TIOR initializes. */
+                start_channel(qts, ch, false);
+                qtest_clock_step(qts, 5000);
+                assert_pad(qts, pad, enabled, enabled && result);
+                set_io(qts, ch, gr, io);
+                assert_pad(qts, pad, enabled, enabled && initial);
+            }
+            set_io(qts, ch, gr, 0);
+            qtest_writew(qts, BASE + tgr[ch][gr], 0xffff);
+        }
+    }
+    qtest_quit(qts);
+}
+
+/* 20.3.5: paired matches drive A/C, never B/D; equal TGRs retain level. */
+static void test_pad_pwm1(void)
+{
+    static const unsigned ngr[] = { 4, 2, 2, 4, 4 };
+    QTestState *qts = mtu_init();
+
+    qtest_writeb(qts, BASE + 0xa, 0xff);
+    for (unsigned ch = 0; ch < 5; ch++) {
+        for (unsigned gr = 0; gr < ngr[ch]; gr += 2) {
+            unsigned pad = output_pad[ch][gr];
+            unsigned psel = pad == 0x14 ? 3 : 1;
+
+            qtest_writeb(qts, BASE + mode[ch], 2);
+            qtest_writeb(qts, BASE + tcr[ch], gr ? 0xa1 : 0x21);
+            qtest_writew(qts, BASE + count[ch], 0);
+            qtest_writew(qts, BASE + tgr[ch][gr], 99);
+            qtest_writew(qts, BASE + tgr[ch][gr + 1], 24);
+            select_pad(qts, pad, psel);
+            select_pad(qts, output_pad[ch][gr + 1], 1);
+            qtest_writeb(qts, BASE + tior[ch] + gr / 2, 0x21);
+            assert_pad(qts, pad, true, false);
+            assert_pad(qts, output_pad[ch][gr + 1], false, false);
+            start_channel(qts, ch, true);
+            for (unsigned cycle = 0; cycle < 3; cycle++) {
+                qtest_clock_step(qts, 3124);
+                assert_pad(qts, pad, true, false);
+                qtest_clock_step(qts, 1);
+                assert_pad(qts, pad, true, true);
+                qtest_clock_step(qts, 9374);
+                assert_pad(qts, pad, true, true);
+                qtest_clock_step(qts, 1);
+                assert_pad(qts, pad, true, false);
+            }
+            /* Unreachable duty match gives flat low (0%). */
+            qtest_writew(qts, BASE + tgr[ch][gr + 1], 199);
+            qtest_clock_step(qts, 25000);
+            assert_pad(qts, pad, true, false);
+            /* Equal matches retain low, then retain high after a duty match. */
+            qtest_writew(qts, BASE + tgr[ch][gr + 1], 99);
+            qtest_clock_step(qts, 25000);
+            assert_pad(qts, pad, true, false);
+            qtest_writew(qts, BASE + tgr[ch][gr + 1], 24);
+            qtest_clock_step(qts, 3125);
+            assert_pad(qts, pad, true, true);
+            qtest_writew(qts, BASE + tgr[ch][gr + 1], 99);
+            qtest_clock_step(qts, 21875);
+            assert_pad(qts, pad, true, true); /* 100% */
+            start_channel(qts, ch, false);
+            /* Back to normal: A stays high until TIOR is written. */
+            qtest_writeb(qts, BASE + mode[ch], 0);
+            assert_pad(qts, pad, true, true);
+            set_io(qts, ch, gr, 1);
+            assert_pad(qts, pad, true, false);
+            qtest_writeb(qts, BASE + tior[ch] + gr / 2, 0);
+            qtest_writew(qts, BASE + tgr[ch][gr], 0xffff);
+            qtest_writew(qts, BASE + tgr[ch][gr + 1], 0xffff);
+        }
+    }
+    qtest_quit(qts);
+}
+
+static void test_pad_pwm2(void)
+{
+    QTestState *qts = mtu_init();
+
+    for (unsigned ch = 0; ch < 3; ch++) {
+        unsigned pad = output_pad[ch][0];
+
+        select_pad(qts, pad, pad == 0x14 ? 3 : 1);
+        qtest_writeb(qts, BASE + mode[ch], 3);
+        qtest_writeb(qts, BASE + tcr[ch], 0x41); /* cycle B */
+        qtest_writeb(qts, BASE + tior[ch], 0x12);
+        qtest_writew(qts, BASE + tgr[ch][0], 24);
+        qtest_writew(qts, BASE + tgr[ch][1], 99);
+        start_channel(qts, ch, true);
+        for (unsigned cycle = 0; cycle < 3; cycle++) {
+            qtest_clock_step(qts, 3124);
+            assert_pad(qts, pad, true, false);
+            qtest_clock_step(qts, 1);
+            assert_pad(qts, pad, true, true);
+            qtest_clock_step(qts, 9375);
+            assert_pad(qts, pad, true, false);
+        }
+        qtest_writew(qts, BASE + tgr[ch][0], 199);
+        qtest_clock_step(qts, 25000);
+        assert_pad(qts, pad, true, false);
+        qtest_writew(qts, BASE + tgr[ch][0], 99);
+        qtest_clock_step(qts, 12500);
+        assert_pad(qts, pad, true, false);
+        qtest_writew(qts, BASE + tgr[ch][0], 24);
+        qtest_clock_step(qts, 3125);
+        assert_pad(qts, pad, true, true);
+        qtest_writew(qts, BASE + tgr[ch][0], 99);
+        qtest_clock_step(qts, 21875);
+        assert_pad(qts, pad, true, true);
+        /* CPU zero writes restore initial level in PWM2. */
+        qtest_writew(qts, BASE + count[ch], 0);
+        assert_pad(qts, pad, true, false);
+        start_channel(qts, ch, false);
+    }
+    qtest_quit(qts);
+}
+
+static void test_pad_output_control(void)
+{
+    QTestState *qts = mtu_init();
+    static const unsigned pads[] = { 0x22, 0x24, 0x30, 0x23, 0x25, 0x31 };
+
+    g_assert_cmphex(qtest_readb(qts, BASE + 0xa), ==, 0xc0);
+    qtest_writeb(qts, BASE + 0xa, 0xff);
+    qtest_writeb(qts, BASE + 4, 0x66);
+    qtest_writeb(qts, BASE + 5, 0x66);
+    qtest_writeb(qts, BASE + 6, 0x66);
+    qtest_writeb(qts, BASE + 7, 0x66);
+    for (unsigned i = 0; i < G_N_ELEMENTS(pads); i++) {
+        select_pad(qts, pads[i], 1);
+    }
+    for (unsigned i = 0; i < G_N_ELEMENTS(pads); i++) {
+        qtest_writeb(qts, BASE + 0xa, 1 << i);
+        for (unsigned j = 0; j < G_N_ELEMENTS(pads); j++) {
+            assert_pad(qts, pads[j], i == j, i == j);
+        }
+    }
+    /* TRWER guards TOER and TOCR1/2, but not TOLBR (20.2.16). */
+    qtest_writeb(qts, BASE + 0xe, 0x47);
+    qtest_writeb(qts, BASE + 0xf, 0xff);
+    qtest_writeb(qts, BASE + 0x36, 0xff);
+    qtest_readb(qts, RWE);
+    qtest_writeb(qts, RWE, 0);
+    qtest_writeb(qts, BASE + 0xa, 0);
+    qtest_writeb(qts, BASE + 0xe, 0);
+    qtest_writeb(qts, BASE + 0xf, 0);
+    qtest_writeb(qts, BASE + 0x36, 0x15);
+    g_assert_cmphex(qtest_readb(qts, BASE + 0xe), ==, 0);
+    g_assert_cmphex(qtest_readb(qts, BASE + 0x36), ==, 0x15);
+    qtest_writeb(qts, RWE, 1);
+    g_assert_cmphex(qtest_readb(qts, BASE + 0xa), ==, 0xe0);
+    g_assert_cmphex(qtest_readb(qts, BASE + 0xe), ==, 0x47);
+    g_assert_cmphex(qtest_readb(qts, BASE + 0xf), ==, 0xff);
+    qtest_writeb(qts, BASE + 0xe, 0xf);
+    qtest_writeb(qts, BASE + 0xe, 0x40);
+    g_assert_cmphex(qtest_readb(qts, BASE + 0xe), ==, 0x4f);
+    qtest_qmp_assert_success(qts, "{'execute':'system_reset'}");
+    qtest_writew(qts, 0x803fe, 0xa503);
+    qtest_writel(qts, MSTPCRA, 0xeffffdff);
+    g_assert_cmphex(qtest_readb(qts, BASE + 0xa), ==, 0xc0);
+    g_assert_cmphex(qtest_readb(qts, BASE + 0xe), ==, 0);
+    g_assert_cmphex(qtest_readb(qts, BASE + 0xf), ==, 0);
+    g_assert_cmphex(qtest_readb(qts, BASE + 0x36), ==, 0);
+    for (unsigned i = 0; i < G_N_ELEMENTS(pads); i++) {
+        assert_pad(qts, pads[i], false, false);
+    }
+    qtest_quit(qts);
+}
+
+static void test_pad_sync_and_buffers(void)
+{
+    QTestState *qts = mtu_init();
+
+    /* Five PWM2 duty pads share MTU1 B's synchronous cycle (Fig. 20.27). */
+    qtest_writeb(qts, SYNC, 3);
+    qtest_writeb(qts, BASE + tcr[0], 0x61);
+    qtest_writeb(qts, BASE + tcr[1], 0x41);
+    qtest_writeb(qts, BASE + mode[0], 3);
+    qtest_writeb(qts, BASE + mode[1], 3);
+    qtest_writeb(qts, BASE + tior[0], 0x22);
+    qtest_writeb(qts, BASE + tior[0] + 1, 0x22);
+    qtest_writeb(qts, BASE + tior[1], 0x12);
+    for (unsigned gr = 0; gr < 4; gr++) {
+        unsigned pad = output_pad[0][gr];
+
+        select_pad(qts, pad, pad == 0x14 ? 3 : 1);
+        qtest_writew(qts, BASE + tgr[0][gr], gr == 3 ? 99 : 24);
+    }
+    select_pad(qts, 0x20, 1);
+    qtest_writew(qts, BASE + tgr[1][0], 24);
+    qtest_writew(qts, BASE + tgr[1][1], 99);
+    qtest_writeb(qts, START, 3);
+    qtest_clock_step(qts, 3125);
+    for (unsigned gr = 0; gr < 4; gr++) {
+        assert_pad(qts, output_pad[0][gr], true, gr != 3);
+    }
+    assert_pad(qts, 0x20, true, true);
+    qtest_clock_step(qts, 9375);
+    for (unsigned gr = 0; gr < 4; gr++) {
+        assert_pad(qts, output_pad[0][gr], true, false);
+    }
+    assert_pad(qts, 0x20, true, false);
+    qtest_writeb(qts, START, 0);
+    qtest_writeb(qts, SYNC, 0);
+    /* Buffered PWM1: new period/duty apply after the old cycle clears. */
+    qtest_writeb(qts, BASE + mode[0], 0x32);
+    qtest_writeb(qts, BASE + tcr[0], 0x21);
+    qtest_writeb(qts, BASE + tior[0], 0x21);
+    qtest_writeb(qts, BASE + 0x126, 3);
+    qtest_writew(qts, BASE + tgr[0][0], 99);
+    qtest_writew(qts, BASE + tgr[0][1], 24);
+    qtest_writew(qts, BASE + tgr[0][2], 199);
+    qtest_writew(qts, BASE + tgr[0][3], 49);
+    assert_pad(qts, output_pad[0][2], false, false);
+    start_channel(qts, 0, true);
+    qtest_clock_step(qts, 3125);
+    assert_pad(qts, 0x14, true, true);
+    qtest_clock_step(qts, 9375);
+    assert_pad(qts, 0x14, true, false);
+    qtest_clock_step(qts, 6249);
+    assert_pad(qts, 0x14, true, false);
+    qtest_clock_step(qts, 1);
+    assert_pad(qts, 0x14, true, true);
+    /* Module stop retains both the current pad and the fractional clock. */
+    qtest_writel(qts, MSTPCRA, 0xefffffff);
+    qtest_clock_step(qts, 100000);
+    assert_pad(qts, 0x14, true, true);
+    qtest_writel(qts, MSTPCRA, 0xeffffdff);
+    qtest_clock_step(qts, 18750);
+    assert_pad(qts, 0x14, true, false);
+    qtest_quit(qts);
+}
+
+static void test_pad_migration(void)
+{
+    QTestState *src = mtu_init();
+    QTestState *dst;
+    int64_t now;
+    g_autofree char *dir = g_dir_make_tmp("rx113-mtu-pad-XXXXXX", NULL);
+    g_autofree char *file = g_strdup_printf("%s/state", dir);
+    g_autofree char *uri = g_strdup_printf("file:%s", file);
+
+    g_assert_nonnull(dir);
+    select_pad(src, 0xb3, 1);
+    qtest_writeb(src, BASE + tcr[0], 0x21);
+    qtest_writeb(src, BASE + mode[0], 2);
+    qtest_writeb(src, BASE + tior[0], 0x21);
+    qtest_writew(src, BASE + tgr[0][0], 99);
+    qtest_writew(src, BASE + tgr[0][1], 24);
+    start_channel(src, 0, true);
+    now = qtest_clock_step(src, 5062);
+    assert_pad(src, 0xb3, true, true);
+    qtest_qmp_assert_success(src, "{'execute':'migrate',"
+                            "'arguments':{'uri':%s}}", uri);
+    migration_wait(src);
+    dst = qtest_init("-M rx113-r5f51138 -incoming defer");
+    qtest_clock_set(dst, now);
+    qtest_qmp_assert_success(dst, "{'execute':'migrate-incoming',"
+                            "'arguments':{'uri':%s}}", uri);
+    migration_wait(dst);
+    assert_pad(dst, 0xb3, true, true);
+    qtest_clock_step(dst, 7437);
+    assert_pad(dst, 0xb3, true, true);
+    qtest_clock_step(dst, 1);
+    assert_pad(dst, 0xb3, true, false);
+    qtest_quit(dst);
+    qtest_quit(src);
+    unlink(file);
+    rmdir(dir);
+}
+
+static void test_pad_zero_period(void)
+{
+    QTestState *qts = mtu_init();
+
+    select_pad(qts, 0x14, 3);
+    qtest_writeb(qts, BASE + tcr[0], 0x20); /* PCLK/1, zero period */
+    qtest_writew(qts, BASE + tgr[0][0], 0);
+    qtest_writeb(qts, BASE + tior[0], 5); /* initial high, clear on match */
+    start_channel(qts, 0, true);
+    qtest_clock_step(qts, 31);
+    assert_pad(qts, 0x14, true, true);
+    qtest_clock_step(qts, 1);
+    assert_pad(qts, 0x14, true, false);
+    qtest_clock_step(qts, 1000000000);
+    assert_pad(qts, 0x14, true, false);
+    start_channel(qts, 0, false);
+    qtest_writeb(qts, BASE + tcr[0], 0x20);
+    qtest_writeb(qts, BASE + tior[0], 3);
+    start_channel(qts, 0, true);
+    /* Four PCLK/1 matches per 125 ns; odd and even toggles are observable. */
+    qtest_clock_step(qts, 32);
+    assert_pad(qts, 0x14, true, true);
+    qtest_clock_step(qts, 31);
+    assert_pad(qts, 0x14, true, false);
+    qtest_clock_step(qts, 31);
+    assert_pad(qts, 0x14, true, true);
+    qtest_clock_step(qts, 31);
+    assert_pad(qts, 0x14, true, false);
+    qtest_quit(qts);
+}
+
+static void test_pad_mux(void)
+{
+    static const struct {
+        unsigned pad, psel, ch, gr;
+    } routes[] = {
+        { 0x04, 1, 0, 0 }, { 0x13, 1, 0, 1 },
+        { 0xb0, 2, 0, 2 }, { 0xa3, 1, 0, 3 },
+        { 0x56, 3, 1, 0 }, { 0xa3, 3, 1, 1 },
+        { 0xe0, 2, 2, 0 }, { 0xa4, 3, 2, 1 },
+        { 0xe4, 3, 3, 0 }, { 0xb3, 3, 3, 1 },
+        { 0x123, 1, 3, 2 }, { 0x16, 2, 3, 3 },
+        { 0xb3, 2, 4, 0 }, { 0xd1, 1, 4, 1 },
+        { 0xe1, 1, 4, 2 }, { 0xd2, 1, 4, 3 },
+    };
+    QTestState *qts = mtu_init();
+
+    qtest_writeb(qts, BASE + 0xa, 0xff);
+    for (unsigned i = 0; i < G_N_ELEMENTS(routes); i++) {
+        unsigned pad = routes[i].pad;
+        unsigned port = pad >> 4, bit = pad & 7;
+
+        set_io(qts, routes[i].ch, routes[i].gr, 6);
+        select_pad(qts, pad, routes[i].psel);
+        assert_pad(qts, pad, true, true);
+        /* GPIO latch/direction cannot change a selected MTIOC output. */
+        qtest_writeb(qts, PORT_BASE + 0x20 + port, 0);
+        qtest_writeb(qts, PORT_BASE + port, 0);
+        assert_pad(qts, pad, true, true);
+        qtest_writeb(qts, PORT_BASE + 0x60 + port, 0);
+        assert_pad(qts, pad, false, false);
+        set_io(qts, routes[i].ch, routes[i].gr, 0);
+        /* An invalid PSEL never selects the MTU signal. */
+        select_pad(qts, pad, 0);
+        assert_pad(qts, pad, false, false);
+        qtest_writeb(qts, PORT_BASE + 0x60 + port, 0);
+        qtest_writeb(qts, PORT_BASE + port, 1 << bit);
+        qtest_writeb(qts, PORT_BASE + 0x20 + port, 1 << bit);
+        assert_pad(qts, pad, true, true);
+        qtest_writeb(qts, PORT_BASE + port, 0);
+        qtest_writeb(qts, PORT_BASE + 0x20 + port, 0);
+    }
+    qtest_quit(qts);
+}
+
+static void test_pad_package64(void)
+{
+    QTestState *qts = qtest_init("-M rx113-r5f51138 "
+                               "-global rx113-port.package-pins=64");
+
+    qtest_writew(qts, 0x803fe, 0xa503);
+    qtest_writel(qts, MSTPCRA, 0xeffffdff);
+    qtest_writeb(qts, BASE + 0xa, 0xff);
+    set_io(qts, 3, 1, 6);
+    select_pad(qts, 0xb7, 1);
+    assert_pad(qts, 0xb7, true, true);
+    /* PSRA switches GPIO names; the peripheral selection remains PB7. */
+    qtest_writeb(qts, PORT_BASE + 0x121, 0x80);
+    qtest_writeb(qts, PORT_BASE + 12, 2);
+    g_assert_cmpuint(pad_property(qts, "driving", 0xb7), ==, 1);
+    g_assert_cmpuint(pad_property(qts, "levels", 0xb7), ==, 1);
+    g_assert_cmphex(qtest_readb(qts, PORT_BASE + 0x40 + 12) & 2, ==, 2);
+    g_assert_cmphex(qtest_readb(qts, PORT_BASE + 0x40 + 11) & 0x80, ==, 0);
+    /* Unbonded P04 cannot become an MTIOC0A output in the 64-pin package. */
+    set_io(qts, 0, 0, 6);
+    select_pad(qts, 0x04, 1);
+    assert_pad(qts, 0x04, false, false);
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
+    qtest_add_func("/rx113-mtu/pad-package64", test_pad_package64);
+    qtest_add_func("/rx113-mtu/pad-mux", test_pad_mux);
+    qtest_add_func("/rx113-mtu/pad-zero-period", test_pad_zero_period);
+    qtest_add_func("/rx113-mtu/pad-migration", test_pad_migration);
+    qtest_add_func("/rx113-mtu/pad-sync-buffers", test_pad_sync_and_buffers);
+    qtest_add_func("/rx113-mtu/pad-normal", test_pad_normal);
+    qtest_add_func("/rx113-mtu/pad-pwm1", test_pad_pwm1);
+    qtest_add_func("/rx113-mtu/pad-pwm2", test_pad_pwm2);
+    qtest_add_func("/rx113-mtu/pad-output-control", test_pad_output_control);
     qtest_add_func("/rx113-mtu/compare", test_compare);
     qtest_add_func("/rx113-mtu/clear", test_clear);
     qtest_add_func("/rx113-mtu/overflow", test_overflow);

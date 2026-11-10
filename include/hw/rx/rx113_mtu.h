@@ -12,6 +12,8 @@
 OBJECT_DECLARE_SIMPLE_TYPE(RX113MTUState, RX113_MTU)
 
 #define RX113_MTU_IRQS 28
+/* MTIOC0A..D, MTIOC1A..B, MTIOC2A..B, MTIOC3A..D, MTIOC4A..D. */
+#define RX113_MTIOC_PINS 16
 /* Event subscription permits the zero-period optimization when ELC is idle. */
 void rx113_mtu_set_elc_events(DeviceState *dev, uint32_t mask);
 void rx113_mtu_set_clock(DeviceState *dev, uint64_t hz, bool stopped);
