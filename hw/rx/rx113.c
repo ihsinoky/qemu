@@ -21,6 +21,7 @@
 #include "hw/rx/rx113_s12ad.h"
 #include "hw/rx/rx113_dtc.h"
 #include "hw/rx/rx113_elc.h"
+#include "hw/rx/rx113_doc.h"
 #include "hw/misc/unimp.h"
 #include "hw/core/sysbus.h"
 #include "hw/core/irq.h"
@@ -210,6 +211,8 @@ static void rx113_system_update_clocks(RX113SystemState *s)
         qemu_log_mask(LOG_GUEST_ERROR, "rx113: prohibited PCLKD divider\n");
     }
 gates:
+    rx113_doc_set_stopped(s->mcu->doc,
+                          s->regs[SYS_MSTPCRB] & (1U << 6));
     rx113_elc_set_clock(s->mcu->elc, pclkb,
                         s->regs[SYS_MSTPCRB] & (1U << 9));
     rx113_dtc_set_stopped(s->mcu->dtc,
@@ -788,6 +791,7 @@ static void register_elc(RX113State *s)
     }
     elc_source_connect(s->s12ad, "scan-end", 0, dev, 0x58);
     elc_source_connect(s->dtc, "transfer-end", 0, dev, 0x61);
+    elc_source_connect(s->doc, "event", 0, dev, 0x6a);
     for (unsigned i = 0; i < 12; i++) {
         qdev_connect_gpio_out_named(dev, "mtu", i,
                                    qdev_get_gpio_in_named(s->mtu, "elc", i));
@@ -818,7 +822,6 @@ static void register_stubs(void)
     } stubs[] = {
         { "rx113-dac", 0x00088040, 0x10 },
         { "rx113-cac", 0x0008b000, 0x20 },
-        { "rx113-doc", 0x0008b080, 0x10 },
         { "rx113-usb0", 0x000a0000, 0x200 },
         { "rx113-ctsu", 0x000a0900, 0x100 },
     };
@@ -886,6 +889,14 @@ static void rx113_realize(DeviceState *dev, Error **errp)
     }
     register_rtc(s, register_lcdc(s));
     register_s12ad(s, register_port(s));
+    s->doc = qdev_new(TYPE_RX113_DOC);
+    object_property_add_child(OBJECT(s), "doc", OBJECT(s->doc));
+    qdev_prop_set_bit(s->doc, "has-elc", true);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(s->doc), &error_abort);
+    sysbus_mmio_map(SYS_BUS_DEVICE(s->doc), 0, 0x0008b080);
+    /* Table 14.3: level source 57, with no DTC activation. */
+    sysbus_connect_irq(SYS_BUS_DEVICE(s->doc), 0,
+                       qdev_get_gpio_in(DEVICE(&s->icu), 57));
     register_elc(s);
     register_stubs();
 }
