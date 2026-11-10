@@ -125,3 +125,24 @@ sensor ICO frequency for both edge measurements. This contract
 tests the digital controller and the software-visible behaviour; it
 does not predict physical touch sensitivity or calibration behaviour
 against silicon, and the report must say so.
+
+## D-011: CTSU stabilization timing and CTSUTRMR factory value (emulation conventions)
+Date: 2026-11-10. Decided by: PMO as emulation conventions under the
+D-010 contract; reported to the PO, whose merge gate remains the
+final decision.
+The RX113 manual requires CTSUSST to be programmed to 0x10 but does
+not specify the state-3 stabilization duration that value represents
+(Issue #41 resumed audit). Convention: the state-3 wait is 34
+base-clock periods at CTSUSST=0x10 — anchored on Renesas's QE
+parameter guide (R30AN0428EJ0340, section 3.1), which gives a
+34-base-clock-period stabilization interval for a representative
+CTSU1 example, CTSU1 being the group the vendor's introduction guide
+assigns to both RX113 and RX130 — scaled proportionally for other
+CTSUSST values (CTSUSST x 34/16 base-clock periods). The base clock
+is the CTSU base clock of sections 35.2.3/35.2.15. This is an
+emulation convention, not an RX113 timing specification.
+CTSUTRMR (section 35.2.19) resets to a "unique value for each chip"
+that the manual does not give numerically. Convention: the model
+holds a fixed factory value of 0x00, restored on reset; writes are
+accepted only in calibration mode (CTSUERRS.CTSUSPMD=10b), as the
+manual specifies, and the value has no effect on counts under D-010.
