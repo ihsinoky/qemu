@@ -54,6 +54,9 @@ struct RX113MTUState {
     /* Duty 1..3, MTU3.TGRA and TCDR, respectively (20.3.8(b)). */
     uint16_t temporary[5];
     uint8_t region;
+    uint8_t complementary_on;
+    uint8_t complementary_allow;
+    bool complementary_initial;
     bool transfer_pending;
     uint32_t elc_events;
     RX113MTUChannel ch[CHANNELS];
@@ -182,7 +185,7 @@ static bool mtu_output_enabled(RX113MTUState *s, unsigned n, unsigned gr)
     unsigned mode = c->mode & 15;
     static const int oe[2][4] = { { -1, 0, -1, 3 }, { 1, 2, 4, 5 } };
 
-    if (n >= 3 && mtu_reset_pwm(s)) {
+    if (n >= 3 && (mtu_reset_pwm(s) || mtu_complementary(s))) {
         if (n == 3 && gr == 0) {
             return s->tocr1 & 0x40;
         }
@@ -224,6 +227,20 @@ static void mtu_output_update(RX113MTUState *s)
             s->output = deposit32(s->output, negative[i], 1, !level);
         }
     }
+    if (mtu_complementary(s)) {
+        static const unsigned pins[] = { 9, 12, 13, 11, 14, 15 };
+
+        for (unsigned i = 0; i < 6; i++) {
+            unsigned phase = i % 3;
+            unsigned polarity = (s->tocr1 & 4) ?
+                (s->tocr2 >> (2 * phase + (i >= 3))) & 1 :
+                (s->tocr1 >> (i >= 3)) & 1;
+            bool on = !s->complementary_initial &&
+                      (s->complementary_on & (1 << i));
+
+            s->output = deposit32(s->output, pins[i], 1, !polarity ^ on);
+        }
+    }
     for (unsigned n = 0; n < 5; n++) {
         for (unsigned gr = 0; gr < MIN(tgr_count[n], 4); gr++) {
             unsigned pin = output_base[n] + gr;
@@ -263,7 +280,7 @@ static uint16_t mtu_output_result(RX113MTUState *s, unsigned n,
     unsigned mode = c->mode & 15;
     uint16_t output = s->output;
 
-    if (n >= 3 && mtu_reset_pwm(s)) {
+    if (n >= 3 && (mtu_reset_pwm(s) || mtu_complementary(s))) {
         return output;
     }
     for (unsigned gr = 0; gr < MIN(tgr_count[n], 4); gr++) {
@@ -469,12 +486,97 @@ static void mtu_complementary_restart(RX113MTUState *s)
     s->ch[3].phase = s->ch[4].phase = 0;
     s->tcnts = 0;
     s->region = MTU_TB2_UP;
+    s->complementary_on = s->complementary_allow = 0;
+    for (unsigned i = 0; i < 3; i++) {
+        unsigned duty = i == 0 ? s->ch[3].tgr[1] : s->ch[4].tgr[i - 1];
+
+        if (duty >= s->tddr) {
+            s->complementary_on |= 1 << (i + 3);
+            s->complementary_allow |= 1 << (i + 3);
+        } else {
+            s->complementary_allow |= 1 << i;
+        }
+    }
+    s->complementary_initial = true;
+    s->output |= 1 << 8;
+}
+
+/*
+ * Figures 20.46-53: each direction has an outgoing (active register)
+ * and incoming (temporary register) branch during the selected Tb window.
+ * The subcounter supplies the branches outside the main counters' range.
+ */
+static void mtu_complementary_output(RX113MTUState *s)
+{
+    RX113MTUChannel *c3 = &s->ch[3], *c4 = &s->ch[4];
+    bool crest = !c3->down && c3->count == c3->tgr[0];
+    bool trough = c4->down && c4->count == 0;
+    bool tb1 = s->region == MTU_TB1_DOWN || s->region == MTU_TB1_UP;
+    bool tb2 = s->region == MTU_TB2_UP || s->region == MTU_TB2_DOWN;
+    unsigned mode = c3->mode & 15;
+    bool transfer = (tb1 && mode != 14) || (tb2 && mode != 13);
+
+    for (unsigned i = 0; i < 3; i++) {
+        unsigned old = i == 0 ? c3->tgr[1] : c4->tgr[i - 1];
+        unsigned enable = i == 1 ? 0x10 : 0x20;
+        unsigned next = transfer && (c3->mode & enable) ?
+                        s->temporary[i] : old;
+        unsigned up = tb2 ? next : old;
+        unsigned down = tb1 ? next : old;
+        bool off_n = (!c3->down || trough) && c3->count == up;
+        bool on_p = (!c4->down || trough) && c4->count == up;
+        bool off_p = (c4->down || crest) && c4->count == down;
+        bool on_n = (c3->down || crest) && c3->count == down;
+        unsigned p = 1 << i, n = 1 << (i + 3);
+
+        if (tb1) {
+            off_p |= (s->region == MTU_TB1_DOWN) && s->tcnts == next;
+            on_p |= (s->region == MTU_TB1_UP || s->tcnts == s->tcdr) &&
+                    s->tcnts == old;
+        } else if (tb2) {
+            off_n |= (s->region == MTU_TB2_UP) && s->tcnts == next;
+            on_n |= (s->region == MTU_TB2_DOWN || s->tcnts == s->tddr) &&
+                    s->tcnts == old;
+        }
+        bool hold_p = on_p && off_p;
+        bool hold_n = on_n && off_n;
+
+        /* Turn-off cancels the opposite pending turn-on (20.3.8(j)). */
+        if (off_p) {
+            /* Coincident on/off retains the latch, but still interlocks. */
+            if (!hold_p) {
+                s->complementary_on &= ~p;
+            }
+            s->complementary_allow = (s->complementary_allow & ~p) | n;
+        }
+        if (off_n) {
+            if (!hold_n) {
+                s->complementary_on &= ~n;
+            }
+            s->complementary_allow = (s->complementary_allow & ~n) | p;
+        }
+        if (off_p && off_n) {
+            s->complementary_allow =
+                (s->complementary_allow & ~(p | n)) | (tb1 ? n : p);
+        }
+        if (on_p && !off_p && (s->complementary_allow & p) &&
+            !(s->complementary_on & n)) {
+            s->complementary_on |= p;
+        }
+        if (on_n && !off_n && (s->complementary_allow & n) &&
+            !(s->complementary_on & p)) {
+            s->complementary_on |= n;
+        }
+    }
+    /* Section 20.3.8(i): retain inactive pads through the initial dead time. */
+    if (s->complementary_initial && c4->count == s->tddr) {
+        s->complementary_initial = false;
+    }
 }
 
 /*
  * Section 20.3.8(a),(b): one coupled edge, never two ordinary timer ticks.
  * Sample compares before advancing, as in the normal-mode count path.
- * Waveform and old/new duty-match arbitration are not implemented yet.
  */
 static unsigned mtu_complementary_tick(RX113MTUState *s)
 {
@@ -493,6 +595,7 @@ static unsigned mtu_complementary_tick(RX113MTUState *s)
             s->region = MTU_TB2_UP;
         }
     }
+    mtu_complementary_output(s);
     switch (s->region) {
     case MTU_TB1_DOWN:
         if (s->tcnts == s->tcdr) {
@@ -534,10 +637,22 @@ static unsigned mtu_complementary_tick(RX113MTUState *s)
 
     if (!c3->down && c3->count == c3->tgr[0]) {
         mtu_match(s, 3, 0);
+        if (s->tocr1 & 0x40) {
+            s->output ^= 1 << 8;
+        }
+        if (s->tocr2 & 0x40) {
+            s->tocr2 = (s->tocr2 & 0xc0) | s->tolbr;
+        }
         c3->down = c4->down = true;
     } else if (c4->down && c4->count == 0) {
         /* Table 20.57: the trough shares TCIV4 with overflow. */
         events |= 1U << (4 + 16);
+        if (s->tocr1 & 0x40) {
+            s->output ^= 1 << 8;
+        }
+        if (s->tocr2 & 0x80) {
+            s->tocr2 = (s->tocr2 & 0xc0) | s->tolbr;
+        }
         c3->down = c4->down = false;
     }
     c3->count += c3->down ? -1 : 1;
@@ -1209,8 +1324,8 @@ static void mtu_write(void *opaque, hwaddr addr, uint64_t value, unsigned size)
             mtu_complementary_transfer(s, true);
             mtu_complementary_restart(s);
             qemu_log_mask(LOG_UNIMP,
-                          "rx113-mtu: complementary PWM duty arbitration, "
-                          "outputs and extended controls unavailable\n");
+                          "rx113-mtu: complementary PWM extended controls "
+                          "and duty interrupts unavailable\n");
         }
         c->phase = 0;
         if (n == 3 && mtu_reset_pwm(s)) {
@@ -1387,6 +1502,8 @@ static void mtu_reset_hold(Object *obj, ResetType type)
     s->tcnts = 0;
     memset(s->temporary, 0, sizeof(s->temporary));
     s->region = MTU_TA;
+    s->complementary_on = s->complementary_allow = 0;
+    s->complementary_initial = false;
     s->transfer_pending = false;
     mtu_output_update(s);
     s->held_irqs = 0;
@@ -1447,7 +1564,7 @@ static int mtu_post_load(void *opaque, int version_id)
 
 static const VMStateDescription vmstate_mtu = {
     .name = TYPE_RX113_MTU,
-    .version_id = 5,
+    .version_id = 6,
     .minimum_version_id = 1,
     .pre_save = mtu_pre_save,
     .post_load = mtu_post_load,
@@ -1480,6 +1597,9 @@ static const VMStateDescription vmstate_mtu = {
         VMSTATE_UINT16_ARRAY_V(temporary, RX113MTUState, 5, 5),
         VMSTATE_UINT8_V(region, RX113MTUState, 5),
         VMSTATE_BOOL_V(transfer_pending, RX113MTUState, 5),
+        VMSTATE_UINT8_V(complementary_on, RX113MTUState, 6),
+        VMSTATE_UINT8_V(complementary_allow, RX113MTUState, 6),
+        VMSTATE_BOOL_V(complementary_initial, RX113MTUState, 6),
         VMSTATE_END_OF_LIST()
     },
 };

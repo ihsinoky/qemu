@@ -2,9 +2,168 @@
 SPDX-License-Identifier: GPL-2.0-or-later
 -->
 
-# Issue 49: RX113 MTU advanced output — stage 2b partial delivery
+# Issue 49: RX113 MTU advanced output — stage 2b waveform delivery
 
 ## Current delivery (2026-11-11)
+
+**Stage 2b and Issue #49 remain incomplete.** This continuation delivers
+complementary PWM duty arbitration and physical PORT pad waveforms on top
+of the committed carrier/subcounter and staged-buffer implementation.
+It stops at a tested waveform-core boundary under the requested usage
+limit. Extended controls and dead-time compensation remain below; stage 3
+(POE) was not started. No unresolved hardware decision is being delegated
+to the PO, and this is not a full acceptance claim.
+
+Base: `d8e52c0a8ac7e90b5301c31d17665c7c2a8a9259`.
+Branch: `rx113/issue-49-mtu-advanced`.
+No commit, merge, push, PR or upstream submission was performed. Repository
+metadata is read-only. Deliverables are the working-tree changes and
+`.issue49-runtime/issue49-stage2b2-waveform.patch`, relative to that base.
+All prior delivery sections below are historical.
+
+### Implemented boundary and manual evidence
+
+Authority: supplied R01UH0448EJ0120 Rev.1.20, printed manual pages.
+
+* 20.3.8(j), Figures 20.46–48, pp.492–493: each phase separately evaluates
+  four events (positive on/off and negative on/off) before advancing any
+  counter or transferring buffers. The main up/down branches and both
+  active TCNTS branches supply matches. Outgoing branches use active duty
+  registers; incoming branches use the existing temporary bank when the
+  mode and buffer-enable group select a transfer at that extremum. In
+  unselected windows they use the active bank. A pending buffer write
+  cannot bypass the existing temporary bank.
+* Turn-off cancels the opposite pending turn-on. The incoming turn-off
+  takes priority when the two turn-offs coincide. A turn-on also requires
+  the opposite phase to be off. This suppresses short positive/negative
+  pulses when the new turn-off overtakes the old delayed turn-on, as in
+  Figures 20.47/48. Six logical on-state bits and six interlock bits are
+  independent of physical polarity.
+* 20.3.8(k), Figures 20.49–53, pp.494–496: simultaneous on/off for the same
+  phase retains its latch while the off timing still arbitrates pending
+  turn-ons. The tested duty spectrum includes zero, TDDR, TCDR and TGRA3,
+  including positive 100% and 0%, and suppressed pulses close to each end.
+* 20.3.8(i), Figures 20.44/45, pp.490–491, and Tables 20.31–37:
+  complementary mode initially drives all six pads inactive through the
+  initial dead time. The initial negative-phase state is qualified against
+  the initial duty. Subsequent turn-off/on compares separate the arms by
+  TDDR count edges. TOER enables its six documented pads. MTIOC3C remains
+  outside the PWM outputs.
+* 20.2.18–20, pp.434–438: complementary outputs use both positive and
+  negative TOCR1 polarity bits, or all six TOCR2 polarity bits when TOCS
+  selects TOCR2. BF selects TOLBR transfer at the crest, trough, or both,
+  preserving BF. These transfers occur at the main carrier extremum,
+  separately from the end-of-Tb duty transfer.
+* 20.3.8(l), Figure 20.54, p.496: PSYE enables MTIOC3A, initially high,
+  toggling at **both** the crest and trough. This differs from the existing
+  reset-synchronized path, which retains its previous cycle behavior.
+* Stopping both counters restores the complementary initial output and
+  counter state. Module stop retains the waveform, interlock, count region
+  and fractional clock. Matching external MTCLKA/B edges use the same
+  coupled waveform path. Partial/mismatched clock configurations retain
+  the existing unsupported-configuration diagnostic.
+* Migration version 6 saves on-state, interlock and initial-output hold,
+  alongside version 5's counters, temporary bank and pending snapshot.
+  The same-build migration test observes PORT pads inside crest Tb with a
+  second transaction pending, then through the crest and trough transfers.
+  Old streams did not implement complementary pads; compatibility of an
+  advanced waveform from such a stream is not claimed.
+
+The complementary-mode diagnostic now names the remaining **extended
+controls and duty interrupts unavailable**. It no longer says that all
+outputs are unavailable. There is no claim of full complementary-mode
+support. RX62N and all other device source files are untouched.
+
+### Explicitly unfinished behavior and next step
+
+The next implementation should add **TDER read-before-clear and the
+no-dead-time waveform path**, retaining the required TDDR=1 carrier setup
+while generating inverse arms without a dead-time gap. Add physical PORT
+checks for both polarity selections and zero/full duty before changing
+that diagnostic. Then implement TWCR read-before-set, synchronous
+restart/WRE/CCE (20.3.8(m)–(o), pp.497–502, and 20.7 restart procedures),
+including retained-output and initial-output restart cases.
+
+Still required in stage 2b, and not implemented by register storage:
+
+* Duty and buffered C/D compare interrupt arbitration; only the existing
+  crest TGIA3 and trough TCIV4/ELC sources are implemented on this path.
+* TITCR/TITCNT interrupt skipping and TBTER-linked buffer transfers,
+  including temporary-bank snapshot and transfer gating.
+* TGCR brushless gating, software feedback and the documented external
+  feedback source, within the complementary modes.
+* 20.3.11, pp.516–519: dead-time compensation and the MTU5 measurement/
+  capture range it requires. General input capture remains out of scope.
+* Dedicated complementary synchronous clear/restart behavior. The generic
+  synchronous-clear path still skips the coupled complementary pair.
+
+The basic CST stop/restart implemented here does not substitute for TWCR.
+No no-dead-time, skipping, TGCR, compensation, or POE result is claimed.
+Do not begin stage 3 before completing stage 2.
+
+### Current validation
+
+Validation evidence is under `.issue49-runtime/`, with `stage2b2-*` names.
+No subprojects were fetched. TMPDIR stays inside the worktree; the existing
+`.s49` alias resolves to the same scratch directory for socket path limits.
+
+| Check | Result and runtime evidence |
+| --- | --- |
+| RX-only rebuild | PASS: `stage2b2-build.log`, `stage2b2-build-final.log` |
+| MTU qtest | 50/50 PASS in the final regression; earlier equal-duty run also 50/50: `stage2b2-regression.log`, `stage2b2-mtu-second.log` |
+| All configured RX qtests and quick functional tests | 32 suites OK, four existing skips, zero failures: `stage2b2-regression.log` |
+| Existing gdbsim U-Boot functional | PASS: `stage2b2-gdbsim-functional.log` |
+| Cached FIT PLL/HOCO before and after reset | Both PASS: `stage2b2-fit-pll.log`, `stage2b2-fit-hoco.log` |
+| SYSTEM protection/timing without/with FIT ELF | Both PASS: `stage2b2-system.log`, `stage2b2-system-elf.log` |
+| Both gdbsim machines listed/run three seconds | Both PASS: `stage2b2-machine-help.log`, `stage2b2-gdbsim-smoke.log` |
+| Changed-file and raw-diff checkpatch | Zero errors and warnings: `stage2b2-checkpatch-files.log`, `stage2b2-checkpatch-patch.log` |
+| Forward/reverse patch dry runs and byte reconstruction | PASS: `stage2b2-patch-validation.log` |
+
+`stage2b2-tested-binary.sha256` identifies the final tested QEMU binary.
+The full final regression uses the distinct-duty waveform test and the
+extended clock/pad assertions; the earlier standalone 50-test run used
+equal phase duties and predates those test enhancements.
+
+The three new test cases cover all six pads and PIDR: four carrier cycles
+for every duty from 0 through TGRA3, with distinct duties on the three
+phases and checks one ns before each edge; overtaken turn-on suppression
+at crest and trough with both the single-extremum and dual-extremum update
+modes; and per-arm polarity, TOLBR transfers, TOER and PSYE. Existing clock
+and migration tests now also assert live complementary pads. The original
+47 MTU tests and their counter/register/IRQ assertions remain intact.
+
+The initial waveform test exposed a missing interlock effect when duty
+was exactly TDDR; the off timing now retains its arbitration effect even
+when coincident on/off retains the latch. Early attempt logs also record
+a test invoked during relinking, an incorrect GLib path selecting zero
+tests, and a run interrupted by a binary relink. Those are not passing
+validation evidence. All final tests use the completed build.
+
+Reproduce:
+
+```sh
+. .issue49-runtime/env.sh
+make -C build -j$(nproc)
+build/tests/qtest/rx113-mtu-test
+bash .issue49-runtime/stage2b2-regression.sh
+scripts/checkpatch.pl --no-tree -f hw/rx/rx113-mtu.c \
+  tests/qtest/rx113-mtu-test.c
+python3 .issue49-runtime/stage2b2-validate-patch.py
+```
+
+The patch contains exactly `hw/rx/rx113-mtu.c`,
+`tests/qtest/rx113-mtu-test.c` and this report. It excludes AGENTS.md,
+manuals, runtime assets, build products and repository metadata.
+The verifier reconstructs these three base files in worktree scratch,
+checks/applies the forward patch and compares every byte with this tree,
+then checks/applies the reverse patch and compares with the base again.
+It does not write `.git`. Raw-diff checkpatch uses `--no-signoff` for the
+uncommitted deliverable. Suggested commit subject:
+`hw/rx: Generate RX113 complementary PWM pad waveforms`.
+
+# Issue 49: RX113 MTU advanced output — stage 2b partial delivery
+
+## Stage 2b carrier delivery (historical)
 
 **Stage 2b and Issue #49 remain incomplete.** This run delivers the
 complementary **carrier/subcounter and staged-buffer foundation**, before

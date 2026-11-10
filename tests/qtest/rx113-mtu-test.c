@@ -1060,6 +1060,70 @@ static void complementary_setup(QTestState *qts, unsigned md)
     qtest_writeb(qts, BASE + mode[3], 0x30 | md);
 }
 
+static void complementary_pads(QTestState *qts)
+{
+    for (unsigned ch = 3; ch <= 4; ch++) {
+        for (unsigned gr = 0; gr < 4; gr++) {
+            select_pad(qts, output_pad[ch][gr], 1);
+        }
+    }
+    qtest_writeb(qts, BASE + 0xe, 0x43); /* Active high, PSYE. */
+    qtest_writeb(qts, BASE + 0xa, 0x3f);
+}
+
+static void assert_complementary_pads(QTestState *qts, unsigned positive,
+                                      unsigned negative, bool cycle)
+{
+    static const unsigned p[] = { 0x22, 0x24, 0x30 };
+    static const unsigned n[] = { 0x23, 0x25, 0x31 };
+
+    for (unsigned i = 0; i < 3; i++) {
+        assert_pad(qts, p[i], true, (positive >> i) & 1);
+        assert_pad(qts, n[i], true, (negative >> i) & 1);
+    }
+    assert_pad(qts, 0x17, true, cycle);
+    assert_pad(qts, 0x16, false, false);
+}
+
+/* Independent steady-carrier oracle, including the initial inactive window. */
+static void test_complementary_waveform(void)
+{
+    for (unsigned duty = 0; duty <= 14; duty++) {
+        QTestState *qts = mtu_init();
+
+        complementary_setup(qts, 15);
+        qtest_writeb(qts, BASE + mode[3], 0);
+        qtest_writew(qts, BASE + tgr[3][3], duty);
+        qtest_writew(qts, BASE + tgr[4][2], (duty + 5) % 15);
+        qtest_writew(qts, BASE + tgr[4][3], (duty + 10) % 15);
+        qtest_writeb(qts, BASE + mode[3], 0x3f);
+        complementary_pads(qts);
+        qtest_writeb(qts, START, 0xc0);
+        for (unsigned edge = 0; edge <= 96; edge++) {
+            unsigned t = edge % 24;
+            unsigned positive = 0, negative = 0;
+            bool cycle = !edge || !(((edge - 1) / 12) & 1);
+
+            for (unsigned i = 0; i < 3; i++) {
+                unsigned d = (duty + 5 * i) % 15;
+                bool p = d == 0 || (t >= d + 1 && t < 25 - d);
+                bool n = d == 14 || (t >= 27 - d || t < d - 1);
+
+                if (edge >= 3) {
+                    positive |= (p && d < 12) << i;
+                    negative |= (n && d > 2) << i;
+                }
+            }
+            g_test_message("duty %u edge %u", duty, edge);
+            assert_complementary_pads(qts, positive, negative, cycle);
+            qtest_clock_step(qts, 124);
+            assert_complementary_pads(qts, positive, negative, cycle);
+            qtest_clock_step(qts, 1);
+        }
+        qtest_quit(qts);
+    }
+}
+
 static void assert_complementary_bank(QTestState *qts, unsigned duty,
                                       unsigned half)
 {
@@ -1080,6 +1144,81 @@ static void complementary_buffers(QTestState *qts, unsigned duty,
     if (commit) {
         qtest_writew(qts, BASE + tgr[4][3], duty + 4);
     }
+}
+
+/* Figures 20.47/48: a new turn-off overtakes the old pending turn-on. */
+static void test_complementary_arbitration(void)
+{
+    for (unsigned trough = 0; trough < 2; trough++) {
+        for (unsigned both = 0; both < 2; both++) {
+            QTestState *qts = mtu_init();
+            unsigned md = both ? 15 : trough ? 14 : 13;
+            unsigned old = trough ? 3 : 11;
+
+            complementary_setup(qts, md);
+            qtest_writeb(qts, BASE + mode[3], 0);
+            qtest_writew(qts, BASE + tgr[3][3], old);
+            qtest_writew(qts, BASE + tgr[4][2], old);
+            qtest_writew(qts, BASE + tgr[4][3], old);
+            qtest_writeb(qts, BASE + mode[3], 0x30 | md);
+            complementary_pads(qts);
+            qtest_writeb(qts, START, 0xc0);
+            for (unsigned edge = 0; edge <= 60; edge++) {
+                bool p = trough && ((edge >= 4 && edge < 22) || edge >= 25);
+                bool n = !trough && ((edge >= 3 && edge < 10) || edge >= 13);
+                bool cycle = !edge || !(((edge - 1) / 12) & 1);
+
+                if (edge == (trough ? 17 : 5)) {
+                    unsigned next = trough ? 0 : 14;
+
+                    qtest_writew(qts, BASE + tgr[3][3], next);
+                    qtest_writew(qts, BASE + tgr[4][2], next);
+                    qtest_writew(qts, BASE + tgr[4][3], next);
+                }
+                g_test_message("mode %u edge %u", md, edge);
+                assert_complementary_pads(qts, p ? 7 : 0, n ? 7 : 0, cycle);
+                qtest_clock_step(qts, 124);
+                assert_complementary_pads(qts, p ? 7 : 0, n ? 7 : 0, cycle);
+                qtest_clock_step(qts, 1);
+            }
+            qtest_quit(qts);
+        }
+    }
+}
+
+static void test_complementary_polarity(void)
+{
+    QTestState *qts = mtu_init();
+
+    complementary_setup(qts, 15);
+    complementary_pads(qts);
+    qtest_writeb(qts, BASE + 0xe, 0x44); /* TOCR2 selects each arm. */
+    qtest_writeb(qts, BASE + 0xf, 0x40 | 0x19); /* Transfer at crest. */
+    qtest_writeb(qts, BASE + 0x36, 0x26);
+    assert_complementary_pads(qts, 2, 5, true);
+    qtest_writeb(qts, START, 0xc0);
+    qtest_clock_step(qts, 9 * 125); /* All three positive arms active. */
+    assert_complementary_pads(qts, 5, 5, true);
+    qtest_clock_step(qts, 4 * 125 - 1);
+    assert_complementary_pads(qts, 5, 5, true);
+    g_assert_cmpuint(qtest_readb(qts, BASE + 0xf), ==, 0x59);
+    qtest_clock_step(qts, 1);
+    g_assert_cmpuint(qtest_readb(qts, BASE + 0xf), ==, 0x66);
+    assert_complementary_pads(qts, 2, 2, false);
+    qtest_writeb(qts, BASE + 0xf, 0x80 | 0x26); /* Transfer at trough. */
+    qtest_writeb(qts, BASE + 0x36, 0x19);
+    qtest_clock_step(qts, 12 * 125 - 1);
+    g_assert_cmpuint(qtest_readb(qts, BASE + 0xf), ==, 0xa6);
+    qtest_clock_step(qts, 1);
+    g_assert_cmpuint(qtest_readb(qts, BASE + 0xf), ==, 0x99);
+    assert_complementary_pads(qts, 2, 2, true);
+    qtest_writeb(qts, BASE + 0xe, 4); /* PSYE disables only the cycle pad. */
+    assert_pad(qts, 0x17, false, false);
+    qtest_writeb(qts, BASE + 0xa, 0);
+    assert_pad(qts, 0x22, false, false);
+    qtest_writeb(qts, BASE + 0xa, 0x3f);
+    assert_pad(qts, 0x22, true, false);
+    qtest_quit(qts);
 }
 
 static void test_complementary_count(void)
@@ -1195,19 +1334,25 @@ static void test_complementary_clock(void)
     QTestState *qts = mtu_init();
 
     complementary_setup(qts, 15);
+    complementary_pads(qts);
     qtest_writeb(qts, START, 0xc0);
     qtest_clock_step(qts, 12 * 125 + 62); /* Inside the crest Tb1. */
+    assert_complementary_pads(qts, 7, 0, true);
     qtest_writel(qts, MSTPCRA, 0xefffffff);
     qtest_clock_step(qts, 10000);
+    assert_complementary_pads(qts, 7, 0, true);
     qtest_writel(qts, MSTPCRA, 0xeffffdff);
     g_assert_cmpuint(qtest_readw(qts, BASE + count[3]), ==, 14);
     g_assert_cmpuint(qtest_readw(qts, BASE + count[4]), ==, 12);
     g_assert_cmpuint(qtest_readw(qts, BASE + 0x20), ==, 12);
+    assert_complementary_pads(qts, 7, 0, true);
     qtest_clock_step(qts, 62);
     g_assert_cmpuint(qtest_readw(qts, BASE + count[3]), ==, 14);
     qtest_clock_step(qts, 1);
     g_assert_cmpuint(qtest_readw(qts, BASE + count[3]), ==, 13);
+    assert_complementary_pads(qts, 7, 0, false);
     qtest_writeb(qts, START, 0);
+    assert_complementary_pads(qts, 0, 0, true);
     g_assert_cmpuint(qtest_readw(qts, BASE + count[3]), ==, 2);
     g_assert_cmpuint(qtest_readw(qts, BASE + count[4]), ==, 0);
     g_assert_cmpuint(qtest_readw(qts, BASE + 0x20), ==, 0);
@@ -1225,6 +1370,7 @@ static void test_complementary_clock(void)
     g_assert_cmpuint(qtest_readw(qts, BASE + count[3]), ==, 13);
     g_assert_cmpuint(qtest_readw(qts, BASE + count[4]), ==, 11);
     g_assert_cmpuint(qtest_readw(qts, BASE + 0x20), ==, 13);
+    assert_complementary_pads(qts, 7, 0, false);
     qtest_quit(qts);
 }
 
@@ -1331,6 +1477,7 @@ static void test_complementary_migration(void)
 
     g_assert_nonnull(dir);
     complementary_setup(src, 15);
+    complementary_pads(src);
     qtest_writeb(src, START, 0xc0);
     qtest_clock_step(src, 6 * 125);
     complementary_buffers(src, 5, 12, true);
@@ -1345,12 +1492,15 @@ static void test_complementary_migration(void)
                             "'arguments':{'uri':%s}}", uri);
     migration_wait(dst);
     assert_complementary_bank(dst, 4, 12);
+    assert_complementary_pads(dst, 7, 0, true);
     qtest_clock_step(dst, 3 * 125 - 63);
     assert_complementary_bank(dst, 4, 12);
     qtest_clock_step(dst, 1);
     assert_complementary_bank(dst, 5, 12);
+    assert_complementary_pads(dst, 7, 0, false);
     qtest_clock_step(dst, 12 * 125);
     assert_complementary_bank(dst, 3, 12);
+    assert_complementary_pads(dst, 0, 6, true);
     g_assert_cmpuint(qtest_readw(dst, BASE + count[3]), ==, 5);
     g_assert_cmpuint(qtest_readw(dst, BASE + count[4]), ==, 3);
     qtest_quit(dst);
@@ -1763,6 +1913,12 @@ static void test_pad_package64(void)
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
+    qtest_add_func("/rx113-mtu/complementary-arbitration",
+                   test_complementary_arbitration);
+    qtest_add_func("/rx113-mtu/complementary-polarity",
+                   test_complementary_polarity);
+    qtest_add_func("/rx113-mtu/complementary-waveform",
+                   test_complementary_waveform);
     qtest_add_func("/rx113-mtu/complementary-count", test_complementary_count);
     for (unsigned md = 13; md <= 15; md++) {
         g_autofree char *name = g_strdup_printf(
