@@ -19,6 +19,7 @@
 #include "hw/rx/rx113_iwdt.h"
 #include "hw/rx/rx113_mtu.h"
 #include "hw/rx/rx113_s12ad.h"
+#include "hw/rx/rx113_dac.h"
 #include "hw/rx/rx113_dtc.h"
 #include "hw/rx/rx113_elc.h"
 #include "hw/rx/rx113_doc.h"
@@ -27,6 +28,7 @@
 #include "hw/misc/unimp.h"
 #include "hw/core/sysbus.h"
 #include "hw/core/irq.h"
+#include "hw/core/split-irq.h"
 #include "hw/core/qdev-properties.h"
 #include "system/system.h"
 #include "qobject/qlist.h"
@@ -248,6 +250,8 @@ gates:
                         s->regs[SYS_MSTPCRB] & (1U << 9));
     rx113_dtc_set_stopped(s->mcu->dtc,
                           s->regs[SYS_MSTPCRA] & (1U << 28));
+    rx113_dac_set_clock(s->mcu->dac, pclkb,
+                        s->regs[SYS_MSTPCRA] & (1U << 18));
     rx113_s12ad_set_clock(s->mcu->s12ad, pclkb, pclkd,
                           s->regs[SYS_MSTPCRA] & (1U << 17));
     rx113_mtu_set_clock(s->mcu->mtu, pclkb,
@@ -824,6 +828,7 @@ static void elc_source_connect(DeviceState *src, const char *name, unsigned pin,
 static void register_elc(RX113State *s)
 {
     DeviceState *dev = qdev_new(TYPE_RX113_ELC);
+    DeviceState *splitter = qdev_new(TYPE_SPLIT_IRQ);
 
     s->elc = dev;
     object_property_add_child(OBJECT(s), "elc", OBJECT(dev));
@@ -850,7 +855,15 @@ static void register_elc(RX113State *s)
     for (unsigned i = 0; i < SCI_NR_IRQ; i++) {
         elc_source_connect(DEVICE(&s->sci[3]), "event", i, dev, 0x3a + i);
     }
-    elc_source_connect(s->s12ad, "scan-end", 0, dev, 0x58);
+    object_property_add_child(OBJECT(s), "adc-scan-end", OBJECT(splitter));
+    qdev_prop_set_uint16(splitter, "num-lines", 2);
+    qdev_realize_and_unref(splitter, NULL, &error_abort);
+    qdev_connect_gpio_out(splitter, 0,
+                         qdev_get_gpio_in_named(dev, "event", 0x58));
+    qdev_connect_gpio_out(splitter, 1,
+                         qdev_get_gpio_in_named(s->dac, "sync", 0));
+    qdev_connect_gpio_out_named(s->s12ad, "scan-end", 0,
+                               qdev_get_gpio_in(splitter, 0));
     elc_source_connect(s->dtc, "transfer-end", 0, dev, 0x61);
     elc_source_connect(s->doc, "event", 0, dev, 0x6a);
     for (unsigned i = 0; i < 12; i++) {
@@ -869,6 +882,8 @@ static void register_elc(RX113State *s)
                                qdev_get_gpio_in_named(s->ctsu, "start", 0));
     qdev_connect_gpio_out_named(dev, "link", 15,
                                qdev_get_gpio_in_named(s->s12ad, "trigger", 9));
+    qdev_connect_gpio_out_named(dev, "link", 17,
+                               qdev_get_gpio_in_named(s->dac, "elc", 0));
     qdev_connect_gpio_out_named(dev, "link", 18,
                                qdev_get_gpio_in(s->dtc, 106));
     qdev_connect_gpio_out_named(dev, "link", 19,
@@ -883,7 +898,6 @@ static void register_stubs(void)
         hwaddr base;
         hwaddr size;
     } stubs[] = {
-        { "rx113-dac", 0x00088040, 0x10 },
         { "rx113-usb0", 0x000a0000, 0x200 },
     };
     unsigned i;
@@ -959,6 +973,12 @@ static void rx113_realize(DeviceState *dev, Error **errp)
                            qdev_get_gpio_in(DEVICE(&s->icu), 32 + i));
     }
     register_s12ad(s, register_port(s));
+    s->dac = qdev_new(TYPE_RX113_DAC);
+    object_property_add_child(OBJECT(s), "dac", OBJECT(s->dac));
+    object_property_set_link(OBJECT(s->dac), "adc", OBJECT(s->s12ad),
+                             &error_abort);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(s->dac), &error_abort);
+    sysbus_mmio_map(SYS_BUS_DEVICE(s->dac), 0, 0x00088040);
     s->doc = qdev_new(TYPE_RX113_DOC);
     object_property_add_child(OBJECT(s), "doc", OBJECT(s->doc));
     qdev_prop_set_bit(s->doc, "has-elc", true);

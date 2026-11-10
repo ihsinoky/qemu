@@ -306,6 +306,14 @@ static void s12ad_sync(RX113S12ADState *s)
     s->last_ns = now;
 }
 
+bool rx113_s12ad_active(DeviceState *dev)
+{
+    RX113S12ADState *s = RX113_S12AD(dev);
+
+    s12ad_sync(s);
+    return s->phase != IDLE;
+}
+
 static void s12ad_schedule(RX113S12ADState *s)
 {
     timer_del(s->timer);

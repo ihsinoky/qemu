@@ -31,6 +31,7 @@ struct RX113State {
     DeviceState *iwdt;
     DeviceState *mtu;
     DeviceState *s12ad;
+    DeviceState *dac;
     DeviceState *dtc;
     DeviceState *elc;
     DeviceState *doc;
