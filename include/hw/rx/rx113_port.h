@@ -18,6 +18,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(RX113PortState, RX113_PORT)
 struct RX113PortState {
     SysBusDevice parent_obj;
     MemoryRegion iomem;
+    DeviceState *elc;
     uint32_t package_pins;
     uint8_t regs[0x200];
     uint8_t external[RX113_PORT_COUNT];
@@ -32,5 +33,12 @@ struct RX113PortState {
 };
 
 void rx113_port_set_ctsu(RX113PortState *s, bool fixed, bool level);
+
+/* Qualified PORTB GPIO bits, direction, pin levels and output latch. */
+uint8_t rx113_port_b_mask(RX113PortState *s);
+uint8_t rx113_port_b_direction(RX113PortState *s);
+uint8_t rx113_port_b_levels(RX113PortState *s);
+uint8_t rx113_port_b_latch(RX113PortState *s);
+void rx113_port_b_write(RX113PortState *s, uint8_t mask, uint8_t value);
 
 #endif /* HW_RX_RX113_PORT_H */
