@@ -33,6 +33,7 @@
 #include "system/system.h"
 #include "qobject/qlist.h"
 #include "qom/object.h"
+#include "hw/rx/rx113_usb.h"
 
 /*
  * RX113 Internal Memory
@@ -175,7 +176,7 @@ static const struct {
 /* §9.2.1-3, §9.7.2: UPLL feeds UCLK and never PCLKB. */
 static void rx113_system_update_clocks(RX113SystemState *s)
 {
-    uint64_t source, pclkb = s->mcu->cmt[0].input_freq;
+    uint64_t source = 0, pclkb = s->mcu->cmt[0].input_freq;
     uint64_t pclkd = 0;
     unsigned adiv = extract32(s->regs[SYS_SCKCR], 0, 4);
     unsigned div = extract32(s->regs[SYS_SCKCR], 8, 4);
@@ -221,6 +222,29 @@ static void rx113_system_update_clocks(RX113SystemState *s)
         qemu_log_mask(LOG_GUEST_ERROR, "rx113: prohibited PCLKD divider\n");
     }
 gates:
+    {
+        uint64_t uclk = source;
+        unsigned select_usb = s->regs[SYS_UPLLCR];
+        unsigned usb_div = select_usb & 3;
+        unsigned usb_stc = (select_usb >> 8) & 0x3f;
+        static const unsigned ready_bit[] = { 0, 3, 0, 0, 2 };
+        bool ready = select < 5 &&
+                     (select == 0 ? !(s->regs[SYS_LOCOCR] & 1) :
+                      select == 3 ? !(s->regs[SYS_SOSCCR] & 1) :
+                      !!(s->oscovfsr & (1U << ready_bit[select])));
+
+        if (!ready) {
+            uclk = 0;
+        }
+        if (select_usb & 0x10) {
+            uclk = (s->oscovfsr & 0x20) && usb_div <= 1 &&
+                    (usb_stc == 0x0b || usb_stc == 0x0f) ?
+                    (s->main_clock_hz >> usb_div) *
+                    (usb_stc == 0x0b ? 6 : 8) : 0;
+        }
+        rx113_usb_set_clock(s->mcu->usb, uclk,
+                            s->regs[SYS_MSTPCRB] & (1U << 19));
+    }
     if (s->mcu->cac) {
         static const unsigned system_source[] = { 3, 2, 0, 1 };
         uint64_t hz[6] = {
@@ -890,21 +914,18 @@ static void register_elc(RX113State *s)
                                qdev_get_gpio_in(s->dtc, 80));
 }
 
-/* Table 5.1 register blocks; these stubs log accesses with -d unimp. */
-static void register_stubs(void)
+/* Section 27, Table 14.3: USBI/USBR and both DTC FIFO requests. */
+static void register_usb(RX113State *s)
 {
-    static const struct {
-        const char *name;
-        hwaddr base;
-        hwaddr size;
-    } stubs[] = {
-        { "rx113-usb0", 0x000a0000, 0x200 },
-    };
-    unsigned i;
+    static const unsigned vectors[] = { 38, 90, 36, 37 };
 
-    for (i = 0; i < ARRAY_SIZE(stubs); i++) {
-        create_unimplemented_device(stubs[i].name, stubs[i].base,
-                                    stubs[i].size);
+    s->usb = qdev_new(TYPE_RX113_USB);
+    object_property_add_child(OBJECT(s), "usb0", OBJECT(s->usb));
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(s->usb), &error_abort);
+    sysbus_mmio_map(SYS_BUS_DEVICE(s->usb), 0, 0x000a0000);
+    for (unsigned i = 0; i < ARRAY_SIZE(vectors); i++) {
+        sysbus_connect_irq(SYS_BUS_DEVICE(s->usb), i,
+                           qdev_get_gpio_in(s->dtc, vectors[i]));
     }
 }
 
@@ -1001,7 +1022,7 @@ static void rx113_realize(DeviceState *dev, Error **errp)
                                             60 + i));
     }
     register_elc(s);
-    register_stubs();
+    register_usb(s);
 }
 
 static const Property rx113_properties[] = {
