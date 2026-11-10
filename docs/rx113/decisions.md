@@ -98,3 +98,30 @@ Issue #39: the CFME reflection delay (section 10.2.1 note, no duration
 or clock domain specified) is not modelled — writes reflect
 immediately; the digital filter (section 10.3.2) is documented
 behaviour and is implemented as specified under D-006.
+
+## D-010: CTSU input fixture contract (emulation convention)
+Date: 2026-11-10. Decided by: PMO as an emulation convention; reported
+to the PO, whose merge gate remains the final decision.
+The manual defines the CTSU analog chain only qualitatively
+(i = f C V, section 35.3.1): no numerical transfer from capacitance
+or from the CTSUSO / CTSURICOA adjustment codes to ICO frequency
+exists in the supplied sources, and the Issue #41 audit stopped on
+this gap. Contract: the fixture boundary is the ICO input. QOM
+properties supply ICO frequencies directly — a device-level
+reference ICO base frequency (`ref-ico-hz`, default 1 MHz) and a
+per-channel sensor ICO frequency (`tsNN-ico-hz`, defaulting to the
+reference base, i.e. the deterministic no-touch baseline). The
+digital controller — measurement timing from PCLKB, counting,
+overflow, the states of Figure 35.11, scan order, interrupts, DTC
+and ELC integration — is implemented as documented. Register fields
+whose documented effect is purely in the analog domain and has no
+numerical definition (CTSUSO sensor offset, CTSURICOA reference
+current, CTSUICOG gain) are stored and read back but do not alter
+counts; the fixture frequencies are defined as post-adjustment
+values. This follows the Issue #20 RTCDV precedent (an
+electrical-characteristic-only setting is held, not effected). In
+mutual mode, a pair's measurements derive from the receive channel's
+sensor ICO frequency for both edge measurements. This contract
+tests the digital controller and the software-visible behaviour; it
+does not predict physical touch sensitivity or calibration behaviour
+against silicon, and the report must say so.
