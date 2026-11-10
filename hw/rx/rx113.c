@@ -20,6 +20,7 @@
 #include "hw/rx/rx113_mtu.h"
 #include "hw/rx/rx113_s12ad.h"
 #include "hw/rx/rx113_dtc.h"
+#include "hw/rx/rx113_elc.h"
 #include "hw/misc/unimp.h"
 #include "hw/core/sysbus.h"
 #include "hw/core/irq.h"
@@ -209,6 +210,8 @@ static void rx113_system_update_clocks(RX113SystemState *s)
         qemu_log_mask(LOG_GUEST_ERROR, "rx113: prohibited PCLKD divider\n");
     }
 gates:
+    rx113_elc_set_clock(s->mcu->elc, pclkb,
+                        s->regs[SYS_MSTPCRB] & (1U << 9));
     rx113_dtc_set_stopped(s->mcu->dtc,
                           s->regs[SYS_MSTPCRA] & (1U << 28));
     rx113_s12ad_set_clock(s->mcu->s12ad, pclkb, pclkd,
@@ -622,6 +625,7 @@ static void register_tmr(RX113State *s, unsigned unit)
     object_initialize_child(OBJECT(s), "tmr[*]",
                             &s->tmr[unit], TYPE_RENESAS_TMR);
     tmr = SYS_BUS_DEVICE(&s->tmr[unit]);
+    qdev_prop_set_bit(DEVICE(tmr), "has-elc", true);
     qdev_prop_set_uint64(DEVICE(tmr), "input-freq", RX113_PCLKB_HZ);
     sysbus_realize(tmr, &error_abort);
 
@@ -745,6 +749,65 @@ static void register_s12ad(RX113State *s, DeviceState *port)
     }
 }
 
+/* Table 17.3 source numbers are independent of the ICU vector numbers. */
+static void elc_source_connect(DeviceState *src, const char *name, unsigned pin,
+                               DeviceState *elc, unsigned id)
+{
+    qdev_connect_gpio_out_named(src, name, pin,
+                               qdev_get_gpio_in_named(elc, "event", id));
+}
+
+static void register_elc(RX113State *s)
+{
+    DeviceState *dev = qdev_new(TYPE_RX113_ELC);
+
+    s->elc = dev;
+    object_property_add_child(OBJECT(s), "elc", OBJECT(dev));
+    object_property_set_link(OBJECT(dev), "mtu", OBJECT(s->mtu),
+                             &error_abort);
+    object_property_set_link(OBJECT(dev), "cmt", OBJECT(&s->cmt[0]),
+                             &error_abort);
+    object_property_set_link(OBJECT(dev), "tmr0", OBJECT(&s->tmr[0]),
+                             &error_abort);
+    object_property_set_link(OBJECT(dev), "tmr2", OBJECT(&s->tmr[1]),
+                             &error_abort);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_abort);
+    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, 0x0008b100);
+    for (unsigned id = 0x08; id <= 0x1a; id++) {
+        elc_source_connect(s->mtu, "event", id, dev, id);
+    }
+    elc_source_connect(DEVICE(&s->cmt[0]), "event", 1, dev, 0x1f);
+    for (unsigned unit = 0; unit < 2; unit++) {
+        for (unsigned i = 0; i < 3; i++) {
+            elc_source_connect(DEVICE(&s->tmr[unit]), "event", i, dev,
+                               (unit ? 0x28 : 0x22) + i);
+        }
+    }
+    for (unsigned i = 0; i < SCI_NR_IRQ; i++) {
+        elc_source_connect(DEVICE(&s->sci[3]), "event", i, dev, 0x3a + i);
+    }
+    elc_source_connect(s->s12ad, "scan-end", 0, dev, 0x58);
+    elc_source_connect(s->dtc, "transfer-end", 0, dev, 0x61);
+    for (unsigned i = 0; i < 12; i++) {
+        qdev_connect_gpio_out_named(dev, "mtu", i,
+                                   qdev_get_gpio_in_named(s->mtu, "elc", i));
+    }
+    qdev_connect_gpio_out_named(dev, "link", 7,
+                               qdev_get_gpio_in_named(DEVICE(&s->cmt[0]),
+                                                      "elc", 1));
+    for (unsigned i = 0; i < 2; i++) {
+        qdev_connect_gpio_out_named(dev, "link", i ? 12 : 10,
+                                   qdev_get_gpio_in_named(DEVICE(&s->tmr[i]),
+                                                          "elc", 0));
+    }
+    qdev_connect_gpio_out_named(dev, "link", 15,
+                               qdev_get_gpio_in_named(s->s12ad, "trigger", 9));
+    qdev_connect_gpio_out_named(dev, "link", 18,
+                               qdev_get_gpio_in(s->dtc, 106));
+    qdev_connect_gpio_out_named(dev, "link", 19,
+                               qdev_get_gpio_in(s->dtc, 80));
+}
+
 /* Table 5.1 register blocks; these stubs log accesses with -d unimp. */
 static void register_stubs(void)
 {
@@ -756,7 +819,6 @@ static void register_stubs(void)
         { "rx113-dac", 0x00088040, 0x10 },
         { "rx113-cac", 0x0008b000, 0x20 },
         { "rx113-doc", 0x0008b080, 0x10 },
-        { "rx113-elc", 0x0008b100, 0x30 },
         { "rx113-usb0", 0x000a0000, 0x200 },
         { "rx113-ctsu", 0x000a0900, 0x100 },
     };
@@ -824,6 +886,7 @@ static void rx113_realize(DeviceState *dev, Error **errp)
     }
     register_rtc(s, register_lcdc(s));
     register_s12ad(s, register_port(s));
+    register_elc(s);
     register_stubs();
 }
 

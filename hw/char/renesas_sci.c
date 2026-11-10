@@ -110,12 +110,14 @@ static void receive(void *opaque, const uint8_t *buf, int size)
     }
     if (FIELD_EX8(sci->ssr, SSR, RDRF) || size > 1) {
         sci->ssr = FIELD_DP8(sci->ssr, SSR, ORER, 1);
+        qemu_irq_pulse(sci->event[ERI]);
         if (FIELD_EX8(sci->scr, SCR, RIE)) {
             qemu_set_irq(sci->irq[ERI], 1);
         }
     } else {
         sci->rdr = buf[0];
         sci->ssr = FIELD_DP8(sci->ssr, SSR, RDRF, 1);
+        qemu_irq_pulse(sci->event[RXI]);
         if (FIELD_EX8(sci->scr, SCR, RIE)) {
             qemu_irq_pulse(sci->irq[RXI]);
         }
@@ -135,6 +137,7 @@ static void send_byte(RSCIState *sci)
     sci->ssr = FIELD_DP8(sci->ssr, SSR, TEND, 0);
     sci->ssr = FIELD_DP8(sci->ssr, SSR, TDRE, 1);
     qemu_set_irq(sci->irq[TEI], 0);
+    qemu_irq_pulse(sci->event[TXI]);
     if (FIELD_EX8(sci->scr, SCR, TIE)) {
         qemu_irq_pulse(sci->irq[TXI]);
     }
@@ -147,6 +150,7 @@ static void txend(void *opaque)
         send_byte(sci);
     } else {
         sci->ssr = FIELD_DP8(sci->ssr, SSR, TEND, 1);
+        qemu_irq_pulse(sci->event[TEI]);
         if (FIELD_EX8(sci->scr, SCR, TEIE)) {
             qemu_set_irq(sci->irq[TEI], 1);
         }
@@ -192,6 +196,9 @@ static void sci_write(void *opaque, hwaddr offset, uint64_t val, unsigned size)
         }
         break;
     case A_SCR:
+        if (!(sci->scr & R_SCR_TE_MASK) && (val & R_SCR_TE_MASK)) {
+            qemu_irq_pulse(sci->event[TXI]);
+        }
         sci->scr = val;
         if (FIELD_EX8(sci->scr, SCR, TE)) {
             sci->ssr = FIELD_DP8(sci->ssr, SSR, TDRE, 1);
@@ -357,6 +364,7 @@ static void sci_event(void *opaque, QEMUChrEvent event)
     RSCIState *sci = RSCI(opaque);
     if (!sci->module_stopped && event == CHR_EVENT_BREAK) {
         sci->ssr = FIELD_DP8(sci->ssr, SSR, FER, 1);
+        qemu_irq_pulse(sci->event[ERI]);
         if (FIELD_EX8(sci->scr, SCR, RIE)) {
             qemu_set_irq(sci->irq[ERI], 1);
         }
@@ -389,6 +397,7 @@ static void rsci_init(Object *obj)
     for (i = 0; i < SCI_NR_IRQ; i++) {
         sysbus_init_irq(d, &sci->irq[i]);
     }
+    qdev_init_gpio_out_named(DEVICE(obj), sci->event, "event", SCI_NR_IRQ);
     timer_init_ns(&sci->timer, QEMU_CLOCK_VIRTUAL, txend, sci);
     timer_init_ns(&sci->rx_timer, QEMU_CLOCK_VIRTUAL, sci_rx_ready, sci);
 }

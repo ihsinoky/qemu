@@ -69,6 +69,10 @@ static bool tmr_wide(RTMRState *s)
 
 static unsigned tmr_div(RTMRState *s, int ch)
 {
+    if (s->has_elc && ch == 0 &&
+        (s->elc_mode == 2 || (s->elc_mode == 0 && !s->elc_started))) {
+        return 0;
+    }
     if (tmr_wide(s)) {
         if (ch || FIELD_EX8(s->tccr[1], TCCR, CSS) != CSS_INTERNAL) {
             return 0;
@@ -138,6 +142,12 @@ static void tmr_schedule(RTMRState *s, int ch)
 static void tmr_match(RTMRState *s, int ch, unsigned events)
 {
     unsigned clear = FIELD_EX8(s->tcr[ch], TCR, CCLR);
+
+    for (unsigned i = 0; i < 3; i++) {
+        if (events & (1 << i)) {
+            qemu_irq_pulse(s->event[ch * 3 + i]);
+        }
+    }
 
     if ((events & 1) && FIELD_EX8(s->tcr[ch], TCR, CMIEA)) {
         qemu_irq_pulse(s->cmia[ch]);
@@ -335,6 +345,9 @@ static uint64_t tmr_read(void *opaque, hwaddr addr, unsigned size)
                       addr);
         return UINT64_MAX;
     }
+    if (addr == 12 && size == 1 && tmr->has_elc) {
+        return tmr->elc_started;
+    }
     switch (addr & 0x0e) {
     case A_TCR:
         ret = 0;
@@ -430,6 +443,13 @@ static void tmr_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
             tmr->phase[0] = tmr->phase[1] = 0;
         }
     }
+    if (addr == 12 && size == 1 && tmr->has_elc) {
+        if (!(val & 1)) {
+            tmr->elc_started = false;
+            tmr_schedule(tmr, 0);
+        }
+        return;
+    }
     switch (addr & 0x0e) {
     case A_TCR:
         tmr->tcr[ch] = val;
@@ -493,6 +513,7 @@ static uint16_t issue_event(RTMRState *tmr, int ch, int sz,
         break;
     case cmia:
         if (tcnt >= tcora) {
+            qemu_irq_pulse(tmr->event[ch * 3]);
             if (FIELD_EX8(tmr->tcr[ch], TCR, CCLR) == CCLR_A) {
                 ret = tcnt - tcora;
             }
@@ -508,6 +529,7 @@ static uint16_t issue_event(RTMRState *tmr, int ch, int sz,
         break;
     case cmib:
         if (tcnt >= tcorb) {
+            qemu_irq_pulse(tmr->event[ch * 3 + 1]);
             if (FIELD_EX8(tmr->tcr[ch], TCR, CCLR) == CCLR_B) {
                 ret = tcnt - tcorb;
             }
@@ -517,6 +539,9 @@ static uint16_t issue_event(RTMRState *tmr, int ch, int sz,
         }
         break;
     case ovi:
+        if (tcnt >= (1 << sz)) {
+            qemu_irq_pulse(tmr->event[ch * 3 + 2]);
+        }
         if ((tcnt >= (1 << sz)) && FIELD_EX8(tmr->tcr[ch], TCR, OVIE)) {
             qemu_irq_pulse(tmr->ovi[ch]);
         }
@@ -569,6 +594,47 @@ static void timer_event1(void *opaque)
     timer_events(tmr, 1);
 }
 
+void renesas_tmr_set_elc_mode(RTMRState *s, unsigned mode)
+{
+    assert(s->has_elc && mode < 4);
+    if (s->elc_mode == mode) {
+        return;
+    }
+    tmr_sync(s);
+    s->elc_mode = mode;
+    tmr_schedule(s, 0);
+}
+
+static void tmr_elc_input(void *opaque, int n, int level)
+{
+    RTMRState *s = opaque;
+    unsigned events = 0;
+
+    if (!level || !s->has_elc || !s->clock_managed || s->module_stopped ||
+        tmr_wide(s) || s->elc_mode == 3 ||
+        (s->elc_mode == 0 && s->elc_started)) {
+        return;
+    }
+    tmr_sync(s);
+    switch (s->elc_mode) {
+    case 0:
+        s->elc_started = true;
+        break;
+    case 1:
+        s->tcnt[0] = 0;
+        s->phase[0] = 0;
+        break;
+    case 2:
+        s->tcnt[0]++;
+        events = (s->tcnt[0] == s->tcora[0] ? 1 : 0) |
+                 (s->tcnt[0] == s->tcorb[0] ? 2 : 0) |
+                 (s->tcnt[0] == 0 ? 4 : 0);
+        tmr_match(s, 0, events);
+        break;
+    }
+    tmr_schedule(s, 0);
+}
+
 void renesas_tmr_set_clock(RTMRState *s, uint64_t freq, bool stopped)
 {
     int ch;
@@ -611,6 +677,8 @@ static void rtmr_reset(DeviceState *dev)
             tmr->clock_tick[ch] = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
         }
     }
+    tmr->elc_mode = 3;
+    tmr->elc_started = false;
     tmr->tcr[0]   = tmr->tcr[1]   = 0x00;
     tmr->tcsr[0]  = 0x00;
     tmr->tcsr[1]  = 0x10;
@@ -637,6 +705,9 @@ static void rtmr_init(Object *obj)
         sysbus_init_irq(d, &tmr->cmib[i]);
         sysbus_init_irq(d, &tmr->ovi[i]);
     }
+    tmr->elc_mode = 3;
+    qdev_init_gpio_out_named(DEVICE(obj), tmr->event, "event", TMR_NR_IRQ);
+    qdev_init_gpio_in_named(DEVICE(obj), tmr_elc_input, "elc", 1);
     timer_init_ns(&tmr->timer[0], QEMU_CLOCK_VIRTUAL, timer_event0, tmr);
     timer_init_ns(&tmr->timer[1], QEMU_CLOCK_VIRTUAL, timer_event1, tmr);
 }
@@ -649,6 +720,8 @@ static int tmr_pre_load(void *opaque)
     if (s->legacy_input_freq) {
         s->input_freq = s->legacy_input_freq;
     }
+    s->elc_mode = 3;
+    s->elc_started = false;
     s->clock_managed = false;
     s->module_stopped = false;
     return 0;
@@ -694,6 +767,31 @@ static const VMStateDescription vmstate_tmr_clock = {
     },
 };
 
+static bool tmr_elc_needed(void *opaque)
+{
+    return RTMR(opaque)->has_elc;
+}
+
+static int tmr_elc_post_load(void *opaque, int version_id)
+{
+    RTMRState *s = opaque;
+
+    return s->has_elc && s->clock_managed && s->elc_mode < 4 ? 0 : -EINVAL;
+}
+
+static const VMStateDescription vmstate_tmr_elc = {
+    .name = "rx-tmr/elc",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = tmr_elc_needed,
+    .post_load = tmr_elc_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT8(elc_mode, RTMRState),
+        VMSTATE_BOOL(elc_started, RTMRState),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static const VMStateDescription vmstate_rtmr = {
     .name = "rx-tmr",
     .version_id = 1,
@@ -715,12 +813,14 @@ static const VMStateDescription vmstate_rtmr = {
     },
     .subsections = (const VMStateDescription * const[]) {
         &vmstate_tmr_clock,
+        &vmstate_tmr_elc,
         NULL
     },
 };
 
 static const Property rtmr_properties[] = {
     DEFINE_PROP_UINT64("input-freq", RTMRState, input_freq, 0),
+    DEFINE_PROP_BOOL("has-elc", RTMRState, has_elc, false),
 };
 
 static void rtmr_class_init(ObjectClass *klass, const void *data)
