@@ -32,6 +32,8 @@ struct RX113MTUState {
     MemoryRegion iomem;
     QEMUTimer *timer;
     qemu_irq irq[RX113_MTU_IRQS];
+    qemu_irq event[0x1b];
+    uint32_t elc_events;
     RX113MTUChannel ch[CHANNELS];
     uint64_t hz;
     int64_t last_ns;
@@ -145,6 +147,11 @@ static void mtu_match(RX113MTUState *s, unsigned n, unsigned gr)
     } else {
         enabled = c->tier & (1 << gr);
     }
+    if (n >= 1 && n <= 4) {
+        static const unsigned base[] = { 0, 0x08, 0x0c, 0x10, 0x15 };
+
+        qemu_irq_pulse(s->event[base[n] + gr]);
+    }
     if (enabled) {
         /* Section 20.6.26: zero-period PCLK/1 requests stay asserted. */
         if (n < 5 && c->tgr[gr] == 0 && mtu_clear_gr(c) >= 0 &&
@@ -220,6 +227,11 @@ static void mtu_finish_events(RX113MTUState *s, unsigned events)
             unsigned flag = down ? 0x20 : 0x10;
             unsigned irq = irq_base[n] + (n == 1 || n == 2 ? 2 : 4);
 
+            if (n >= 1 && n <= 4 && !(n == 3 && down)) {
+                static const unsigned wrap[] = { 0, 0x0a, 0x0e, 0x14, 0x19 };
+
+                qemu_irq_pulse(s->event[wrap[n] + down]);
+            }
             if (s->ch[n].tier & flag) {
                 qemu_irq_pulse(s->irq[irq + down]);
             }
@@ -259,6 +271,16 @@ static bool mtu_static_zero(RX113MTUState *s, unsigned n)
         (s->sync & (1 << start_bit[n])) || gr < 0 || c->tgr[gr] ||
         !mtu_compare(s, n, gr) || mtu_divisor(s, n) != 1) {
         return false;
+    }
+    if (n >= 1 && n <= 4) {
+        static const unsigned base[] = { 0, 0x08, 0x0c, 0x10, 0x15 };
+
+        for (unsigned i = 0; i < tgr_count[n]; i++) {
+            if (c->tgr[i] == 0 && mtu_compare(s, n, i) &&
+                (s->elc_events & (1U << (base[n] + i)))) {
+                return false;
+            }
+        }
     }
     for (unsigned i = 0; i < tgr_count[n]; i++) {
         unsigned irq = irq_base[n] + i + (i >= 4);
@@ -392,6 +414,17 @@ static void mtu_timer(void *opaque)
     mtu_schedule(s);
 }
 
+void rx113_mtu_set_elc_events(DeviceState *dev, uint32_t mask)
+{
+    RX113MTUState *s = RX113_MTU(dev);
+
+    if (s->elc_events != mask) {
+        mtu_advance(s);
+        s->elc_events = mask;
+        mtu_schedule(s);
+    }
+}
+
 void rx113_mtu_set_clock(DeviceState *dev, uint64_t hz, bool stopped)
 {
     RX113MTUState *s = RX113_MTU(dev);
@@ -399,6 +432,48 @@ void rx113_mtu_set_clock(DeviceState *dev, uint64_t hz, bool stopped)
     mtu_advance(s);
     s->hz = hz;
     s->stopped = stopped;
+    mtu_schedule(s);
+}
+
+/* Three operation inputs per channel: start, restart, TGRA capture. */
+static void mtu_elc_input(void *opaque, int input, int level)
+{
+    RX113MTUState *s = opaque;
+    unsigned n = input / 3 + 1;
+    unsigned operation = input % 3;
+    RX113MTUChannel *c = &s->ch[n];
+
+    if (!level || s->stopped) {
+        return;
+    }
+    mtu_advance(s);
+    /* Section 20.8.2 requires normal mode for ELC operations. */
+    if (c->mode != 0) {
+        return;
+    }
+    switch (operation) {
+    case 0:
+        s->start |= 1 << start_bit[n];
+        break;
+    case 1:
+        c->count = 0;
+        c->phase = 0;
+        break;
+    case 2:
+        if (mtu_running(s, n) && mtu_io(c, 0) >= 8) {
+            c->tgr[0] = c->count;
+            if (c->tier & 1) {
+                qemu_irq_pulse(s->irq[irq_base[n]]);
+            }
+            if (mtu_clear_gr(c) == 0) {
+                c->count = 0;
+                mtu_buffer(c, 1, true);
+                mtu_finish_events(s, 1 << n);
+            }
+        }
+        break;
+    }
+    mtu_update_held(s);
     mtu_schedule(s);
 }
 
@@ -776,6 +851,7 @@ static void mtu_reset_hold(Object *obj, ResetType type)
         qemu_set_irq(s->irq[i], 0);
     }
     s->held_irqs = 0;
+    s->elc_events = 0;
     s->rwe = 1;
     s->rwe_read = false;
     s->last_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
@@ -828,7 +904,7 @@ static int mtu_post_load(void *opaque, int version_id)
 
 static const VMStateDescription vmstate_mtu = {
     .name = TYPE_RX113_MTU,
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .pre_save = mtu_pre_save,
     .post_load = mtu_post_load,
@@ -847,6 +923,7 @@ static const VMStateDescription vmstate_mtu = {
         VMSTATE_UINT8(clear5, RX113MTUState),
         VMSTATE_UINT8(mtclk, RX113MTUState),
         VMSTATE_UINT32(held_irqs, RX113MTUState),
+        VMSTATE_UINT32_V(elc_events, RX113MTUState, 2),
         VMSTATE_END_OF_LIST()
     },
 };
@@ -864,6 +941,8 @@ static void mtu_init(Object *obj)
     for (unsigned i = 0; i < RX113_MTU_IRQS; i++) {
         sysbus_init_irq(sbd, &s->irq[i]);
     }
+    qdev_init_gpio_out_named(DEVICE(obj), s->event, "event", 0x1b);
+    qdev_init_gpio_in_named(DEVICE(obj), mtu_elc_input, "elc", 12);
     qdev_init_gpio_in_named(DEVICE(obj), mtu_clock_input, "mtclk", 4);
 }
 
