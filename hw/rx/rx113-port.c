@@ -10,6 +10,7 @@
 #include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/rx/rx113_port.h"
+#include "hw/rx/rx113_elc.h"
 #include "migration/vmstate.h"
 
 #define PDR  0x000
@@ -181,8 +182,9 @@ static uint8_t port_mask(RX113PortState *s, hwaddr addr)
     return mask;
 }
 
-static void port_update(RX113PortState *s)
+static void port_update(RX113PortState *s, bool notify)
 {
+    uint8_t old_b = s->levels[11];
     uint8_t irq_levels = 0;
     bool cacref = false;
 
@@ -248,10 +250,40 @@ static void port_update(RX113PortState *s)
         qemu_set_irq(s->pin_out[pin], level);
         qemu_set_irq(s->pin_oe[pin], drive);
     }
+    if (notify && s->elc) {
+        rx113_elc_port_input(s->elc, old_b, s->levels[11]);
+    }
     qemu_set_irq(s->cacref, cacref);
     for (unsigned i = 0; i < 8; i++) {
         qemu_set_irq(s->irq[i], (irq_levels >> i) & 1);
     }
+}
+
+uint8_t rx113_port_b_mask(RX113PortState *s)
+{
+    return gpio_pins(s, 11) & ~s->regs[PMR + 11];
+}
+
+uint8_t rx113_port_b_direction(RX113PortState *s)
+{
+    return s->regs[PDR + 11];
+}
+
+uint8_t rx113_port_b_levels(RX113PortState *s)
+{
+    return s->levels[11];
+}
+
+uint8_t rx113_port_b_latch(RX113PortState *s)
+{
+    return s->regs[PODR + 11];
+}
+
+void rx113_port_b_write(RX113PortState *s, uint8_t mask, uint8_t value)
+{
+    mask &= rx113_port_b_mask(s);
+    s->regs[PODR + 11] = (s->regs[PODR + 11] & ~mask) | (value & mask);
+    port_update(s, true);
 }
 
 void rx113_port_set_ctsu(RX113PortState *s, bool fixed, bool level)
@@ -259,7 +291,7 @@ void rx113_port_set_ctsu(RX113PortState *s, bool fixed, bool level)
     if (s) {
         s->ctsu_fixed = fixed;
         s->ctsu_level = level;
-        port_update(s);
+        port_update(s, true);
     }
 }
 
@@ -277,7 +309,7 @@ static void port_input(void *opaque, int pin, int level)
         s->external[port] = (s->external[port] & ~mask) |
                             (level != 0 ? mask : 0);
     }
-    port_update(s);
+    port_update(s, true);
 }
 
 static uint64_t port_read(void *opaque, hwaddr addr, unsigned size)
@@ -317,6 +349,9 @@ static void port_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
                (s->regs[PWPR] & PFSWE)) {
         mask = pfs_mask(s, addr - PFS);
     }
+    if (addr == PODR + 11 && s->elc) {
+        mask &= rx113_elc_port_write_mask(s->elc);
+    }
     s->regs[addr] = (s->regs[addr] & ~mask) | (val & mask);
     if (addr >= PMR && addr < PMR + RX113_PORT_COUNT && val & mask) {
         unsigned port = addr - PMR;
@@ -334,7 +369,7 @@ static void port_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
                           "(PMR port %u = 0x%02x)\n", port, unsupported);
         }
     }
-    port_update(s);
+    port_update(s, true);
 }
 
 static const MemoryRegionOps port_ops = {
@@ -375,12 +410,12 @@ static void port_reset_hold(Object *obj, ResetType type)
     memset(s->regs, 0, sizeof(s->regs));
     s->regs[PWPR] = B0WI;
     /* External board drivers survive an MCU reset. */
-    port_update(s);
+    port_update(s, false);
 }
 
 static int port_post_load(void *opaque, int version_id)
 {
-    port_update(opaque);
+    port_update(opaque, false);
     return 0;
 }
 

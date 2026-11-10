@@ -853,6 +853,7 @@ static void register_elc(RX113State *s)
 {
     DeviceState *dev = qdev_new(TYPE_RX113_ELC);
     DeviceState *splitter = qdev_new(TYPE_SPLIT_IRQ);
+    Object *port = object_resolve_path_component(OBJECT(s), "port");
 
     s->elc = dev;
     object_property_add_child(OBJECT(s), "elc", OBJECT(dev));
@@ -864,6 +865,8 @@ static void register_elc(RX113State *s)
                              &error_abort);
     object_property_set_link(OBJECT(dev), "tmr2", OBJECT(&s->tmr[1]),
                              &error_abort);
+    object_property_set_link(OBJECT(dev), "port", port, &error_abort);
+    RX113_PORT(port)->elc = dev;
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_abort);
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, 0x0008b100);
     for (unsigned id = 0x08; id <= 0x1a; id++) {
