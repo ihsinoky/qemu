@@ -79,3 +79,22 @@ change nothing when unconnected; event outputs and ELC operation
 inputs on the RX113 MTU; and the ELC device plus its wiring on
 RX113. IRQ behavior and RX62N behavior must remain completely
 unchanged, with the existing regression suites as the gate.
+
+## D-009: CAC active-configuration write policy (emulation convention)
+Date: 2026-11-10. Decided by: PMO as an emulation convention, in the
+same manner as the Issue #10 stopped-MMIO convention; reported to the
+PO, whose merge gate remains the final decision.
+The manual requires CACR1, CACR2, CAULVR and CALLVR to be set while
+CACR0.CFME=0 (sections 10.2.2, 10.2.3, 10.2.6, 10.2.7) but does not
+specify the hardware response to writes with CFME=1. The Issue #39
+audit stopped on this gap. Policy: while CFME=1, writes to those four
+registers are ignored (values retained) and a guest error is logged.
+Rationale: accepting a mid-measurement change to the target/reference
+selection, dividers or limits has no defined meaning for the interval
+already being counted, so inventing partial-acceptance semantics would
+create more undocumented behaviour than ignoring the write; firmware
+following the documented sequence is unaffected. Related choices for
+Issue #39: the CFME reflection delay (section 10.2.1 note, no duration
+or clock domain specified) is not modelled — writes reflect
+immediately; the digital filter (section 10.3.2) is documented
+behaviour and is implemented as specified under D-006.
