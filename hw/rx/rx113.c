@@ -23,6 +23,7 @@
 #include "hw/rx/rx113_elc.h"
 #include "hw/rx/rx113_doc.h"
 #include "hw/rx/rx113_cac.h"
+#include "hw/rx/rx113_ctsu.h"
 #include "hw/misc/unimp.h"
 #include "hw/core/sysbus.h"
 #include "hw/core/irq.h"
@@ -88,7 +89,7 @@ enum {
     SYS_MSTPCRB, SYS_SCKCR, SYS_SCKCR3, SYS_PLLCR, SYS_PLLCR2,
     SYS_UPLLCR, SYS_UPLLCR2, SYS_MOSCCR, SYS_SOSCCR, SYS_LOCOCR,
     SYS_HOCOCR, SYS_MOSCWTCR, SYS_HOCOWTCR, SYS_PRCR, SYS_MOFCR,
-    SYS_MSTPCRA, SYS_MSTPCRC, SYS_REG_COUNT,
+    SYS_MSTPCRA, SYS_MSTPCRC, SYS_MSTPCRD, SYS_REG_COUNT,
 };
 
 static const struct {
@@ -102,6 +103,7 @@ static const struct {
     [SYS_MSTPCRA] = { 0x10, 4, 0xefffffff, 0x1006c230, 2 },
     [SYS_MSTPCRB] = { 0x14, 4, 0xffffffff, 0xe6aa0650, 2 },
     [SYS_MSTPCRC] = { 0x18, 4, 0x7ffffffe, 0x8c180001, 2 },
+    [SYS_MSTPCRD] = { 0x1c, 4, 0xffffffff, 0x8c00, 2 },
     /* §9.2.1-6: clock selections; PRC0 protects these registers. */
     [SYS_SCKCR] = { 0x20, 4, 0x33000303, 0xff000f0f, 1 },
     [SYS_SCKCR3] = { 0x26, 2, 0, 0x700, 1 },
@@ -238,6 +240,8 @@ gates:
         rx113_cac_set_clocks(s->mcu->cac, hz,
                              s->regs[SYS_MSTPCRC] & (1U << 19));
     }
+    rx113_ctsu_set_clock(s->mcu->ctsu, pclkb,
+                         s->regs[SYS_MSTPCRD] & (1U << 10));
     rx113_doc_set_stopped(s->mcu->doc,
                           s->regs[SYS_MSTPCRB] & (1U << 6));
     rx113_elc_set_clock(s->mcu->elc, pclkb,
@@ -512,6 +516,9 @@ static int rx113_system_post_load(void *opaque, int version_id)
     RX113SystemState *s = opaque;
     unsigned i;
 
+    if (version_id < 6) {
+        s->regs[SYS_MSTPCRD] = system_regs[SYS_MSTPCRD].reset;
+    }
     if (version_id < 4) {
         s->regs[SYS_MSTPCRC] = system_regs[SYS_MSTPCRC].reset;
     }
@@ -533,7 +540,7 @@ static int rx113_system_post_load(void *opaque, int version_id)
 
 static const VMStateDescription vmstate_rx113_system = {
     .name = TYPE_RX113_SYSTEM,
-    .version_id = 5,
+    .version_id = 6,
     .minimum_version_id = 1,
     .post_load = rx113_system_post_load,
     .fields = (const VMStateField[]) {
@@ -541,6 +548,7 @@ static const VMStateDescription vmstate_rx113_system = {
         VMSTATE_UINT32_SUB_ARRAY(regs, RX113SystemState, 0, SYS_MSTPCRA),
         VMSTATE_UINT32_V(regs[SYS_MSTPCRA], RX113SystemState, 3),
         VMSTATE_UINT32_V(regs[SYS_MSTPCRC], RX113SystemState, 4),
+        VMSTATE_UINT32_V(regs[SYS_MSTPCRD], RX113SystemState, 6),
         VMSTATE_BOOL_V(rtc_enabled, RX113SystemState, 5),
         VMSTATE_INT64_V(iwdt_ready_ns, RX113SystemState, 5),
         VMSTATE_UINT8_V(oscovfsr, RX113SystemState, 2),
@@ -857,6 +865,8 @@ static void register_elc(RX113State *s)
                                    qdev_get_gpio_in_named(DEVICE(&s->tmr[i]),
                                                           "elc", 0));
     }
+    qdev_connect_gpio_out_named(dev, "link", 14,
+                               qdev_get_gpio_in_named(s->ctsu, "start", 0));
     qdev_connect_gpio_out_named(dev, "link", 15,
                                qdev_get_gpio_in_named(s->s12ad, "trigger", 9));
     qdev_connect_gpio_out_named(dev, "link", 18,
@@ -875,7 +885,6 @@ static void register_stubs(void)
     } stubs[] = {
         { "rx113-dac", 0x00088040, 0x10 },
         { "rx113-usb0", 0x000a0000, 0x200 },
-        { "rx113-ctsu", 0x000a0900, 0x100 },
     };
     unsigned i;
 
@@ -958,6 +967,19 @@ static void rx113_realize(DeviceState *dev, Error **errp)
     /* Table 14.3: level source 57, with no DTC activation. */
     sysbus_connect_irq(SYS_BUS_DEVICE(s->doc), 0,
                        qdev_get_gpio_in(DEVICE(&s->icu), 57));
+    s->ctsu = qdev_new(TYPE_RX113_CTSU);
+    object_property_add_child(OBJECT(s), "ctsu", OBJECT(s->ctsu));
+    object_property_set_link(OBJECT(s->ctsu), "port",
+                             object_resolve_path_component(OBJECT(s), "port"),
+                             &error_abort);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(s->ctsu), &error_abort);
+    sysbus_mmio_map(SYS_BUS_DEVICE(s->ctsu), 0, 0x000a0900);
+    sysbus_mmio_map(SYS_BUS_DEVICE(s->ctsu), 1, 0x007fffbe);
+    for (unsigned i = 0; i < 3; i++) {
+        sysbus_connect_irq(SYS_BUS_DEVICE(s->ctsu), i,
+                           qdev_get_gpio_in(i < 2 ? s->dtc : DEVICE(&s->icu),
+                                            60 + i));
+    }
     register_elc(s);
     register_stubs();
 }
