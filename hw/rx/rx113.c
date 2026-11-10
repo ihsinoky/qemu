@@ -19,6 +19,7 @@
 #include "hw/rx/rx113_iwdt.h"
 #include "hw/rx/rx113_mtu.h"
 #include "hw/rx/rx113_s12ad.h"
+#include "hw/rx/rx113_dtc.h"
 #include "hw/misc/unimp.h"
 #include "hw/core/sysbus.h"
 #include "hw/core/irq.h"
@@ -208,6 +209,8 @@ static void rx113_system_update_clocks(RX113SystemState *s)
         qemu_log_mask(LOG_GUEST_ERROR, "rx113: prohibited PCLKD divider\n");
     }
 gates:
+    rx113_dtc_set_stopped(s->mcu->dtc,
+                          s->regs[SYS_MSTPCRA] & (1U << 28));
     rx113_s12ad_set_clock(s->mcu->s12ad, pclkb, pclkd,
                           s->regs[SYS_MSTPCRA] & (1U << 17));
     rx113_mtu_set_clock(s->mcu->mtu, pclkb,
@@ -594,8 +597,21 @@ static void register_icu(RX113State *s)
 
     sysbus_connect_irq(icu, 0, qdev_get_gpio_in(DEVICE(&s->cpu), RX_CPU_IRQ));
     sysbus_connect_irq(icu, 1, qdev_get_gpio_in(DEVICE(&s->cpu), RX_CPU_FIR));
-    sysbus_connect_irq(icu, 2, qdev_get_gpio_in(DEVICE(&s->icu), SWI));
     sysbus_mmio_map(icu, 0, RX113_ICU_BASE);
+}
+
+static void register_dtc(RX113State *s)
+{
+    s->dtc = qdev_new(TYPE_RX113_DTC);
+    object_property_add_child(OBJECT(s), "dtc", OBJECT(s->dtc));
+    object_property_set_link(OBJECT(s->dtc), "icu", OBJECT(&s->icu),
+                             &error_abort);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(s->dtc), &error_abort);
+    sysbus_mmio_map(SYS_BUS_DEVICE(s->dtc), 0, 0x00082400);
+    /* RX113-only front end, with direct delegation to the shared ICU MMIO. */
+    sysbus_mmio_map_overlap(SYS_BUS_DEVICE(s->dtc), 1, RX113_ICU_BASE, 1);
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->icu), 2,
+                       qdev_get_gpio_in(s->dtc, SWI));
 }
 
 static void register_tmr(RX113State *s, unsigned unit)
@@ -612,7 +628,7 @@ static void register_tmr(RX113State *s, unsigned unit)
     irqbase = RX113_TMR_IRQ + TMR_NR_IRQ * unit;
     for (i = 0; i < TMR_NR_IRQ; i++) {
         sysbus_connect_irq(tmr, i,
-                           qdev_get_gpio_in(DEVICE(&s->icu), irqbase + i));
+                           qdev_get_gpio_in(s->dtc, irqbase + i));
     }
     sysbus_mmio_map(tmr, 0, RX113_TMR_BASE + unit * 0x10);
 }
@@ -631,7 +647,7 @@ static void register_cmt(RX113State *s, unsigned unit)
     irqbase = RX113_CMT_IRQ + CMT_NR_IRQ * unit;
     for (i = 0; i < CMT_NR_IRQ; i++) {
         sysbus_connect_irq(cmt, i,
-                           qdev_get_gpio_in(DEVICE(&s->icu), irqbase + i));
+                           qdev_get_gpio_in(s->dtc, irqbase + i));
     }
     sysbus_mmio_map(cmt, 0, RX113_CMT_BASE + unit * 0x10);
 }
@@ -651,7 +667,7 @@ static void register_sci(RX113State *s, unsigned unit)
 
     for (i = 0; i < SCI_NR_IRQ; i++) {
         sysbus_connect_irq(sci, i,
-                          qdev_get_gpio_in(DEVICE(&s->icu),
+                          qdev_get_gpio_in(s->dtc,
                                            sci_channels[unit].irq + i));
     }
     sysbus_mmio_map(sci, 0, sci_channels[unit].base);
@@ -689,11 +705,11 @@ static void register_rtc(RX113State *s, DeviceState *lcdc)
     sysbus_realize_and_unref(sbd, &error_abort);
     sysbus_mmio_map(sbd, 0, RX113_RTC_BASE);
     sysbus_connect_irq(sbd, RX113_RTC_IRQ_ALM,
-                       qdev_get_gpio_in(DEVICE(&s->icu), RTC_ALM));
+                       qdev_get_gpio_in(s->dtc, RTC_ALM));
     sysbus_connect_irq(sbd, RX113_RTC_IRQ_PRD,
-                       qdev_get_gpio_in(DEVICE(&s->icu), RTC_PRD));
+                       qdev_get_gpio_in(s->dtc, RTC_PRD));
     sysbus_connect_irq(sbd, RX113_RTC_IRQ_CUP,
-                       qdev_get_gpio_in(DEVICE(&s->icu), RTC_CUP));
+                       qdev_get_gpio_in(s->dtc, RTC_CUP));
     sysbus_connect_irq(sbd, RX113_RTC_IRQ_PRD_LCDC,
                        qdev_get_gpio_in_named(lcdc, "prd", 0));
 }
@@ -708,7 +724,7 @@ static DeviceState *register_port(RX113State *s)
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, RX113_PORT_BASE);
     for (unsigned i = 0; i < 8; i++) {
         qdev_connect_gpio_out_named(dev, "irq", i,
-                                   qdev_get_gpio_in(DEVICE(&s->icu), 64 + i));
+                                   qdev_get_gpio_in(s->dtc, 64 + i));
     }
     return dev;
 }
@@ -725,7 +741,7 @@ static void register_s12ad(RX113State *s, DeviceState *port)
     /* Table 14.3: S12ADI0 and GBADI are edge sources 102 and 103. */
     for (unsigned i = 0; i < 2; i++) {
         sysbus_connect_irq(SYS_BUS_DEVICE(dev), i,
-                           qdev_get_gpio_in(DEVICE(&s->icu), 102 + i));
+                           qdev_get_gpio_in(s->dtc, 102 + i));
     }
 }
 
@@ -737,7 +753,6 @@ static void register_stubs(void)
         hwaddr base;
         hwaddr size;
     } stubs[] = {
-        { "rx113-dtc", 0x00082400, 0x10 },
         { "rx113-dac", 0x00088040, 0x10 },
         { "rx113-cac", 0x0008b000, 0x20 },
         { "rx113-doc", 0x0008b080, 0x10 },
@@ -789,7 +804,8 @@ static void rx113_realize(DeviceState *dev, Error **errp)
 
     register_system(s);
     register_icu(s);
-    s->cpu.env.ack = qdev_get_gpio_in_named(DEVICE(&s->icu), "ack", 0);
+    register_dtc(s);
+    s->cpu.env.ack = qdev_get_gpio_in_named(s->dtc, "ack", 0);
     s->mtu = qdev_new(TYPE_RX113_MTU);
     object_property_add_child(OBJECT(s), "mtu", OBJECT(s->mtu));
     sysbus_realize_and_unref(SYS_BUS_DEVICE(s->mtu), &error_abort);
@@ -797,7 +813,7 @@ static void rx113_realize(DeviceState *dev, Error **errp)
     /* Table 14.3: all 28 MTU interrupts are consecutive edge sources. */
     for (unsigned i = 0; i < RX113_MTU_IRQS; i++) {
         sysbus_connect_irq(SYS_BUS_DEVICE(s->mtu), i,
-                           qdev_get_gpio_in(DEVICE(&s->icu), 114 + i));
+                           qdev_get_gpio_in(s->dtc, 114 + i));
     }
     register_tmr(s, 0);
     register_tmr(s, 1);
