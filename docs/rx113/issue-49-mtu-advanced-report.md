@@ -2,9 +2,188 @@
 SPDX-License-Identifier: GPL-2.0-or-later
 -->
 
-# Issue 49: RX113 MTU advanced output — stage 2 partial delivery
+# Issue 49: RX113 MTU advanced output — stage 2b partial delivery
 
-## Delivery status
+## Current delivery (2026-11-11)
+
+**Stage 2b and Issue #49 remain incomplete.** This run delivers the
+complementary **carrier/subcounter and staged-buffer foundation**, before
+the waveform arbitration boundary. It does not yet deliver the complete
+working PWM output core requested in the continuation brief. The existing
+stage 1 and stage 2a implementations remain in place. Stage 3 (POE) was
+not started. This is a partial run boundary, not a claim of full acceptance
+or an unresolved decision delegated to the PO.
+
+Base: `31296f4d8a3790b7c83a1ed4fd9930ca05f818f5` (stage 2a).
+Branch: `rx113/issue-49-mtu-advanced`. No commit, merge, push, PR or
+upstream submission was performed; repository metadata is read-only.
+The deliverable is the working-tree diff and
+`.issue49-runtime/issue49-stage2b-carrier.patch`.
+
+| Stage | Current state |
+| --- | --- |
+| 1 | Committed as `3f31fe9583`; retained |
+| 2a | Committed as `31296f4d8a`; retained |
+| 2b carrier and staged buffers | Implemented and tested as described below |
+| 2b duty arbitration, PWM pads and extended controls | Not implemented; explicit diagnostic retained |
+| 3 POE | Not started |
+
+### Implemented boundary and manual evidence
+
+Authority: supplied R01UH0448EJ0120 Rev.1.20, printed manual pages.
+
+* 20.3.8(a), Figure 20.39, p.483: one coupled count-edge function advances
+  MTU3/4 with the TDDR offset and shared direction. MTU3 runs from TDDR to
+  TGRA, MTU4 from zero to TCDR. TCNTS has separate crest down/up and
+  trough up/down regions, and a dormant Ta region. Initial operation begins
+  in the trough window. This is not two ordinary up-counters.
+* Figure 20.38, p.482: the implemented clock domain is the documented
+  simultaneous CST3/CST4 start with matching count source and edge.
+  Both internal and external MTCLKA/B sources use the same coupled edge.
+  Partial starts or mismatched clocks freeze this foundation and produce
+  an unsupported-configuration diagnostic; no policy for those setups is
+  inferred. Scheduling currently visits every complementary count edge;
+  event-distance optimization remains future work.
+* 20.3.8(b),(c),(g),(h), pp.484,486,488-489, Figure 20.43:
+  all five hidden temporary registers are separate from both buffers and
+  active registers. Mode selection initializes all five active registers.
+  Thereafter, MTU4.TGRD is the transaction commit write. In Ta it snapshots
+  all five buffers; in Tb it arms a deferred snapshot. At an end-of-Tb
+  boundary the selected transfer consumes the existing temporary bank
+  **before** a pending snapshot replaces it. Thus a Tb write cannot bypass
+  the temporary bank. Modes 13/14/15 select crest/trough/both transfers.
+* 20.6.14, p.539: MTU3 BFA controls TGRA3, TGRA4 and TCDR transfers;
+  BFB controls TGRB3 and TGRB4 transfers. MTU4's mode does not independently
+  run another counter engine.
+* 20.2.22-25, pp.440-441, and 20.2.16, p.432: TCNTS is read-only;
+  TDDR/TCDR/TCBR are 16-bit registers with FFFFh reset values. TRWER
+  protects TDDR/TCDR, while TCBR remains accessible. TCNTS and the five
+  hidden registers, region and pending-transfer state are migrated in
+  device migration version 5. Same-build migration is tested inside Tb1
+  with a pending second transaction and a fractional count clock.
+* 20.6.13, p.539: stopping both counters restores TDDR/zero and the initial
+  carrier/subcounter direction. Module stop instead retains region, count
+  and fractional clock state. Starting again continues from the relevant
+  state. Output restart semantics are still pending with the waveform core.
+* Table 20.57, p.520, and 20.3.8(3), p.506: crest requests use TGIA3;
+  the MTU4 trough emits ELC 0x1a and TCIV4 vector 138 together. The generic
+  wrap delivery now shares MTU4's overflow/underflow IRQ, instead of
+  incorrectly indexing the MTU5 U interrupt at vector 139. ELC delivery
+  remains independent of the ICU interrupt enable. No ICU vector was added.
+
+Compare decisions sample the stored count before the edge advances it,
+matching this model's existing count-edge convention. Direction changes
+and crest/trough requests occur on that sampled terminal count. The
+TCNTS transition table implemented by the new edge function is:
+
+| Region | Sampled transition | Action |
+| --- | --- | --- |
+| Ta, main up | MTU3.TCNT = TCDR | Start Tb1 at TGRA3, counting down |
+| Tb1 down | TCNTS = TCDR | Count up |
+| Tb1 up | TCNTS = TGRA3 | Halt at zero; selected crest transfer, then pending snapshot |
+| Ta, main down | MTU4.TCNT = TDDR | Start Tb2 at zero, counting up |
+| Tb2 up | TCNTS = TDDR | Count down |
+| Tb2 down | TCNTS = zero | Halt at TGRA3; selected trough transfer, then pending snapshot |
+
+### Explicitly unfinished behavior and next step
+
+Complementary mode selection now diagnoses **duty arbitration, outputs and
+extended controls unavailable**. All complementary pad enables stay off.
+The counter and buffer implementation is observable, but is not advertised
+as usable complementary PWM. TOER cannot enable an unimplemented waveform.
+Existing reset PWM and normal/PWM1/PWM2 pads retain their behavior.
+
+The very next change must implement 20.3.8(j),(k), pp.492-496: compare the
+old active and new temporary duty banks against MTU3/4 and the active
+TCNTS branches, arbitrate the four turn-on/turn-off events for each phase,
+apply turn-off precedence/interlocks, and preserve simultaneous on/off
+matches and the 0%/100% cases. Add physical PORT/PIDR tests for all six
+pads through crest and trough, including duty changes across both dead-time
+windows, before enabling complementary pad output. The present hidden-bank
+separation and region state are the inputs for that implementation; there
+is no immediate-copy waveform substitute. Duty and buffered C/D compare
+interrupt arbitration is also pending; only crest/trough sources are
+implemented on this path.
+
+Then complete TDER read-before-clear and no-dead-time output behavior;
+TWCR read-before-set, synchronous clearing/WRE/CCE and initial output
+restart; complementary TOCR/PSYE and TOLBR transfer; TITCR/TITCNT/TBTER
+skipping and linked transfers; TGCR brushless gating; and 20.3.11 MTU5
+measurement/capture compensation. None is silently replaced by register
+storage. TDDR currently provides the carrier offset, **not verified output
+dead-time separation**. Generic synchronous-clear processing deliberately
+skips the complementary pair until its dedicated restart path is added.
+No complementary duty/temporary-match IRQ or output acceptance result is
+claimed. Retain the unavailable diagnostic until these paths have tests.
+Do not begin POE before completing stage 2.
+
+### Current validation
+
+Evidence uses new `stage2b-*` runtime logs; earlier delivery logs are
+historical. No subprojects were fetched. All scratch uses the worktree
+runtime directory, with the existing `.s49` alias for socket path limits.
+
+| Check | Result and evidence under `.issue49-runtime/` |
+| --- | --- |
+| RX-only rebuild | PASS: `stage2b-build-final.log` |
+| MTU qtest | 47/47 PASS (37 retained, ten new): `stage2b-mtu.log` |
+| All configured RX qtests and quick functional tests | 32 suites OK, four existing skips, zero failures: `stage2b-regression.log` |
+| Existing gdbsim U-Boot functional | PASS: `stage2b-gdbsim-functional.log` |
+| Cached FIT PLL and HOCO, before/after reset | Both PASS: `stage2b-fit-pll.log`, `stage2b-fit-hoco.log` |
+| SYSTEM protection/timing, without/with FIT ELF | Both PASS: `stage2b-system.log`, `stage2b-system-elf.log` |
+| Both gdbsim machines listed/run three seconds | Both PASS: `stage2b-machine-help.log`, `stage2b-gdbsim-smoke.log` |
+| Changed-file/raw-diff checkpatch | Zero errors and warnings: `stage2b-checkpatch-files.log`, `stage2b-checkpatch-patch.log` |
+| Forward/reverse patch dry runs and reconstructed bytes | PASS: `stage2b-patch-validation.log` |
+
+The ten new tests cover three carrier cycles with observations one ns
+before each edge; all TCNTS regions; all three update modes; commit-last
+ordering; deferred writes during Tb; transfer of the old temporary bank
+before a new pending bank; both buffer-enable groups; cycle increases and
+decreases across the crest while retaining the outgoing down-ramp;
+register resets, read-only and protection behavior; counter stop/restart;
+module stop at a fractional clock; external clock coupling; independent
+ELC/ICU trough delivery and absence of a spurious vector 139 request; and
+migration with both old temporary data and a pending new transaction.
+These are carrier/register/IRQ tests, not complementary pad tests.
+
+The first test attempts are retained in `stage2b-mtu-first.log` through
+`stage2b-mtu-third.log`. They exposed mistakes in the test's repeating
+subcounter lookup and the ELC setup (module-stop bit and operation
+selection), which were corrected before the passing run. No original
+assertion was removed or weakened. `stage2b-tested-binary.sha256` identifies
+the tested device binary; the final additional cycle test rebuilt only the
+qtest executable. The final regression uses all 47 MTU cases.
+
+Reproduce:
+
+```sh
+. .issue49-runtime/env.sh
+make -C build -j$(nproc)
+build/tests/qtest/rx113-mtu-test
+bash .issue49-runtime/stage2b-regression.sh
+scripts/checkpatch.pl --no-tree -f hw/rx/rx113-mtu.c \
+  tests/qtest/rx113-mtu-test.c
+python3 .issue49-runtime/stage2b-validate-patch.py
+```
+
+Current patch files, relative to the stage-2a commit:
+
+* `hw/rx/rx113-mtu.c`
+* `tests/qtest/rx113-mtu-test.c`
+* `docs/rx113/issue-49-mtu-advanced-report.md`
+
+The raw diff excludes AGENTS.md, manuals, runtime assets, build products
+and repository metadata. It is checked with `--no-signoff` because no
+commit was authorized or possible. The verifier reconstructs the three
+base files in runtime scratch, checks/applies the forward patch and
+compares every byte with the working tree, then checks/applies the reverse
+patch and compares every byte with the base again. It does not write
+`.git`. Suggested commit subject:
+`hw/rx: Add RX113 complementary carrier and staged buffer core`.
+
+## Stage 2a delivery record (historical; superseded by current status above)
+
+## Stage 2a delivery status (historical)
 
 Stage 1 is committed as `3f31fe9583a0ab265880b46299d2acf84afb5a24`.
 This run delivers the **reset-synchronized PWM portion of stage 2**, at
@@ -257,7 +436,7 @@ scripts/checkpatch.pl --no-tree -f hw/rx/rx113-mtu.c hw/rx/rx113-port.c \
   tests/qtest/rx113-mtu-test.c
 ```
 
-## Remaining work and D-006 merge gate
+## Stage 2a remaining work and D-006 merge gate (historical)
 
 The required order remains stage 2, then stage 3. Engineering estimates
 include manual-based qtests and regression, not just register storage.
@@ -273,7 +452,7 @@ Input capture outside the explicitly requested MTU5 compensation path
 remains outside Issue #49. Existing Issue #29 limitations for sub-PCLK
 synchronizer/bus arbitration and peer-module features are unchanged.
 
-## Next implementation step
+## Stage 2a next implementation step (historical)
 
 Start with a manual-derived transition table for the coupled complementary
 engine (20.3.8(a)–(c), Figures 20.39–42, pp.483–487), including Ta/Tb1/Tb2
@@ -296,7 +475,7 @@ this patch**. Their absence is not masked by register-only storage.
 Retain the unsupported diagnostics until the corresponding engine is
 validated. Stage 3 POE must wait for stage 2 completion.
 
-## Current patch contents
+## Stage 2a patch contents (historical)
 
 * `hw/rx/rx113-mtu.c`
 * `tests/qtest/rx113-mtu-test.c`
