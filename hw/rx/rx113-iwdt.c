@@ -326,6 +326,11 @@ static const MemoryRegionOps rx113_iwdt_ops = {
     .impl.max_access_size = 4,
 };
 
+uint64_t rx113_iwdt_clock_hz(DeviceState *dev)
+{
+    return RX113_IWDT(dev)->clock_started ? IWDT_HZ : 0;
+}
+
 uint8_t rx113_iwdt_ilococr(DeviceState *dev)
 {
     RX113IWDTState *s = RX113_IWDT(dev);

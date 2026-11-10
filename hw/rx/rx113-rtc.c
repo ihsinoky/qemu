@@ -350,6 +350,8 @@ static void rtc_update_timer(RX113RTCState *s)
     unsigned period = rtc_prd_period(s);
     int64_t ticks = -1;
 
+    qemu_set_irq(s->rtc_enable, !!(s->rcr3 & RCR3_RTCEN));
+
     if (!rtc_running(s)) {
         timer_del(&s->timer);
         return;
@@ -724,6 +726,7 @@ static void rtc_init(Object *obj)
     sysbus_init_irq(sbd, &s->prd);
     sysbus_init_irq(sbd, &s->cup);
     sysbus_init_irq(sbd, &s->prd_lcdc);
+    qdev_init_gpio_out_named(DEVICE(obj), &s->rtc_enable, "rtc-enable", 1);
     timer_init_ns(&s->timer, QEMU_CLOCK_VIRTUAL, rtc_timer_cb, s);
     /* SOSCCR.SOSTP resets to 0: SYSTEM initially requests the sub-clock. */
     s->system_subclock = true;

@@ -22,6 +22,7 @@
 #include "hw/rx/rx113_dtc.h"
 #include "hw/rx/rx113_elc.h"
 #include "hw/rx/rx113_doc.h"
+#include "hw/rx/rx113_cac.h"
 #include "hw/misc/unimp.h"
 #include "hw/core/sysbus.h"
 #include "hw/core/irq.h"
@@ -58,6 +59,9 @@
 
 /* Initial realization property; SYSTEM supplies the live clock at reset. */
 #define RX113_PCLKB_HZ (32 * 1000 * 1000)
+#define RX113_LOCO_HZ 4000000
+#define RX113_HOCO_HZ 32000000
+#define RX113_SUB_HZ 32768
 
 struct RX113Class {
     /*< private >*/
@@ -141,6 +145,8 @@ struct RX113SystemState {
     qemu_irq subclock;
     RX113State *mcu;
     uint64_t main_clock_hz;
+    bool rtc_enabled;
+    int64_t iwdt_ready_ns;
 };
 
 /* Table 5.1 addresses and Table 14.3 ERI/RXI/TXI/TEI vector bases. */
@@ -174,16 +180,16 @@ static void rx113_system_update_clocks(RX113SystemState *s)
 
     switch (select) {
     case 0:
-        source = 4000000; /* nominal LOCO */
+        source = RX113_LOCO_HZ;
         break;
     case 1:
-        source = 32000000; /* HOCO */
+        source = RX113_HOCO_HZ;
         break;
     case 2:
         source = s->main_clock_hz;
         break;
     case 3:
-        source = 32768; /* sub-clock crystal */
+        source = RX113_SUB_HZ;
         break;
     case 4: {
         unsigned plidiv = extract32(s->regs[SYS_PLLCR], 0, 2);
@@ -211,6 +217,27 @@ static void rx113_system_update_clocks(RX113SystemState *s)
         qemu_log_mask(LOG_GUEST_ERROR, "rx113: prohibited PCLKD divider\n");
     }
 gates:
+    if (s->mcu->cac) {
+        static const unsigned system_source[] = { 3, 2, 0, 1 };
+        uint64_t hz[6] = {
+            (s->oscovfsr & 1) ? s->main_clock_hz : 0,
+            (!(s->regs[SYS_SOSCCR] & 1) || s->rtc_enabled) ?
+                RX113_SUB_HZ : 0,
+            (s->oscovfsr & 8) ? RX113_HOCO_HZ : 0,
+            (s->regs[SYS_LOCOCR] & 1) ? 0 : RX113_LOCO_HZ,
+            qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) >= s->iwdt_ready_ns ?
+                rx113_iwdt_clock_hz(s->mcu->iwdt) : 0,
+            pclkb,
+        };
+        bool available = select < 4 ? hz[system_source[select]] :
+                         select == 4 && (s->oscovfsr & 4);
+
+        if (!available) {
+            hz[5] = 0;
+        }
+        rx113_cac_set_clocks(s->mcu->cac, hz,
+                             s->regs[SYS_MSTPCRC] & (1U << 19));
+    }
     rx113_doc_set_stopped(s->mcu->doc,
                           s->regs[SYS_MSTPCRB] & (1U << 6));
     rx113_elc_set_clock(s->mcu->elc, pclkb,
@@ -298,9 +325,13 @@ static void rx113_system_update_oscillators(void *opaque)
             }
         }
     }
+    if (s->iwdt_ready_ns > now) {
+        next = MIN(next, s->iwdt_ready_ns);
+    }
     if (next != INT64_MAX) {
         timer_mod(s->osc_timer, next);
     }
+    rx113_system_update_clocks(s);
 }
 
 static uint64_t rx113_system_read(void *opaque, hwaddr addr, unsigned size)
@@ -335,7 +366,12 @@ static void rx113_system_write(void *opaque, hwaddr addr, uint64_t value,
 
     if (addr == 0x35 && size == 1) {
         if ((s->regs[SYS_PRCR] & 1) && !(value & 1)) {
+            if (!rx113_iwdt_clock_hz(s->mcu->iwdt)) {
+                s->iwdt_ready_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                                   50000;
+            }
             rx113_iwdt_start_clock(s->mcu->iwdt);
+            rx113_system_update_oscillators(s);
         }
         return;
     }
@@ -360,11 +396,6 @@ static void rx113_system_write(void *opaque, hwaddr addr, uint64_t value,
 
             s->regs[i] = (value & mask) | (system_regs[i].reset & ~mask);
             rx113_system_update_oscillators(s);
-            if (i == SYS_SCKCR || i == SYS_SCKCR3 || i == SYS_PLLCR ||
-                i == SYS_MSTPCRA || i == SYS_MSTPCRB ||
-                i == SYS_MSTPCRC) {
-                rx113_system_update_clocks(s);
-            }
             if (i == SYS_SOSCCR) {
                 qemu_set_irq(s->subclock, !(s->regs[SYS_SOSCCR] & 1));
             }
@@ -415,6 +446,7 @@ static void rx113_system_reset_hold(Object *obj, ResetType type)
 
     timer_del(s->osc_timer);
     s->oscovfsr = 0;
+    s->iwdt_ready_ns = 0;
     for (i = 0; i < OSC_COUNT; i++) {
         s->deadline[i] = -1;
     }
@@ -438,11 +470,26 @@ static void rx113_system_reset_exit(Object *obj, ResetType type)
     qemu_set_irq(s->subclock, !(s->regs[SYS_SOSCCR] & 1));
 }
 
+static void rx113_system_rtc_enable(void *opaque, int n, int level)
+{
+    RX113SystemState *s = opaque;
+
+    if (s->rtc_enabled == !!level) {
+        return;
+    }
+    s->rtc_enabled = level;
+    if (s->mcu->cac && !device_is_in_reset(DEVICE(s))) {
+        rx113_system_update_clocks(s);
+    }
+}
+
 static void rx113_system_init(Object *obj)
 {
     RX113SystemState *s = RX113_SYSTEM(obj);
 
     qdev_init_gpio_out_named(DEVICE(obj), &s->subclock, "subclock", 1);
+    qdev_init_gpio_in_named(DEVICE(obj), rx113_system_rtc_enable,
+                           "rtc-enable", 1);
     s->osc_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                 rx113_system_update_oscillators, s);
     memory_region_init_io(&s->iomem, obj, &rx113_system_ops, s,
@@ -486,7 +533,7 @@ static int rx113_system_post_load(void *opaque, int version_id)
 
 static const VMStateDescription vmstate_rx113_system = {
     .name = TYPE_RX113_SYSTEM,
-    .version_id = 4,
+    .version_id = 5,
     .minimum_version_id = 1,
     .post_load = rx113_system_post_load,
     .fields = (const VMStateField[]) {
@@ -494,6 +541,8 @@ static const VMStateDescription vmstate_rx113_system = {
         VMSTATE_UINT32_SUB_ARRAY(regs, RX113SystemState, 0, SYS_MSTPCRA),
         VMSTATE_UINT32_V(regs[SYS_MSTPCRA], RX113SystemState, 3),
         VMSTATE_UINT32_V(regs[SYS_MSTPCRC], RX113SystemState, 4),
+        VMSTATE_BOOL_V(rtc_enabled, RX113SystemState, 5),
+        VMSTATE_INT64_V(iwdt_ready_ns, RX113SystemState, 5),
         VMSTATE_UINT8_V(oscovfsr, RX113SystemState, 2),
         VMSTATE_INT64_ARRAY_V(deadline, RX113SystemState, OSC_COUNT, 2),
         VMSTATE_TIMER_PTR_V(osc_timer, RX113SystemState, 2),
@@ -709,6 +758,8 @@ static void register_rtc(RX113State *s, DeviceState *lcdc)
     qdev_connect_gpio_out_named(sys, "subclock", 0,
                                qdev_get_gpio_in_named(dev,
                                                       "system-subclock", 0));
+    qdev_connect_gpio_out_named(dev, "rtc-enable", 0,
+                               qdev_get_gpio_in_named(sys, "rtc-enable", 0));
     sysbus_realize_and_unref(sbd, &error_abort);
     sysbus_mmio_map(sbd, 0, RX113_RTC_BASE);
     sysbus_connect_irq(sbd, RX113_RTC_IRQ_ALM,
@@ -733,6 +784,8 @@ static DeviceState *register_port(RX113State *s)
         qdev_connect_gpio_out_named(dev, "irq", i,
                                    qdev_get_gpio_in(s->dtc, 64 + i));
     }
+    qdev_connect_gpio_out_named(dev, "cacref", 0,
+                               qdev_get_gpio_in_named(s->cac, "cacref", 0));
     return dev;
 }
 
@@ -821,7 +874,6 @@ static void register_stubs(void)
         hwaddr size;
     } stubs[] = {
         { "rx113-dac", 0x00088040, 0x10 },
-        { "rx113-cac", 0x0008b000, 0x20 },
         { "rx113-usb0", 0x000a0000, 0x200 },
         { "rx113-ctsu", 0x000a0900, 0x100 },
     };
@@ -888,6 +940,15 @@ static void rx113_realize(DeviceState *dev, Error **errp)
         register_sci(s, i);
     }
     register_rtc(s, register_lcdc(s));
+    s->cac = qdev_new(TYPE_RX113_CAC);
+    object_property_add_child(OBJECT(s), "cac", OBJECT(s->cac));
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(s->cac), &error_abort);
+    sysbus_mmio_map(SYS_BUS_DEVICE(s->cac), 0, 0x0008b000);
+    /* Table 14.3: level sources 32..34, without DTC activation. */
+    for (unsigned i = 0; i < 3; i++) {
+        sysbus_connect_irq(SYS_BUS_DEVICE(s->cac), i,
+                           qdev_get_gpio_in(DEVICE(&s->icu), 32 + i));
+    }
     register_s12ad(s, register_port(s));
     s->doc = qdev_new(TYPE_RX113_DOC);
     object_property_add_child(OBJECT(s), "doc", OBJECT(s->doc));

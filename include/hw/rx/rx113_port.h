@@ -27,6 +27,7 @@ struct RX113PortState {
     qemu_irq pin_out[RX113_PORT_PINS];
     qemu_irq pin_oe[RX113_PORT_PINS];
     qemu_irq irq[8];
+    qemu_irq cacref;
 };
 
 #endif /* HW_RX_RX113_PORT_H */

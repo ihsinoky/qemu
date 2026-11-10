@@ -11,6 +11,7 @@
 #define TYPE_RX113_IWDT "rx113-iwdt"
 OBJECT_DECLARE_SIMPLE_TYPE(RX113IWDTState, RX113_IWDT)
 
+uint64_t rx113_iwdt_clock_hz(DeviceState *dev);
 uint8_t rx113_iwdt_ilococr(DeviceState *dev);
 void rx113_iwdt_start_clock(DeviceState *dev);
 uint8_t rx113_iwdt_reset_status(DeviceState *dev);
