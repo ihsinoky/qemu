@@ -55,6 +55,19 @@ static unsigned pin_name(unsigned pin)
     return (pin / 8) * 16 + pin % 8;
 }
 
+/* Table 19.1: the twelve TS pads; TSCAP is the analog LPF pad. */
+static bool ctsu_pin(unsigned name)
+{
+    switch (name) {
+    case 0x07: case 0x04: case 0x02: case 0x123:
+    case 0x25: case 0x24: case 0x23: case 0x22:
+    case 0x21: case 0x20: case 0x27: case 0x32:
+        return true;
+    default:
+        return false;
+    }
+}
+
 static bool cacref_pin(unsigned name)
 {
     return name == 0x15 || name == 0x27 || name == 0xa0 || name == 0xc7;
@@ -215,6 +228,11 @@ static void port_update(RX113PortState *s)
                 (pfs & PSEL) == 7) {
                 cacref |= level;
             }
+            if (s->ctsu_fixed && ctsu_pin(name) && peripheral &&
+                !(pfs & ASEL) && (pfs & PSEL) == 25) {
+                drive = true;
+                level = s->ctsu_level;
+            }
             s->levels[port] |= level << bit;
             s->driving[port] |= drive << bit;
             if (gp != port) {
@@ -233,6 +251,15 @@ static void port_update(RX113PortState *s)
     qemu_set_irq(s->cacref, cacref);
     for (unsigned i = 0; i < 8; i++) {
         qemu_set_irq(s->irq[i], (irq_levels >> i) & 1);
+    }
+}
+
+void rx113_port_set_ctsu(RX113PortState *s, bool fixed, bool level)
+{
+    if (s) {
+        s->ctsu_fixed = fixed;
+        s->ctsu_level = level;
+        port_update(s);
     }
 }
 
@@ -359,13 +386,15 @@ static int port_post_load(void *opaque, int version_id)
 
 static const VMStateDescription vmstate_port = {
     .name = TYPE_RX113_PORT,
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .post_load = port_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT8_ARRAY(regs, RX113PortState, 0x200),
         VMSTATE_UINT8_ARRAY(external, RX113PortState, RX113_PORT_COUNT),
         VMSTATE_UINT8_ARRAY(external_mask, RX113PortState, RX113_PORT_COUNT),
+        VMSTATE_BOOL_V(ctsu_fixed, RX113PortState, 2),
+        VMSTATE_BOOL_V(ctsu_level, RX113PortState, 2),
         VMSTATE_END_OF_LIST()
     },
 };
