@@ -146,3 +146,25 @@ that the manual does not give numerically. Convention: the model
 holds a fixed factory value of 0x00, restored on reset; writes are
 accepted only in calibration mode (CTSUERRS.CTSUSPMD=10b), as the
 manual specifies, and the value has no effect on counts under D-010.
+
+## D-012: USB0 register inventory follows the manual
+
+The RX113 manual's Table 5.1 and section 27.2 define the USBc register
+inventory (62 registers). BUSWAIT, TESTMODE and USBADDR belong to other
+Renesas USB variants and do not exist on RX113; the Issue #45 brief's
+inclusion of them was a PMO error, corrected at the audit stop.
+Registers not in the manual's inventory are not implemented.
+
+## D-013: USB0 SIE transaction fixture contract
+
+BRDY/NRDY/BEMP and the FIFO receive side are driven by bus transaction
+outcomes (section 27.3), so the core never invents bus results. The
+model takes transaction completion as an explicit input at the SIE
+boundary (received packet data and length, transmit completion,
+NAK/STALL/error outcomes) — the same boundary the future host and
+function bus adapters will drive. FIFO port reads return only data
+delivered by completed receive transactions; BEMP is raised only on
+completed transmissions, never by BCLR/ACLRM. Tests drive this fixture
+boundary. Production host/function adapters remain follow-ups with
+their own estimates; enumeration and live bus transfers are not
+claimed. Decided by the PMO at the Issue #45 audit stop.
