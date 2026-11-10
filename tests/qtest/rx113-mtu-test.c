@@ -733,6 +733,319 @@ static void set_io(QTestState *qts, unsigned ch, unsigned gr, unsigned io)
     qtest_writeb(qts, addr, (old & ~(15 << shift)) | (io << shift));
 }
 
+/* Figures 20.35/36: CST3 and the MTU3 clock drive both channels. */
+static void reset_pwm_setup(QTestState *qts, unsigned flags)
+{
+    for (unsigned ch = 3; ch <= 4; ch++) {
+        for (unsigned gr = 0; gr < 4; gr++) {
+            select_pad(qts, output_pad[ch][gr], 1);
+        }
+    }
+    qtest_writeb(qts, BASE + tcr[3], 0x21); /* /4, cycle clear */
+    qtest_writeb(qts, BASE + tcr[4], 0x25); /* ignored /1024, clear A */
+    qtest_writew(qts, BASE + tgr[3][0], 9);
+    qtest_writew(qts, BASE + tgr[3][1], 6);
+    qtest_writew(qts, BASE + tgr[4][0], 4);
+    qtest_writew(qts, BASE + tgr[4][1], 2);
+    qtest_writeb(qts, BASE + 0xe, 0x43); /* PSYE, active high */
+    qtest_writeb(qts, BASE + 0xa, 0x3f);
+    qtest_writeb(qts, BASE + mode[3], 8 | flags);
+}
+
+static void assert_reset_pwm(QTestState *qts, unsigned phases, bool cycle)
+{
+    static const unsigned p[] = { 0x22, 0x24, 0x30 };
+    static const unsigned n[] = { 0x23, 0x25, 0x31 };
+
+    for (unsigned i = 0; i < 3; i++) {
+        bool level = phases & (1 << i);
+
+        assert_pad(qts, p[i], true, level);
+        assert_pad(qts, n[i], true, !level);
+    }
+    assert_pad(qts, 0x17, true, cycle);
+    assert_pad(qts, 0x16, false, false); /* MTIOC3C is not a PWM output. */
+}
+
+static void test_reset_pwm_waveform(void)
+{
+    QTestState *qts = mtu_init();
+
+    reset_pwm_setup(qts, 0);
+    qtest_writeb(qts, BASE + tier[3], 3);
+    qtest_writeb(qts, BASE + tier[4], 3);
+    assert_reset_pwm(qts, 0, true);
+    /* CST4 alone cannot start either counter. */
+    qtest_writeb(qts, START, 0x80);
+    qtest_clock_step(qts, 1000);
+    g_assert_cmpuint(qtest_readw(qts, BASE + count[3]), ==, 0);
+    g_assert_cmpuint(qtest_readw(qts, BASE + count[4]), ==, 0);
+    qtest_writeb(qts, START, 0x40);
+    for (unsigned period = 0; period < 3; period++) {
+        bool cycle = !(period & 1);
+
+        qtest_clock_step(qts, 374);
+        assert_reset_pwm(qts, 0, cycle);
+        g_assert_cmpuint(qtest_readb(qts, IR(135)), ==, 0);
+        qtest_clock_step(qts, 1);
+        assert_reset_pwm(qts, 4, cycle);
+        g_assert_cmpuint(qtest_readb(qts, IR(135)), ==, 1);
+        qtest_clock_step(qts, 249);
+        assert_reset_pwm(qts, 4, cycle);
+        qtest_clock_step(qts, 1);
+        assert_reset_pwm(qts, 6, cycle);
+        g_assert_cmpuint(qtest_readb(qts, IR(134)), ==, 1);
+        qtest_clock_step(qts, 249);
+        assert_reset_pwm(qts, 6, cycle);
+        qtest_clock_step(qts, 1);
+        assert_reset_pwm(qts, 7, cycle);
+        g_assert_cmpuint(qtest_readb(qts, IR(130)), ==, 1);
+        qtest_clock_step(qts, 374);
+        assert_reset_pwm(qts, 7, cycle);
+        qtest_clock_step(qts, 1);
+        assert_reset_pwm(qts, 0, !cycle);
+        g_assert_cmpuint(qtest_readb(qts, IR(129)), ==, 1);
+        g_assert_cmpuint(qtest_readw(qts, BASE + count[3]), ==, 0);
+        g_assert_cmpuint(qtest_readw(qts, BASE + count[4]), ==, 0);
+        for (unsigned v = 129; v <= 138; v++) {
+            qtest_writeb(qts, IR(v), 0);
+        }
+    }
+    /* Stop returns the reset PWM outputs to their initial levels. */
+    qtest_clock_step(qts, 875);
+    assert_reset_pwm(qts, 7, false);
+    qtest_writeb(qts, START, 0);
+    assert_reset_pwm(qts, 0, true);
+    qtest_clock_step(qts, 5000);
+    g_assert_cmpuint(qtest_readw(qts, BASE + count[3]), ==, 7);
+    g_assert_cmpuint(qtest_readw(qts, BASE + count[4]), ==, 7);
+    qtest_quit(qts);
+}
+
+static void test_reset_pwm_buffers(void)
+{
+    QTestState *qts = mtu_init();
+
+    reset_pwm_setup(qts, 0x30);
+    qtest_writeb(qts, BASE + tier[3], 0x1f);
+    qtest_writeb(qts, BASE + tier[4], 0x1f);
+    /* Figure 20.118: MTU4.TMDR stays zero; MTU3 enables all four buffers. */
+    qtest_writew(qts, BASE + tgr[3][2], 7);
+    qtest_writew(qts, BASE + tgr[3][3], 3);
+    qtest_writew(qts, BASE + tgr[4][2], 1);
+    qtest_writew(qts, BASE + tgr[4][3], 5);
+    qtest_writeb(qts, START, 0x40);
+    qtest_clock_step(qts, 1249);
+    assert_reset_pwm(qts, 7, true);
+    g_assert_cmpuint(qtest_readw(qts, BASE + tgr[3][0]), ==, 9);
+    g_assert_cmpuint(qtest_readw(qts, BASE + tgr[3][1]), ==, 6);
+    g_assert_cmpuint(qtest_readw(qts, BASE + tgr[4][0]), ==, 4);
+    g_assert_cmpuint(qtest_readw(qts, BASE + tgr[4][1]), ==, 2);
+    /* Buffer matches must not issue TGIC/TGID, including on MTU4. */
+    g_assert_cmpuint(qtest_readb(qts, IR(131)), ==, 0);
+    g_assert_cmpuint(qtest_readb(qts, IR(132)), ==, 0);
+    g_assert_cmpuint(qtest_readb(qts, IR(136)), ==, 0);
+    g_assert_cmpuint(qtest_readb(qts, IR(137)), ==, 0);
+    qtest_clock_step(qts, 1);
+    assert_reset_pwm(qts, 0, false);
+    g_assert_cmpuint(qtest_readw(qts, BASE + tgr[3][0]), ==, 7);
+    g_assert_cmpuint(qtest_readw(qts, BASE + tgr[3][1]), ==, 3);
+    g_assert_cmpuint(qtest_readw(qts, BASE + tgr[4][0]), ==, 1);
+    g_assert_cmpuint(qtest_readw(qts, BASE + tgr[4][1]), ==, 5);
+    for (unsigned period = 0; period < 3; period++) {
+        bool cycle = period & 1;
+
+        qtest_clock_step(qts, 249);
+        assert_reset_pwm(qts, 0, cycle);
+        qtest_clock_step(qts, 1);
+        assert_reset_pwm(qts, 2, cycle);
+        qtest_clock_step(qts, 250);
+        assert_reset_pwm(qts, 3, cycle);
+        qtest_clock_step(qts, 250);
+        assert_reset_pwm(qts, 7, cycle);
+        qtest_clock_step(qts, 250);
+        assert_reset_pwm(qts, 0, !cycle);
+    }
+    qtest_quit(qts);
+}
+
+static void test_reset_pwm_polarity(void)
+{
+    QTestState *qts = mtu_init();
+
+    reset_pwm_setup(qts, 0);
+    /* Select per-phase polarity; N bits have no effect without dead time. */
+    qtest_writeb(qts, BASE + 0xe, 0x44);
+    qtest_writeb(qts, BASE + 0xf, 0x51); /* BF=01, P1=P3=1, P2=0 */
+    qtest_writeb(qts, BASE + 0x36, 0x2e); /* invert all P bits */
+    assert_reset_pwm(qts, 2, true);
+    qtest_writeb(qts, START, 0x40);
+    qtest_clock_step(qts, 1249);
+    g_assert_cmphex(qtest_readb(qts, BASE + 0xf), ==, 0x51);
+    assert_reset_pwm(qts, 5, true);
+    qtest_clock_step(qts, 1);
+    g_assert_cmphex(qtest_readb(qts, BASE + 0xf), ==, 0x6e);
+    assert_reset_pwm(qts, 5, false);
+    /* Output inhibition does not inhibit the timer or its waveform latch. */
+    qtest_writeb(qts, BASE + 0xa, 0);
+    assert_pad(qts, 0x22, false, false);
+    qtest_clock_step(qts, 875);
+    qtest_writeb(qts, BASE + 0xa, 0x3f);
+    assert_reset_pwm(qts, 2, false);
+    qtest_writeb(qts, BASE + 0xe, 4); /* PSYE off */
+    assert_pad(qts, 0x17, false, false);
+    qtest_quit(qts);
+}
+
+static void test_reset_pwm_coincident(void)
+{
+    QTestState *qts = mtu_init();
+
+    reset_pwm_setup(qts, 0);
+    for (unsigned ch = 3; ch <= 4; ch++) {
+        qtest_writeb(qts, BASE + tier[ch], 0x1f);
+        qtest_writew(qts, BASE + tgr[ch][0], 0xffff);
+        qtest_writew(qts, BASE + tgr[ch][1], 0xffff);
+        qtest_writew(qts, BASE + count[ch], 0xffff);
+    }
+    qtest_writeb(qts, START, 0x40);
+    /* Cycle=duty toggles once; a cycle clear suppresses both overflow IRQs. */
+    for (unsigned period = 0; period < 3; period++) {
+        qtest_clock_step(qts, period ? 65536 * 125 : 125);
+        assert_reset_pwm(qts, period & 1 ? 0 : 7, period & 1);
+        g_assert_cmpuint(qtest_readw(qts, BASE + count[3]), ==, 0);
+        g_assert_cmpuint(qtest_readw(qts, BASE + count[4]), ==, 0);
+        g_assert_cmpuint(qtest_readb(qts, IR(133)), ==, 0);
+        g_assert_cmpuint(qtest_readb(qts, IR(138)), ==, 0);
+    }
+    qtest_quit(qts);
+}
+
+static void test_reset_pwm_clock(void)
+{
+    QTestState *qts = mtu_init();
+
+    reset_pwm_setup(qts, 0);
+    qtest_writeb(qts, START, 0x40);
+    qtest_clock_step(qts, 437); /* 3 counts + 62 ns, W phase active */
+    assert_reset_pwm(qts, 4, true);
+    /* MTU4's stored normal-mode TMDR does not permit ELC restart here. */
+    qtest_set_irq_in(qts, MTU_PATH, "elc", 10, 1);
+    qtest_set_irq_in(qts, MTU_PATH, "elc", 10, 0);
+    g_assert_cmpuint(qtest_readw(qts, BASE + count[4]), ==, 3);
+    qtest_writel(qts, MSTPCRA, 0xffffffff);
+    qtest_clock_step(qts, 1000000);
+    assert_reset_pwm(qts, 4, true);
+    qtest_writel(qts, MSTPCRA, 0xeffffdff);
+    qtest_clock_step(qts, 187);
+    assert_reset_pwm(qts, 4, true);
+    qtest_clock_step(qts, 1);
+    assert_reset_pwm(qts, 6, true);
+    qtest_writeb(qts, START, 0);
+    qtest_writew(qts, BASE + count[3], 0);
+    qtest_writew(qts, BASE + count[4], 0);
+    qtest_writeb(qts, BASE + tcr[3], 0x26); /* MTCLKA rising, clear A */
+    qtest_writeb(qts, START, 0x40);
+    qtest_clock_step(qts, 1000000);
+    g_assert_cmpuint(qtest_readw(qts, BASE + count[3]), ==, 0);
+    g_assert_cmpuint(qtest_readw(qts, BASE + count[4]), ==, 0);
+    for (unsigned edge = 0; edge < 10; edge++) {
+        qtest_set_irq_in(qts, MTU_PATH, "mtclk", 0, 1);
+        g_assert_cmpuint(qtest_readw(qts, BASE + count[3]), ==,
+                         (edge + 1) % 10);
+        g_assert_cmpuint(qtest_readw(qts, BASE + count[4]), ==,
+                         (edge + 1) % 10);
+        qtest_set_irq_in(qts, MTU_PATH, "mtclk", 0, 0);
+    }
+    assert_reset_pwm(qts, 0, false);
+    qtest_qmp_assert_success(qts, "{'execute':'system_reset'}");
+    qtest_writew(qts, 0x803fe, 0xa503);
+    qtest_writel(qts, MSTPCRA, 0xeffffdff);
+    assert_pad(qts, 0x22, false, false);
+    g_assert_cmphex(qtest_readb(qts, BASE + mode[3]), ==, 0);
+    g_assert_cmphex(qtest_readb(qts, BASE + 0xf), ==, 0);
+    qtest_quit(qts);
+}
+
+static void test_reset_pwm_zero(void)
+{
+    static const unsigned vectors[] = { 129, 130, 134, 135 };
+    QTestState *qts = mtu_init();
+
+    reset_pwm_setup(qts, 0);
+    qtest_writeb(qts, BASE + tcr[3], 0x20); /* PCLK/1, zero cycle */
+    qtest_writeb(qts, BASE + tcr[4], 5); /* no local clear; clock is ignored */
+    qtest_writeb(qts, BASE + tier[3], 3);
+    qtest_writeb(qts, BASE + tier[4], 3);
+    for (unsigned ch = 3; ch <= 4; ch++) {
+        for (unsigned gr = 0; gr < 2; gr++) {
+            qtest_writew(qts, BASE + tgr[ch][gr], 0);
+        }
+    }
+    qtest_writeb(qts, START, 0x40);
+    qtest_clock_step(qts, 31);
+    assert_reset_pwm(qts, 0, true);
+    qtest_clock_step(qts, 1);
+    assert_reset_pwm(qts, 7, false);
+    for (unsigned i = 0; i < G_N_ELEMENTS(vectors); i++) {
+        g_assert_cmpuint(qtest_readb(qts, IR(vectors[i])), ==, 1);
+        qtest_writeb(qts, IR(vectors[i]), 0);
+    }
+    qtest_clock_step(qts, 31);
+    assert_reset_pwm(qts, 0, true);
+    qtest_clock_step(qts, 125);
+    assert_reset_pwm(qts, 0, true);
+    for (unsigned i = 0; i < G_N_ELEMENTS(vectors); i++) {
+        /* Section 20.6.26 applies to both channels of the coupled pair. */
+        g_assert_cmpuint(qtest_readb(qts, IR(vectors[i])), ==, 0);
+    }
+    qtest_quit(qts);
+}
+
+static void test_reset_pwm_migration(void)
+{
+    QTestState *src = mtu_init();
+    QTestState *dst;
+    int64_t now;
+    g_autofree char *dir = g_dir_make_tmp("rx113-mtu-reset-XXXXXX", NULL);
+    g_autofree char *file = g_strdup_printf("%s/state", dir);
+    g_autofree char *uri = g_strdup_printf("file:%s", file);
+
+    g_assert_nonnull(dir);
+    reset_pwm_setup(src, 0x30);
+    qtest_writew(src, BASE + tgr[3][2], 7);
+    qtest_writew(src, BASE + tgr[3][3], 3);
+    qtest_writew(src, BASE + tgr[4][2], 1);
+    qtest_writew(src, BASE + tgr[4][3], 5);
+    qtest_writeb(src, START, 0x40);
+    now = qtest_clock_step(src, 937); /* after all three duty matches */
+    assert_reset_pwm(src, 7, true);
+    qtest_qmp_assert_success(src, "{'execute':'migrate',"
+                            "'arguments':{'uri':%s}}", uri);
+    migration_wait(src);
+    dst = qtest_init("-M rx113-r5f51138 -incoming defer");
+    qtest_clock_set(dst, now);
+    qtest_qmp_assert_success(dst, "{'execute':'migrate-incoming',"
+                            "'arguments':{'uri':%s}}", uri);
+    migration_wait(dst);
+    assert_reset_pwm(dst, 7, true);
+    qtest_clock_step(dst, 312);
+    assert_reset_pwm(dst, 7, true);
+    qtest_clock_step(dst, 1);
+    assert_reset_pwm(dst, 0, false);
+    g_assert_cmpuint(qtest_readw(dst, BASE + count[3]), ==, 0);
+    g_assert_cmpuint(qtest_readw(dst, BASE + count[4]), ==, 0);
+    g_assert_cmpuint(qtest_readw(dst, BASE + tgr[3][0]), ==, 7);
+    qtest_clock_step(dst, 249);
+    assert_reset_pwm(dst, 0, false);
+    qtest_clock_step(dst, 1);
+    assert_reset_pwm(dst, 2, false);
+    qtest_quit(dst);
+    qtest_quit(src);
+    unlink(file);
+    rmdir(dir);
+}
+
 /* Tables 20.12-27: every output's initial, set, clear and toggle levels. */
 static void test_pad_normal(void)
 {
@@ -1137,6 +1450,14 @@ static void test_pad_package64(void)
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
+    qtest_add_func("/rx113-mtu/reset-pwm-waveform", test_reset_pwm_waveform);
+    qtest_add_func("/rx113-mtu/reset-pwm-buffers", test_reset_pwm_buffers);
+    qtest_add_func("/rx113-mtu/reset-pwm-polarity", test_reset_pwm_polarity);
+    qtest_add_func("/rx113-mtu/reset-pwm-coincident",
+                   test_reset_pwm_coincident);
+    qtest_add_func("/rx113-mtu/reset-pwm-clock", test_reset_pwm_clock);
+    qtest_add_func("/rx113-mtu/reset-pwm-zero", test_reset_pwm_zero);
+    qtest_add_func("/rx113-mtu/reset-pwm-migration", test_reset_pwm_migration);
     qtest_add_func("/rx113-mtu/pad-package64", test_pad_package64);
     qtest_add_func("/rx113-mtu/pad-mux", test_pad_mux);
     qtest_add_func("/rx113-mtu/pad-zero-period", test_pad_zero_period);
