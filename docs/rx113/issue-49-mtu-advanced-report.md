@@ -2,9 +2,154 @@
 SPDX-License-Identifier: GPL-2.0-or-later
 -->
 
-# Issue 49: RX113 MTU advanced output — stage 2b waveform delivery
+# Issue 49: RX113 MTU advanced output — stage 2b3 skipping delivery
 
 ## Current delivery (2026-11-11)
+
+**Stage 2b and Issue #49 remain incomplete.** This continuation completes
+only the first item in `.issue49-runtime/issue-49-stage2b3.md`:
+TITCR/TITCNT interrupt skipping and TBTER buffer-snapshot control in
+complementary modes. It stops at this independently tested boundary under
+the requested limited usage window. TGCR is the next item; it has not been
+started. Stage 3 (POE) was not started. No unresolved hardware decision is
+being delegated to the PO, and this is not full issue acceptance.
+
+Base: `6397ad4a2fd29d3db70533f9eeb055f51945edba`.
+Branch: `rx113/issue-49-mtu-advanced`.
+The working tree and `.issue49-runtime/issue49-stage2b3-skipping.patch`
+are the deliverables. No commit, merge, push, PR or upstream submission
+was performed; repository metadata is read-only. All delivery sections
+below are historical and their next-step lists are superseded here.
+
+### Implemented boundary and manual evidence
+
+Authority: supplied R01UH0448EJ0120 Rev.1.20, printed manual pages.
+
+* 20.2.26-27, pp.442-443; 20.3.8(3)(a)-(b), pp.506-507,
+  Figure 20.69: each crest/trough source independently skips COR
+  occurrences, then passes the next occurrence and clears its counter.
+  TITCNT advances on sources even with TIER disabled. COR=0 bypasses
+  skipping. Disabling the corresponding enable or setting COR=0 clears
+  that counter. TITCNT is read-only, with reserved bits read as zero.
+  CST stop and module stop retain skipping progress; module stop also
+  retains the existing fractional carrier timing. Ordinary timer modes
+  do not consume these complementary skipping counters.
+* Crest TGIA3 and trough TCIV4 requests are filtered independently.
+  Carrier direction, PSYE, waveform generation, polarity transfers and
+  raw ELC compare/trough events remain driven by every source occurrence.
+  The trough still uses vector 138 and ELC event 0x1a, with no vector 139
+  request. Skipping does not acknowledge an existing ICU.IR request.
+* 20.2.28, p.444; 20.3.8(3)(c), pp.508-510, Figures 20.70-72:
+  BTE=01 blocks buffer-to-temporary snapshots while temporary-to-active
+  transfers continue. The MTU4.TGRD commit write retains a pending
+  transaction. Re-enabling transfers accepts it in an eligible Ta window;
+  a Tb write cannot bypass the old temporary bank.
+* BTE=10 links snapshots to source intervals opened by a non-skipped
+  crest or trough occurrence. It excludes both Tb windows and follows
+  the selected crest/trough update mode. Either enabled source can open
+  the interval when both are selected (Figure 20.72). The initial zero
+  count does not fabricate an interval before a source has passed.
+  A write outside the interval waits for the next eligible opening;
+  a write inside snapshots immediately. When skipping is disabled, linked
+  snapshots never occur. BTE=11 remains a prohibited hardware setting;
+  this model opens no snapshot window for it.
+* MTU migration version 7 adds TITCR, TITCNT, TBTER and the two source
+  interval latches. Existing temporary-bank and pending-transaction state
+  is retained. Same-build tests cover migration inside crest Tb with a
+  pending transaction, and inside the following open Ta interval with
+  a new write after loading. Neither loading nor an initial zero TITCNT
+  creates an interrupt edge. Older streams default these new controls
+  to disabled; no cross-version advanced-waveform acceptance is claimed.
+
+Only `hw/rx/rx113-mtu.c`, `tests/qtest/rx113-mtu-test.c` and this report
+change. RX62N and all other device sources are untouched. The partial-mode
+diagnostic remains because TGCR, restart and duty IRQ controls are still
+unavailable. Delayed A/D start requests and their skipping links are not
+implemented or claimed by this delivery.
+
+### Remaining stage 2b work and precise next step
+
+Continue in the supplied brief's order:
+
+1. **TGCR gating next**: derive the six-arm gating table from 20.2.21,
+   p.439 and 20.3.8(p), pp.503-505, Figures 20.63-66. Implement BDC,
+   P/N, software UF/VF/WF feedback and FB=0 feedback from qualified
+   MTIOC0A/B/C inputs. Include TRWER protection and physical PORT/PIDR
+   assertions for both polarities and both feedback sources. Do not
+   substitute externally supplied clock signals for the documented
+   MTIOC0 inputs. No TGCR register storage or gating is added here.
+2. Wire remaining duty and buffered C/D compare interrupts using the
+   manual's up/down and temporary-bank arbitration. Only the existing
+   crest TGIA3 and trough TCIV4 paths, now with skipping, are delivered.
+3. Audit/finish output restart: TDER read-before-clear and no-dead-time
+   waveforms (retaining the required TDDR=1 setup), TWCR read-before-set,
+   WRE/CCE, complementary synchronous clearing and retained/initial-output
+   restart (20.3.8(m)-(o), pp.497-502; 20.7 restart procedures). The
+   generic synchronous-clear path still skips the complementary pair.
+4. Implement 20.3.11, pp.516-519, dead-time compensation with the MTU5
+   measurement/capture it requires. General input capture stays out of
+   scope. No compensation or MTU5 capture behavior is added here.
+
+Do not begin stage 3 (POE). The earlier waveform report's proposed first
+step (TDER/restart) is historical; this run follows the new brief's order.
+
+### Current validation
+
+Evidence uses `stage2b3-*` names under `.issue49-runtime/`. The existing
+build and populated subprojects were reused, with no downloads. Scratch
+uses `.issue49-runtime/.t`, or its `.s49` alias for Unix socket limits.
+
+| Check | Result and runtime evidence |
+| --- | --- |
+| RX-only rebuild | PASS: `stage2b3-build-final.log` |
+| Full MTU qtest | 54/54 PASS within `stage2b3-regression.log` |
+| All configured RX qtests and quick functional tests | 32 suites OK, four existing skips, zero failures: `stage2b3-regression.log` |
+| Existing gdbsim U-Boot functional | PASS: `stage2b3-gdbsim-functional.log` |
+| Cached FIT PLL/HOCO before and after reset | Both PASS: `stage2b3-fit-pll.log`, `stage2b3-fit-hoco.log` |
+| SYSTEM protection/timing without/with FIT ELF | Both PASS: `stage2b3-system.log`, `stage2b3-system-elf.log` |
+| Both gdbsim machines listed/run three seconds | Both PASS: `stage2b3-machine-help.log`, `stage2b3-gdbsim-smoke.log` |
+| Changed-file and raw-diff checkpatch | Zero errors and warnings: `stage2b3-checkpatch-files.log`, `stage2b3-checkpatch-patch.log` |
+| Forward/reverse patch dry runs and byte reconstruction | PASS: `stage2b3-patch-validation.log` |
+
+`stage2b3-tested-binary.sha256` identifies the final tested QEMU binary.
+The earlier standalone `stage2b3-mtu-first.log` ran 52 cases before the
+migration/gating additions; final acceptance evidence is the 54-case
+regression above.
+
+Four new MTU test cases cover the 0..7 independent skipping-count matrix,
+TITCNT read-only/reset/clear/retention behavior, source progress with TIER
+clear, fractional module stop, ordinary-mode isolation, all update modes
+with crest-only/trough-only/both skip sources, blocked snapshots versus
+continued active transfers, immediate and delayed linked snapshots,
+link-without-skipping suppression, and two migration timings. The existing
+trough ELC test now also exercises a skipped ICU request. All prior MTU
+cases are retained. An initial filtered invocation selected zero tests
+because it omitted the `/rx` prefix; it is not passing evidence. The
+corrected filtered tests each report one executed test.
+
+Reproduce:
+
+```sh
+. .issue49-runtime/env.sh
+make -C build -j$(nproc)
+build/tests/qtest/rx113-mtu-test
+bash .issue49-runtime/stage2b3-regression.sh
+scripts/checkpatch.pl --no-tree -f hw/rx/rx113-mtu.c \
+  tests/qtest/rx113-mtu-test.c
+python3 .issue49-runtime/stage2b3-validate-patch.py
+```
+
+The patch excludes AGENTS.md, manuals, runtime assets, build products and
+repository metadata. The verifier reconstructs the three HEAD files in
+worktree scratch, checks/applies the forward patch and compares all bytes
+with the working tree, then checks/applies the reverse patch and compares
+with HEAD. It never writes `.git`. Raw-diff checkpatch uses `--no-signoff`
+for this uncommitted deliverable. Suggested commit subject:
+`hw/rx: Implement RX113 complementary interrupt skipping`.
+
+# Issue 49: RX113 MTU advanced output — stage 2b waveform delivery
+
+## Waveform delivery (historical)
 
 **Stage 2b and Issue #49 remain incomplete.** This continuation delivers
 complementary PWM duty arbitration and physical PORT pad waveforms on top

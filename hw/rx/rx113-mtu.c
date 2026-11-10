@@ -58,6 +58,11 @@ struct RX113MTUState {
     uint8_t complementary_allow;
     bool complementary_initial;
     bool transfer_pending;
+    uint8_t titcr;
+    uint8_t titcnt;
+    uint8_t tbter;
+    /* Crest/trough source has opened its linked-transfer interval. */
+    uint8_t skip_ready;
     uint32_t elc_events;
     RX113MTUChannel ch[CHANNELS];
     uint64_t hz;
@@ -340,6 +345,25 @@ static bool mtu_flat_match(RX113MTUState *s, unsigned n, unsigned gr)
            mtu_compare(s, src, cycle) && mtu_divisor(s, src) == 1;
 }
 
+/* Figure 20.69: skip COR sources, then pass one and clear the counter. */
+static bool mtu_skip_source(RX113MTUState *s, bool crest)
+{
+    unsigned shift = crest ? 4 : 0;
+    unsigned cor = (s->titcr >> shift) & 7;
+    unsigned cnt = (s->titcnt >> shift) & 7;
+    unsigned ready = crest ? 1 : 2;
+    bool enabled = (s->titcr & (8 << shift)) && cor;
+    bool pass = !enabled || cnt == cor;
+
+    s->titcnt = (s->titcnt & ~(7 << shift)) |
+                ((pass ? 0 : cnt + 1) << shift);
+    s->skip_ready &= ~ready;
+    if (enabled && pass) {
+        s->skip_ready |= ready;
+    }
+    return pass;
+}
+
 static void mtu_match(RX113MTUState *s, unsigned n, unsigned gr)
 {
     RX113MTUChannel *c = &s->ch[n];
@@ -358,6 +382,9 @@ static void mtu_match(RX113MTUState *s, unsigned n, unsigned gr)
         static const unsigned base[] = { 0, 0x08, 0x0c, 0x10, 0x15 };
 
         qemu_irq_pulse(s->event[base[n] + gr]);
+    }
+    if (n == 3 && gr == 0 && mtu_complementary(s)) {
+        enabled &= mtu_skip_source(s, true);
     }
     if (enabled) {
         /* Section 20.6.26: zero-period PCLK/1 requests stay asserted. */
@@ -462,6 +489,31 @@ static void mtu_complementary_snapshot(RX113MTUState *s)
     s->temporary[3] = s->ch[3].tgr[2];
     s->temporary[4] = s->tcbr;
     s->transfer_pending = false;
+}
+
+/* Figures 20.70-72: gate snapshots, never temporary-to-active transfers. */
+static bool mtu_complementary_snapshot_enabled(RX113MTUState *s)
+{
+    unsigned mode = s->ch[3].mode & 15;
+
+    if (s->region != MTU_TA) {
+        return false;
+    }
+    if (s->tbter == 0) {
+        return true;
+    }
+    if (s->tbter != 2 ||
+        (s->ch[3].down ? mode == 13 : mode == 14)) {
+        return false;
+    }
+    return s->skip_ready != 0;
+}
+
+static void mtu_complementary_pending(RX113MTUState *s)
+{
+    if (s->transfer_pending && mtu_complementary_snapshot_enabled(s)) {
+        mtu_complementary_snapshot(s);
+    }
 }
 
 static void mtu_complementary_transfer(RX113MTUState *s, bool initial)
@@ -646,6 +698,7 @@ static unsigned mtu_complementary_tick(RX113MTUState *s)
         c3->down = c4->down = true;
     } else if (c4->down && c4->count == 0) {
         /* Table 20.57: the trough shares TCIV4 with overflow. */
+        mtu_skip_source(s, false);
         events |= 1U << (4 + 16);
         if (s->tocr1 & 0x40) {
             s->output ^= 1 << 8;
@@ -667,9 +720,7 @@ static unsigned mtu_complementary_tick(RX113MTUState *s)
             mtu_complementary_transfer(s, false);
         }
         s->region = MTU_TA;
-        if (s->transfer_pending) {
-            mtu_complementary_snapshot(s);
-        }
+        mtu_complementary_pending(s);
     }
     return events;
 }
@@ -739,7 +790,10 @@ static void mtu_finish_events(RX113MTUState *s, unsigned events)
 
                 qemu_irq_pulse(s->event[wrap[n] + down]);
             }
-            if (s->ch[n].tier & flag) {
+            if ((s->ch[n].tier & flag) &&
+                !(n == 4 && down && mtu_complementary(s) &&
+                  (s->titcr & 8) && (s->titcr & 7) &&
+                  !(s->skip_ready & 2))) {
                 qemu_irq_pulse(s->irq[irq + (down && n != 4)]);
             }
             if (n == 2 && mtu_running(s, 1) &&
@@ -1096,7 +1150,7 @@ static void mtu_clock_input(void *opaque, int pin, int level)
 enum {
     TCR, TMDR, TIOR, TIER, TSR, TCNT, TGR, TIER2, TBTM,
     TSTR, TSYR, TRWER, TSTR5, TIER5, CLEAR5, TOER, TOCR1, TOCR2, TOLBR,
-    TDDR, TCDR, TCBR, TCNTS,
+    TDDR, TCDR, TCBR, TCNTS, TITCR, TITCNT, TBTER,
 };
 
 typedef struct MTURegister {
@@ -1109,6 +1163,9 @@ typedef struct MTURegister {
 } MTURegister;
 
 static const MTURegister mtu_regs[] = {
+    { 0x030, 1, 0, TITCR, 0, 0xff },
+    { 0x031, 1, 0, TITCNT, 0, 0x00 },
+    { 0x032, 1, 0, TBTER, 0, 0x03 },
     { 0x014, 2, 3, TCDR, 0, 0x00 },
     { 0x016, 2, 3, TDDR, 0, 0x00 },
     { 0x020, 2, 3, TCNTS, 0, 0x00 },
@@ -1283,6 +1340,12 @@ static uint64_t mtu_read(void *opaque, hwaddr addr, unsigned size)
         return s->tcbr;
     case TCNTS:
         return s->tcnts;
+    case TITCR:
+        return s->titcr;
+    case TITCNT:
+        return s->titcnt;
+    case TBTER:
+        return s->tbter;
     default:
         g_assert_not_reached();
     }
@@ -1380,11 +1443,8 @@ static void mtu_write(void *opaque, hwaddr addr, uint64_t value, unsigned size)
     case TGR:
         c->tgr[r->index] = value;
         if (n == 4 && r->index == 3 && mtu_complementary(s)) {
-            if (s->region == MTU_TA) {
-                mtu_complementary_snapshot(s);
-            } else {
-                s->transfer_pending = true;
-            }
+            s->transfer_pending = true;
+            mtu_complementary_pending(s);
         }
         /* Section 20.6.24: MTU5 can match even while TSTR is stopped. */
         if (n >= 5 && !mtu_running(s, n) && mtu_compare(s, n, 0) &&
@@ -1459,6 +1519,22 @@ static void mtu_write(void *opaque, hwaddr addr, uint64_t value, unsigned size)
     case TCBR:
         s->tcbr = value;
         break;
+    case TITCR:
+        s->titcr = value;
+        for (unsigned shift = 0; shift <= 4; shift += 4) {
+            if (!(value & (8 << shift)) || !(value & (7 << shift))) {
+                s->titcnt &= ~(7 << shift);
+                s->skip_ready &= ~(shift ? 1 : 2);
+            }
+        }
+        break;
+    case TBTER:
+        s->tbter = value;
+        if (mtu_complementary(s)) {
+            mtu_complementary_pending(s);
+        }
+        break;
+    case TITCNT:
     case TCNTS:
         break; /* Read-only. */
     default:
@@ -1505,6 +1581,7 @@ static void mtu_reset_hold(Object *obj, ResetType type)
     s->complementary_on = s->complementary_allow = 0;
     s->complementary_initial = false;
     s->transfer_pending = false;
+    s->titcr = s->titcnt = s->tbter = s->skip_ready = 0;
     mtu_output_update(s);
     s->held_irqs = 0;
     s->elc_events = 0;
@@ -1542,7 +1619,8 @@ static int mtu_post_load(void *opaque, int version_id)
 {
     RX113MTUState *s = opaque;
 
-    if (!s->hz || s->hz > 160000000 || s->region > MTU_TB2_DOWN) {
+    if (!s->hz || s->hz > 160000000 || s->region > MTU_TB2_DOWN ||
+        (s->titcnt & 0x88) || (s->tbter & ~3) || (s->skip_ready & ~3)) {
         return -EINVAL;
     }
     for (unsigned n = 0; n < CHANNELS; n++) {
@@ -1564,7 +1642,7 @@ static int mtu_post_load(void *opaque, int version_id)
 
 static const VMStateDescription vmstate_mtu = {
     .name = TYPE_RX113_MTU,
-    .version_id = 6,
+    .version_id = 7,
     .minimum_version_id = 1,
     .pre_save = mtu_pre_save,
     .post_load = mtu_post_load,
@@ -1600,6 +1678,10 @@ static const VMStateDescription vmstate_mtu = {
         VMSTATE_UINT8_V(complementary_on, RX113MTUState, 6),
         VMSTATE_UINT8_V(complementary_allow, RX113MTUState, 6),
         VMSTATE_BOOL_V(complementary_initial, RX113MTUState, 6),
+        VMSTATE_UINT8_V(titcr, RX113MTUState, 7),
+        VMSTATE_UINT8_V(titcnt, RX113MTUState, 7),
+        VMSTATE_UINT8_V(tbter, RX113MTUState, 7),
+        VMSTATE_UINT8_V(skip_ready, RX113MTUState, 7),
         VMSTATE_END_OF_LIST()
     },
 };

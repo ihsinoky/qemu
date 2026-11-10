@@ -1384,12 +1384,14 @@ static void test_complementary_trough_elc(void)
     qtest_writeb(qts, 0x8b11f, 0xf3); /* ELOPA: MTU1 start. */
     qtest_writeb(qts, 0x8b100, 0x80);
     qtest_writeb(qts, BASE + tier[4], 0x10);
+    qtest_writeb(qts, BASE + 0x30, 9); /* Skip the first trough IRQ. */
     qtest_writeb(qts, START, 0xc0);
     qtest_clock_step(qts, 25 * 125 - 1);
     g_assert_cmpuint(qtest_readb(qts, IR(138)), ==, 0);
     g_assert_cmpuint(qtest_readb(qts, START), ==, 0xc0);
     qtest_clock_step(qts, 1);
-    g_assert_cmpuint(qtest_readb(qts, IR(138)), ==, 1);
+    g_assert_cmpuint(qtest_readb(qts, IR(138)), ==, 0);
+    g_assert_cmpuint(qtest_readb(qts, BASE + 0x31), ==, 1);
     g_assert_cmpuint(qtest_readb(qts, IR(139)), ==, 0);
     qtest_clock_step(qts, 32);
     g_assert_cmpuint(qtest_readb(qts, START), ==, 0xc2);
@@ -1462,6 +1464,220 @@ static void test_complementary_buffer_enable(void)
         g_assert_cmpuint(qtest_readw(qts, BASE + tgr[4][1]), ==,
                          flags == 0x20 ? 9 : 8);
         qtest_writeb(qts, START, 0);
+    }
+    qtest_quit(qts);
+}
+
+/* Sections 20.2.26-28 and Figure 20.69: independent source counters. */
+static void test_complementary_skip(void)
+{
+    for (unsigned cor = 0; cor <= 7; cor++) {
+        QTestState *qts = mtu_init();
+        unsigned cnt3 = 0, cnt4 = 0;
+
+        complementary_setup(qts, 15);
+        qtest_writeb(qts, BASE + 0x30, 0x88 | (cor << 4) | (7 - cor));
+        qtest_writeb(qts, BASE + tier[3], 1);
+        qtest_writeb(qts, BASE + tier[4], 0x10);
+        qtest_writeb(qts, START, 0xc0);
+        for (unsigned edge = 1; edge <= 24 * 18; edge++) {
+            bool crest = edge % 24 == 13;
+            bool trough = edge > 24 && edge % 24 == 1;
+            bool irq3 = crest && cnt3 == cor;
+            bool irq4 = trough && cnt4 == 7 - cor;
+
+            qtest_clock_step(qts, 125);
+            if (crest) {
+                cnt3 = irq3 ? 0 : cnt3 + 1;
+            }
+            if (trough) {
+                cnt4 = irq4 ? 0 : cnt4 + 1;
+            }
+            g_assert_cmpuint(qtest_readb(qts, IR(129)), ==, irq3);
+            g_assert_cmpuint(qtest_readb(qts, IR(138)), ==, irq4);
+            g_assert_cmpuint(qtest_readb(qts, BASE + 0x31), ==,
+                             (cnt3 << 4) | cnt4);
+            qtest_writeb(qts, IR(129), 0);
+            qtest_writeb(qts, IR(138), 0);
+        }
+        qtest_writeb(qts, START, 0); /* CST stop retains skipping counts. */
+        g_assert_cmpuint(qtest_readb(qts, BASE + 0x31), ==,
+                         (cnt3 << 4) | cnt4);
+        qtest_writeb(qts, BASE + 0x31, 0xff); /* Read-only. */
+        g_assert_cmpuint(qtest_readb(qts, BASE + 0x31), ==,
+                         (cnt3 << 4) | cnt4);
+        qtest_writeb(qts, BASE + 0x30, 0x88); /* COR=0 clears both. */
+        g_assert_cmpuint(qtest_readb(qts, BASE + 0x31), ==, 0);
+        qtest_quit(qts);
+    }
+}
+
+/* Figures 20.70-72: blocked writes wait without bypassing the old bank. */
+static void test_complementary_skip_buffers(void)
+{
+    QTestState *qts = mtu_init();
+
+    complementary_setup(qts, 13);
+    g_assert_cmpuint(qtest_readb(qts, BASE + 0x30), ==, 0);
+    g_assert_cmpuint(qtest_readb(qts, BASE + 0x31), ==, 0);
+    g_assert_cmpuint(qtest_readb(qts, BASE + 0x32), ==, 0);
+    qtest_writeb(qts, START, 0xc0);
+    qtest_clock_step(qts, 6 * 125);
+    complementary_buffers(qts, 5, 12, true); /* Snapshot Data1 in Ta. */
+    qtest_writeb(qts, BASE + 0x32, 1);
+    complementary_buffers(qts, 3, 12, true); /* Block Data2 snapshot. */
+    qtest_clock_step(qts, 9 * 125);
+    assert_complementary_bank(qts, 5, 12); /* Active transfer still runs. */
+    qtest_clock_step(qts, 24 * 125);
+    assert_complementary_bank(qts, 5, 12);
+    qtest_writeb(qts, BASE + 0x32, 0); /* Re-enable: accept pending Data2. */
+    qtest_clock_step(qts, 24 * 125);
+    assert_complementary_bank(qts, 3, 12);
+    qtest_quit(qts);
+
+    for (unsigned md = 13; md <= 15; md++) {
+        for (unsigned source = 0; source < 3; source++) {
+            qts = mtu_init();
+            complementary_setup(qts, md);
+            qtest_writeb(qts, BASE + 0x30,
+                         source == 0 ? 0x90 : source == 1 ? 9 : 0x99);
+            qtest_writeb(qts, BASE + 0x32, 2);
+            qtest_writeb(qts, START, 0xc0);
+            qtest_clock_step(qts, 6 * 125);
+            complementary_buffers(qts, 5, 12, true);
+            qtest_clock_step(qts, 21 * 125); /* End first trough Tb. */
+            assert_complementary_bank(qts, 4, 12);
+            /* Source passes at edge 37 (crest) or 49 (trough). */
+            qtest_clock_step(qts, 12 * 125); /* End second crest Tb. */
+            assert_complementary_bank(qts, 4, 12);
+            qtest_clock_step(qts, 12 * 125); /* End second trough Tb. */
+            assert_complementary_bank(qts,
+                                      md != 13 && source != 1 ? 5 : 4, 12);
+            qtest_clock_step(qts, 12 * 125); /* End third crest Tb. */
+            assert_complementary_bank(qts,
+                                      md == 14 && source == 1 ? 4 : 5, 12);
+            qtest_clock_step(qts, 12 * 125);
+            assert_complementary_bank(qts, 5, 12);
+            qtest_quit(qts);
+        }
+    }
+
+    qts = mtu_init();
+    complementary_setup(qts, 15);
+    qtest_writeb(qts, BASE + 0x32, 0xfe); /* Reserved bits read zero. */
+    g_assert_cmpuint(qtest_readb(qts, BASE + 0x32), ==, 2);
+    qtest_writeb(qts, START, 0xc0);
+    qtest_clock_step(qts, 6 * 125);
+    complementary_buffers(qts, 5, 12, true);
+    qtest_clock_step(qts, 96 * 125);
+    assert_complementary_bank(qts, 4, 12); /* No skipping: no link window. */
+    qtest_quit(qts);
+}
+
+static void test_complementary_skip_migration(void)
+{
+    for (unsigned edge = 38; edge <= 40; edge += 2) {
+        QTestState *src = mtu_init();
+        QTestState *dst;
+        int64_t now;
+        g_autofree char *dir = g_dir_make_tmp("rx113-mtu-skip-XXXXXX", NULL);
+        g_autofree char *file = g_strdup_printf("%s/state", dir);
+        g_autofree char *uri = g_strdup_printf("file:%s", file);
+
+        g_assert_nonnull(dir);
+        complementary_setup(src, 15);
+        complementary_pads(src);
+        qtest_writeb(src, BASE + 0x30, 0x99);
+        qtest_writeb(src, BASE + 0x32, 2);
+        qtest_writeb(src, BASE + tier[3], 1);
+        qtest_writeb(src, BASE + tier[4], 0x10);
+        qtest_writeb(src, START, 0xc0);
+        qtest_clock_step(src, 6 * 125);
+        complementary_buffers(src, 5, 12, true);
+        now = qtest_clock_step(src, (edge - 6) * 125 + 62);
+        g_assert_cmpuint(qtest_readb(src, BASE + 0x31), ==, 1);
+        qtest_writeb(src, IR(129), 0);
+        qtest_qmp_assert_success(src, "{'execute':'migrate',"
+                                "'arguments':{'uri':%s}}", uri);
+        migration_wait(src);
+        dst = qtest_init("-M rx113-r5f51138 -incoming defer");
+        qtest_clock_set(dst, now);
+        qtest_qmp_assert_success(dst, "{'execute':'migrate-incoming',"
+                                "'arguments':{'uri':%s}}", uri);
+        migration_wait(dst);
+        g_assert_cmpuint(qtest_readb(dst, BASE + 0x30), ==, 0x99);
+        g_assert_cmpuint(qtest_readb(dst, BASE + 0x31), ==, 1);
+        g_assert_cmpuint(qtest_readb(dst, BASE + 0x32), ==, 2);
+        g_assert_cmpuint(qtest_readb(dst, IR(129)), ==, 0);
+        assert_complementary_bank(dst, 4, 12);
+        if (edge == 40) {
+            /* Inside an open Ta window: migrated readiness accepts Data2. */
+            complementary_buffers(dst, 3, 12, true);
+        }
+        qtest_clock_step(dst, (51 - edge) * 125 - 63);
+        assert_complementary_bank(dst, 4, 12);
+        qtest_clock_step(dst, 1);
+        assert_complementary_bank(dst, edge == 38 ? 5 : 3, 12);
+        g_assert_cmpuint(qtest_readb(dst, IR(138)), ==, 1);
+        g_assert_cmpuint(qtest_readb(dst, BASE + 0x31), ==, 0);
+        qtest_clock_step(dst, 10 * 125);
+        g_assert_cmpuint(qtest_readb(dst, IR(129)), ==, 0);
+        g_assert_cmpuint(qtest_readb(dst, BASE + 0x31), ==, 0x10);
+        qtest_quit(dst);
+        qtest_quit(src);
+        unlink(file);
+        rmdir(dir);
+    }
+}
+
+static void test_complementary_skip_gates(void)
+{
+    QTestState *qts = mtu_init();
+
+    complementary_setup(qts, 15);
+    qtest_writeb(qts, BASE + 0x30, 0x99);
+    qtest_writeb(qts, START, 0xc0); /* TIER disabled: sources still count. */
+    qtest_clock_step(qts, 25 * 125 + 62);
+    g_assert_cmpuint(qtest_readb(qts, BASE + 0x31), ==, 0x11);
+    g_assert_cmpuint(qtest_readb(qts, IR(129)), ==, 0);
+    g_assert_cmpuint(qtest_readb(qts, IR(138)), ==, 0);
+    qtest_writel(qts, MSTPCRA, 0xefffffff);
+    qtest_clock_step(qts, 100000);
+    qtest_writel(qts, MSTPCRA, 0xeffffdff);
+    g_assert_cmpuint(qtest_readb(qts, BASE + 0x31), ==, 0x11);
+    qtest_writeb(qts, BASE + tier[3], 1);
+    qtest_writeb(qts, BASE + tier[4], 0x10);
+    qtest_clock_step(qts, 12 * 125 - 63);
+    g_assert_cmpuint(qtest_readb(qts, IR(129)), ==, 0);
+    qtest_clock_step(qts, 1);
+    g_assert_cmpuint(qtest_readb(qts, IR(129)), ==, 1);
+    g_assert_cmpuint(qtest_readb(qts, BASE + 0x31), ==, 1);
+    qtest_writeb(qts, BASE + 0x30, 0x91); /* Disable T4VEN only. */
+    g_assert_cmpuint(qtest_readb(qts, BASE + 0x31), ==, 0);
+    qtest_clock_step(qts, 24 * 125);
+    g_assert_cmpuint(qtest_readb(qts, BASE + 0x31), ==, 0x10);
+    qtest_writeb(qts, BASE + 0x30, 0x11); /* Disable T3AEN. */
+    g_assert_cmpuint(qtest_readb(qts, BASE + 0x31), ==, 0);
+    qtest_qmp_assert_success(qts, "{'execute':'system_reset'}");
+    qtest_writew(qts, 0x803fe, 0xa502);
+    qtest_writel(qts, MSTPCRA, 0xeffffdff);
+    g_assert_cmpuint(qtest_readb(qts, BASE + 0x30), ==, 0);
+    g_assert_cmpuint(qtest_readb(qts, BASE + 0x31), ==, 0);
+    g_assert_cmpuint(qtest_readb(qts, BASE + 0x32), ==, 0);
+    qtest_quit(qts);
+
+    qts = mtu_init();
+    /* Skipping settings must not affect ordinary MTU3 compare requests. */
+    qtest_writeb(qts, BASE + 0x30, 0xff);
+    qtest_writeb(qts, BASE + tcr[3], 0x21);
+    qtest_writew(qts, BASE + tgr[3][0], 3);
+    qtest_writeb(qts, BASE + tier[3], 1);
+    qtest_writeb(qts, START, 0x40);
+    for (unsigned i = 0; i < 3; i++) {
+        qtest_clock_step(qts, 4 * 125);
+        g_assert_cmpuint(qtest_readb(qts, IR(129)), ==, 1);
+        g_assert_cmpuint(qtest_readb(qts, BASE + 0x31), ==, 0);
+        qtest_writeb(qts, IR(129), 0);
     }
     qtest_quit(qts);
 }
@@ -1935,6 +2151,13 @@ int main(int argc, char **argv)
     qtest_add_func("/rx113-mtu/complementary-clock", test_complementary_clock);
     qtest_add_func("/rx113-mtu/complementary-trough-elc",
                    test_complementary_trough_elc);
+    qtest_add_func("/rx113-mtu/complementary-skip-migration",
+                   test_complementary_skip_migration);
+    qtest_add_func("/rx113-mtu/complementary-skip-gates",
+                   test_complementary_skip_gates);
+    qtest_add_func("/rx113-mtu/complementary-skip", test_complementary_skip);
+    qtest_add_func("/rx113-mtu/complementary-skip-buffers",
+                   test_complementary_skip_buffers);
     qtest_add_func("/rx113-mtu/complementary-migration",
                    test_complementary_migration);
     qtest_add_func("/rx113-mtu/reset-pwm-waveform", test_reset_pwm_waveform);
