@@ -168,3 +168,17 @@ completed transmissions, never by BCLR/ACLRM. Tests drive this fixture
 boundary. Production host/function adapters remain follow-ups with
 their own estimates; enumeration and live bus transfers are not
 claimed. Decided by the PMO at the Issue #45 audit stop.
+
+## D-014: ELC duplicate single-port selection on one output pin
+
+Section 17.2.10 lets PEL0 and PEL1 each select any PORTB bit as a
+single port, but the manual gives no arbitration when both select the
+same output pin and coincident events request conflicting operations,
+and no prohibition either. Emulation policy: duplicate selection is
+accepted; coincident output operations on the same pin are applied in
+ELSR destination order (24 before 25), so the later operation is the
+final PODR state and mixed operations compose in that order. This
+matches the Issue #35 delivery model (destination-number order) and is
+deterministic. It is an emulation convention for an undocumented
+configuration, not a claim about hardware behaviour. Decided by the
+PMO at the Issue #47 audit stop.
