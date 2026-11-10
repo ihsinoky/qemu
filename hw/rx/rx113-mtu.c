@@ -46,6 +46,8 @@ struct RX113MTUState {
     uint8_t tocr1;
     uint8_t tocr2;
     uint8_t tolbr;
+    uint8_t tgcr;
+    uint8_t feedback;
     uint8_t reset_pwm;
     uint16_t tddr;
     uint16_t tcdr;
@@ -243,6 +245,17 @@ static void mtu_output_update(RX113MTUState *s)
             bool on = !s->complementary_initial &&
                       (s->complementary_on & (1 << i));
 
+            if (s->tgcr & 0x40) {
+                /* Table 20.39, in U/V/W positive then negative order. */
+                static const uint8_t arms[] = {
+                    0, 0x21, 0x0a, 0x22, 0x14, 0x11, 0x0c, 0,
+                };
+                unsigned feedback = (s->tgcr & 8) ?
+                                    s->tgcr & 7 : s->feedback;
+                bool chopping = s->tgcr & (i < 3 ? 0x10 : 0x20);
+
+                on = (arms[feedback] & (1 << i)) && (!chopping || on);
+            }
             s->output = deposit32(s->output, pins[i], 1, !polarity ^ on);
         }
     }
@@ -1065,6 +1078,20 @@ static void mtu_elc_input(void *opaque, int input, int level)
     mtu_schedule(s);
 }
 
+/* Qualified MTIOC0A/B/C pad levels, independent of external count clocks. */
+static void mtu_feedback_input(void *opaque, int pin, int level)
+{
+    RX113MTUState *s = opaque;
+
+    if (((s->feedback >> pin) & 1) == !!level) {
+        return;
+    }
+    s->feedback = deposit32(s->feedback, pin, 1, !!level);
+    if (mtu_complementary(s) && (s->tgcr & 0x48) == 0x40) {
+        mtu_output_update(s);
+    }
+}
+
 /* Table 20.48-51; raw device clocks, before any board PORT/MPC routing. */
 static void mtu_clock_input(void *opaque, int pin, int level)
 {
@@ -1150,7 +1177,7 @@ static void mtu_clock_input(void *opaque, int pin, int level)
 enum {
     TCR, TMDR, TIOR, TIER, TSR, TCNT, TGR, TIER2, TBTM,
     TSTR, TSYR, TRWER, TSTR5, TIER5, CLEAR5, TOER, TOCR1, TOCR2, TOLBR,
-    TDDR, TCDR, TCBR, TCNTS, TITCR, TITCNT, TBTER,
+    TDDR, TCDR, TCBR, TCNTS, TITCR, TITCNT, TBTER, TGCR,
 };
 
 typedef struct MTURegister {
@@ -1163,6 +1190,7 @@ typedef struct MTURegister {
 } MTURegister;
 
 static const MTURegister mtu_regs[] = {
+    { 0x00d, 1, 3, TGCR, 0, 0x7f },
     { 0x030, 1, 0, TITCR, 0, 0xff },
     { 0x031, 1, 0, TITCNT, 0, 0x00 },
     { 0x032, 1, 0, TBTER, 0, 0x03 },
@@ -1269,7 +1297,7 @@ static bool mtu_protected(RX113MTUState *s, const MTURegister *r)
            (r->kind == TCR || r->kind == TMDR || r->kind == TIOR ||
             r->kind == TIER || r->kind == TCNT ||
             r->kind == TOER || r->kind == TOCR1 || r->kind == TOCR2 ||
-            r->kind == TDDR || r->kind == TCDR ||
+            r->kind == TDDR || r->kind == TCDR || r->kind == TGCR ||
             (r->kind == TGR && r->index < 2));
 }
 
@@ -1332,6 +1360,8 @@ static uint64_t mtu_read(void *opaque, hwaddr addr, unsigned size)
         return s->tocr2;
     case TOLBR:
         return s->tolbr;
+    case TGCR:
+        return s->tgcr | 0x80;
     case TDDR:
         return s->tddr;
     case TCDR:
@@ -1507,6 +1537,9 @@ static void mtu_write(void *opaque, hwaddr addr, uint64_t value, unsigned size)
     case TOCR2:
         s->tocr2 = value;
         break;
+    case TGCR:
+        s->tgcr = value;
+        break;
     case TOLBR:
         s->tolbr = value;
         break;
@@ -1573,6 +1606,7 @@ static void mtu_reset_hold(Object *obj, ResetType type)
     s->output = 0;
     memset(s->pending_matches, 0, sizeof(s->pending_matches));
     s->toer = s->tocr1 = s->tocr2 = s->tolbr = 0;
+    s->tgcr = 0;
     s->reset_pwm = 0;
     s->tddr = s->tcdr = s->tcbr = UINT16_MAX;
     s->tcnts = 0;
@@ -1620,6 +1654,7 @@ static int mtu_post_load(void *opaque, int version_id)
     RX113MTUState *s = opaque;
 
     if (!s->hz || s->hz > 160000000 || s->region > MTU_TB2_DOWN ||
+        (s->feedback & ~7) || (s->tgcr & ~0x7f) ||
         (s->titcnt & 0x88) || (s->tbter & ~3) || (s->skip_ready & ~3)) {
         return -EINVAL;
     }
@@ -1642,7 +1677,7 @@ static int mtu_post_load(void *opaque, int version_id)
 
 static const VMStateDescription vmstate_mtu = {
     .name = TYPE_RX113_MTU,
-    .version_id = 7,
+    .version_id = 8,
     .minimum_version_id = 1,
     .pre_save = mtu_pre_save,
     .post_load = mtu_post_load,
@@ -1682,6 +1717,8 @@ static const VMStateDescription vmstate_mtu = {
         VMSTATE_UINT8_V(titcnt, RX113MTUState, 7),
         VMSTATE_UINT8_V(tbter, RX113MTUState, 7),
         VMSTATE_UINT8_V(skip_ready, RX113MTUState, 7),
+        VMSTATE_UINT8_V(tgcr, RX113MTUState, 8),
+        VMSTATE_UINT8_V(feedback, RX113MTUState, 8),
         VMSTATE_END_OF_LIST()
     },
 };
@@ -1705,6 +1742,7 @@ static void mtu_init(Object *obj)
     qdev_init_gpio_out_named(DEVICE(obj), s->event, "event", 0x1b);
     qdev_init_gpio_in_named(DEVICE(obj), mtu_elc_input, "elc", 12);
     qdev_init_gpio_in_named(DEVICE(obj), mtu_clock_input, "mtclk", 4);
+    qdev_init_gpio_in_named(DEVICE(obj), mtu_feedback_input, "feedback", 3);
 }
 
 static void mtu_finalize(Object *obj)

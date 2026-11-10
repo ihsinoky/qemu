@@ -228,6 +228,7 @@ static void port_update(RX113PortState *s, bool notify)
     uint8_t old_b = s->levels[11];
     uint8_t irq_levels = 0;
     bool cacref = false;
+    uint8_t feedback = 0;
 
     memset(s->levels, 0, sizeof(s->levels));
     memset(s->driving, 0, sizeof(s->driving));
@@ -275,6 +276,13 @@ static void port_update(RX113PortState *s, bool notify)
                              (s->regs[PCR + gp] & (1 << gb)));
                 }
             }
+            if (peripheral && !(pfs & ASEL)) {
+                int signal = mtioc_signal(name, pfs & PSEL);
+
+                if (signal >= 0 && signal < 3 && level) {
+                    feedback |= 1 << signal;
+                }
+            }
             /* Tables 19.3..19.16: CACREF uses PSEL=7 on these pads. */
             if (cacref_pin(name) && peripheral && !(pfs & ASEL) &&
                 (pfs & PSEL) == 7) {
@@ -304,6 +312,9 @@ static void port_update(RX113PortState *s, bool notify)
         rx113_elc_port_input(s->elc, old_b, s->levels[11]);
     }
     qemu_set_irq(s->cacref, cacref);
+    for (unsigned i = 0; i < 3; i++) {
+        qemu_set_irq(s->mtu_feedback[i], (feedback >> i) & 1);
+    }
     for (unsigned i = 0; i < 8; i++) {
         qemu_set_irq(s->irq[i], (irq_levels >> i) & 1);
     }
@@ -530,6 +541,7 @@ static void port_init(Object *obj)
                           sizeof(s->regs));
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
     qdev_init_gpio_out_named(dev, &s->cacref, "cacref", 1);
+    qdev_init_gpio_out_named(dev, s->mtu_feedback, "mtu-feedback", 3);
     qdev_init_gpio_in_named(dev, port_mtioc_input, "mtioc",
                             RX113_MTIOC_PINS * 2);
     qdev_init_gpio_in_named(dev, port_input, "pin", RX113_PORT_PINS);

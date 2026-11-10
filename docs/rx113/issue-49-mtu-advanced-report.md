@@ -2,9 +2,146 @@
 SPDX-License-Identifier: GPL-2.0-or-later
 -->
 
-# Issue 49: RX113 MTU advanced output — stage 2b3 skipping delivery
+# Issue 49: RX113 MTU advanced output — stage 2b4 TGCR delivery
 
 ## Current delivery (2026-11-11)
+
+**Stage 2b and Issue #49 remain incomplete.** This continuation implements
+item 1 of `.issue49-runtime/issue-49-stage2b4.md`: TGCR brushless gating
+within complementary modes. It stops at this tested boundary under the
+requested limited usage window. Item 2, dead-time compensation with MTU5
+measurement/capture, is next and has not been implemented. Item 3, remaining
+duty interrupt wiring, follows it. Stage 3 (POE) was not started. There is
+no unresolved manual/design decision requiring PO judgment at this boundary.
+All earlier delivery sections and their next-step ordering are historical.
+
+Base: `11666c4f740f499860f8ff353837ff3d1eeb8e21`.
+Branch: `rx113/issue-49-mtu-advanced`.
+Deliverables are the working tree and
+`.issue49-runtime/issue49-stage2b4-tgcr.patch`. No commit, merge, push, PR,
+or upstream submission was performed; repository metadata is read-only.
+
+### Implemented boundary and manual evidence
+
+Authority: supplied R01UH0448EJ0120 Rev.1.20, printed manual pages.
+
+* 20.2.21, pp.439-440, Table 20.39; 20.3.8(p), pp.503-505,
+  Figures 20.63-66: BDC enables the six-arm truth table. Feedback 000/111
+  disables all arms; the other six combinations select one positive and
+  one negative arm. P and N independently select fixed active level or
+  the existing complementary waveform. Gating operates after waveform
+  arbitration; it does not change the carrier, duty bank or interlocks.
+  BDC=0 bypasses gating. TOCR1/TOCR2 polarity and TOER retain their roles.
+* FB=1 selects UF/VF/WF. FB=0 uses resolved MTIOC0A/B/C pad levels from
+  PORT/MPC, with package bonding, PMR, PSEL and analog exclusion applied.
+  Existing MTIOC alternative routes supply the same feedback signals.
+  MTCLKA/B/C/D are independent count inputs and are not used as feedback.
+  No general MTU0 input capture or noise-filter implementation is claimed.
+* TGCR resets to 80h, reads reserved bit 7 as one, and stores only bits
+  0..6. TRWER protects its reads/writes (20.2.16, p.432 and
+  20.3.8(4)(a), p.510), using the existing read-before-clear RWE rule.
+* Migration version 8 saves TGCR and the three feedback levels. PORT
+  routing is derived from its existing migrated state. Same-build tests
+  exercise external and software feedback in modes 13 and 14, and switch
+  from fixed-level gating to chopping after load to check retained carrier
+  state. The full two-cycle waveform matrix exercises mode 15. Older
+  streams default TGCR to disabled; cross-version waveform acceptance
+  is not claimed.
+
+Changed implementation files are `hw/rx/rx113-mtu.c`,
+`hw/rx/rx113-port.c`, `hw/rx/rx113.c`, and `include/hw/rx/rx113_port.h`.
+Tests and this report also change. The MTU qtest timeout in
+`tests/qtest/meson.build` increases from 60 to 180 seconds because the new
+physical-pad matrix alone takes about 65 seconds; no tests are excluded.
+RX62N behavior and device sources are untouched. TGCR gating in
+reset-synchronized PWM is outside this complementary-only delivery and
+remains unavailable. The existing partial complementary-mode diagnostic
+remains because restart, compensation and duty interrupt work is unfinished.
+
+### Remaining stage 2b work and precise next step
+
+Continue in the stage2b4 brief's order:
+
+1. **Dead-time compensation next:** read 20.3.10 external pulse width
+   measurement and 20.3.11, pp.516-518, Figures 20.79-82, together with
+   MTU5 TIORU/V/W and TCNTCMPCLR definitions. Add qualified MTIC5U/V/W
+   PORT inputs and the specified MTU5 up/down measurement, crest/trough
+   capture, optional count clear and capture request behavior. Make capture
+   decisions on raw crest/trough sources independently of TITCR ICU
+   skipping. Figure 20.81 specifies firmware calculation of corrected
+   duty and writes to MTU3.TGRD/MTU4.TGRC/D; do not invent automatic duty
+   correction. Test measured delays and the resulting firmware-driven
+   buffer transactions. General input capture remains out of scope.
+2. Audit and implement remaining duty and buffered C/D compare requests
+   using the documented up/down and temporary-bank arbitration. Existing
+   crest TGIA3, trough TCIV4 and interrupt skipping remain unchanged here.
+3. Earlier unfinished stage 2b requirements still apply: TDER
+   read-before-clear and no-dead-time outputs (TDDR=1 setup), TWCR
+   read-before-set/WRE/CCE and complementary synchronous clearing/restart,
+   retaining versus restoring initial outputs (20.3.8(m)-(o), pp.497-502,
+   and 20.7). TGCR in reset-synchronized PWM also needs a separate
+   implementation and tests before full advanced-mode acceptance.
+
+Do not start stage 3 (POE). No MTU5 compensation, new duty IRQ, TDER or
+TWCR behavior is included in this patch.
+
+### Validation
+
+Final evidence uses `stage2b4-*` names under `.issue49-runtime/`.
+The existing build and populated subprojects were reused without downloads.
+Scratch uses `.issue49-runtime/.t` or its `.s49` alias for socket limits.
+
+| Check | Result and runtime evidence |
+| --- | --- |
+| RX-only rebuild | PASS: `stage2b4-build-final.log` |
+| Full MTU qtest | 56/56 PASS, 140.26 seconds: `stage2b4-regression.log` |
+| Configured RX qtests and quick functional tests | 32 suites OK, four existing skips, zero failures: `stage2b4-regression.log` |
+| Existing gdbsim U-Boot functional | PASS: `stage2b4-gdbsim-functional.log` |
+| Cached FIT PLL/HOCO before and after reset | Both PASS: `stage2b4-fit-pll.log`, `stage2b4-fit-hoco.log` |
+| SYSTEM protection/timing without/with FIT ELF | Both PASS: `stage2b4-system.log`, `stage2b4-system-elf.log` |
+| Both gdbsim machines listed/run three seconds | Both PASS: `stage2b4-machine-help.log`, `stage2b4-gdbsim-smoke.log` |
+| Changed-file and raw-diff checkpatch | Zero errors and warnings: `stage2b4-checkpatch-files.log`, `stage2b4-checkpatch-patch.log` |
+| Forward/reverse patch dry runs and byte reconstruction | PASS: `stage2b4-patch-validation.log` |
+
+`stage2b4-tested-binary.sha256` identifies the final tested binary. Two new
+MTU cases cover the Table 20.39 matrix at every count edge over two carrier
+cycles, both feedback sources, all four P/N combinations, both global
+polarities and mixed per-arm polarity, BDC bypass, reserved-bit readback,
+TRWER, reset, TOER, alternate routing, PMR/PSEL/ASEL qualification and
+MTCLK isolation; and both feedback sources across migration in modes
+13/14. The original 54 cases are retained. Standalone final-feature tests
+also passed (`stage2b4-tgcr.log`, `stage2b4-tgcr-migration.log`); full
+regression above uses the final rebuilt binary. The initial filtered
+invocation selected zero tests because it omitted the `/rx` prefix; its
+`stage2b4-tgcr-first.log` is not passing evidence.
+
+The build's Meson regeneration printed a ninja jobserver descriptor error
+from a nested build invocation, then completed successfully; the final
+compile/link and all validation used the resulting binary. No source or
+assertion workaround was needed.
+
+Reproduce:
+
+```sh
+. .issue49-runtime/env.sh
+make -C build -j$(nproc)
+bash .issue49-runtime/stage2b4-regression.sh
+scripts/checkpatch.pl --no-tree -f hw/rx/rx113-mtu.c hw/rx/rx113-port.c \
+  hw/rx/rx113.c include/hw/rx/rx113_port.h tests/qtest/rx113-mtu-test.c
+python3 .issue49-runtime/stage2b4-validate-patch.py
+```
+
+The patch excludes AGENTS.md, manuals, runtime/build assets and repository
+metadata. The verifier reconstructs the seven HEAD files in worktree
+scratch, checks/applies forward and reverse patches, and compares all bytes
+with the working tree and base respectively. It never writes `.git`.
+Raw-diff checkpatch uses `--no-signoff` for this uncommitted deliverable.
+Suggested commit subject:
+`hw/rx: Gate RX113 complementary outputs with brushless feedback`.
+
+# Issue 49: RX113 MTU advanced output — stage 2b3 skipping delivery
+
+## Stage 2b3 skipping delivery (historical)
 
 **Stage 2b and Issue #49 remain incomplete.** This continuation completes
 only the first item in `.issue49-runtime/issue-49-stage2b3.md`:

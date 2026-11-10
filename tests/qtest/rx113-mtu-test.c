@@ -1085,6 +1085,167 @@ static void assert_complementary_pads(QTestState *qts, unsigned positive,
     assert_pad(qts, 0x16, false, false);
 }
 
+/* Table 20.39 plus independent carrier timing, observed through PORT/PIDR. */
+static void test_complementary_tgcr(void)
+{
+    static const unsigned positive[] = { 0, 1, 2, 2, 4, 1, 4, 0 };
+    static const unsigned negative[] = { 0, 4, 1, 4, 2, 2, 1, 0 };
+    static const unsigned pads[] = { 0x22, 0x24, 0x30, 0x23, 0x25, 0x31 };
+    static const unsigned inputs[] = { 0x04, 0x13, 0x32 };
+    QTestState *qts = mtu_init();
+
+    g_assert_cmphex(qtest_readb(qts, BASE + 0xd), ==, 0x80);
+    complementary_setup(qts, 15);
+    complementary_pads(qts);
+    for (unsigned i = 0; i < 3; i++) {
+        select_pad(qts, inputs[i], 1);
+    }
+    qtest_writeb(qts, START, 0xc0);
+    for (unsigned edge = 0; edge <= 48; edge++) {
+        for (unsigned polarity = 0; polarity < 3; polarity++) {
+            qtest_writeb(qts, BASE + 0xe,
+                         polarity == 2 ? 4 : polarity ? 3 : 0);
+            qtest_writeb(qts, BASE + 0xf, 0x26);
+            for (unsigned source = 0; source < 2; source++) {
+                for (unsigned feedback = 0; feedback < 8; feedback++) {
+                    for (unsigned i = 0; i < 3; i++) {
+                        unsigned name = inputs[i];
+
+                        qtest_set_irq_in(qts, "/machine/mcu/port", "pin",
+                                         (name >> 4) * 8 + (name & 7),
+                                         (feedback >> i) & 1);
+                    }
+                    for (unsigned chop = 0; chop < 4; chop++) {
+                        unsigned value = 0x40 | (chop << 4) |
+                                         (source ? 8 | feedback : 0);
+
+                        qtest_writeb(qts, BASE + 0xd, value);
+                        g_assert_cmphex(qtest_readb(qts, BASE + 0xd), ==,
+                                        value | 0x80);
+                        for (unsigned arm = 0; arm < 6; arm++) {
+                            unsigned phase = arm % 3;
+                            unsigned duty = 4 + phase * 2;
+                            unsigned t = edge % 24;
+                            bool pwm = edge >= 3 && (arm < 3 ?
+                                (t >= duty + 1 && t < 25 - duty) :
+                                (t >= 27 - duty || t < duty - 1));
+                            bool on = ((arm < 3 ? positive[feedback] :
+                                        negative[feedback]) >> phase) & 1;
+                            unsigned pol = polarity == 2 ?
+                                (0x26 >> (2 * phase + (arm >= 3))) & 1 :
+                                polarity == 1;
+
+                            if (chop & (arm < 3 ? 1 : 2)) {
+                                on &= pwm;
+                            }
+                            assert_pad(qts, pads[arm], true, !pol ^ on);
+                        }
+                    }
+                }
+            }
+        }
+        /* BDC=0 bypasses all feedback and chopping selections. */
+        qtest_writeb(qts, BASE + 0xe, 3);
+        qtest_writeb(qts, BASE + 0xd, 0x3f);
+        for (unsigned arm = 0; arm < 6; arm++) {
+            unsigned duty = 4 + (arm % 3) * 2;
+            unsigned t = edge % 24;
+            bool pwm = edge >= 3 && (arm < 3 ?
+                (t >= duty + 1 && t < 25 - duty) :
+                (t >= 27 - duty || t < duty - 1));
+
+            assert_pad(qts, pads[arm], true, pwm);
+        }
+        if (edge != 48) {
+            qtest_clock_step(qts, 125);
+        }
+    }
+    /* Protection covers TGCR reads and writes, with read-before-clear RWE. */
+    qtest_writeb(qts, BASE + 0xd, 0x49);
+    g_assert_cmpuint(qtest_readb(qts, RWE), ==, 1);
+    qtest_writeb(qts, RWE, 0);
+    qtest_writeb(qts, BASE + 0xd, 0x7f);
+    g_assert_cmphex(qtest_readb(qts, BASE + 0xd), ==, 0);
+    qtest_writeb(qts, RWE, 1);
+    g_assert_cmphex(qtest_readb(qts, BASE + 0xd), ==, 0xc9);
+    /* PSEL, PMR and ASEL qualify external feedback; MTCLK is unrelated. */
+    qtest_writeb(qts, BASE + 0xe, 3);
+    qtest_writeb(qts, BASE + 0xd, 0x40);
+    select_pad(qts, 0x04, 0);
+    select_pad(qts, 0x13, 0);
+    select_pad(qts, 0x32, 0);
+    for (unsigned i = 0; i < 4; i++) {
+        pin(qts, i, true);
+    }
+    for (unsigned i = 0; i < 6; i++) {
+        assert_pad(qts, pads[i], true, false);
+    }
+    select_pad(qts, 0x04, 1);
+    assert_pad(qts, 0x22, true, true);
+    assert_pad(qts, 0x31, true, true);
+    qtest_writeb(qts, PORT_BASE + 0x60, 0); /* PMR disables P04 input. */
+    assert_pad(qts, 0x22, true, false);
+    select_pad(qts, 0xe3, 3); /* Alternative MTIOC0A, analog-capable pad. */
+    qtest_set_irq_in(qts, "/machine/mcu/port", "pin", 14 * 8 + 3, 1);
+    assert_pad(qts, 0x22, true, true);
+    qtest_writeb(qts, PORT_BASE + 0x140 + 14 * 8 + 3, 0x83);
+    assert_pad(qts, 0x22, true, false);
+    /* TOER still controls pad ownership for fixed-level gating. */
+    qtest_writeb(qts, BASE + 0xd, 0x49);
+    qtest_writeb(qts, BASE + 0xa, 0);
+    assert_pad(qts, 0x22, false, false);
+    qtest_qmp_assert_success(qts, "{'execute':'system_reset'}");
+    qtest_writew(qts, 0x803fe, 0xa503);
+    qtest_writel(qts, MSTPCRA, 0xeffffdff);
+    g_assert_cmphex(qtest_readb(qts, BASE + 0xd), ==, 0x80);
+    qtest_quit(qts);
+}
+
+static void test_complementary_tgcr_migration(void)
+{
+    for (unsigned source = 0; source < 2; source++) {
+        QTestState *src = mtu_init();
+        QTestState *dst;
+        int64_t now;
+        g_autofree char *dir = g_dir_make_tmp("rx113-mtu-tgcr-XXXXXX", NULL);
+        g_autofree char *file = g_strdup_printf("%s/state", dir);
+        g_autofree char *uri = g_strdup_printf("file:%s", file);
+
+        g_assert_nonnull(dir);
+        complementary_setup(src, 13 + source);
+        complementary_pads(src);
+        select_pad(src, 0x04, 1);
+        qtest_set_irq_in(src, "/machine/mcu/port", "pin", 4, 1);
+        qtest_writeb(src, BASE + 0xd, source ? 0x49 : 0x40);
+        qtest_writeb(src, START, 0xc0);
+        now = qtest_clock_step(src, 6 * 125 + 62);
+        qtest_qmp_assert_success(src, "{'execute':'migrate',"
+                                "'arguments':{'uri':%s}}", uri);
+        migration_wait(src);
+        dst = qtest_init("-M rx113-r5f51138 -incoming defer");
+        qtest_clock_set(dst, now);
+        qtest_qmp_assert_success(dst, "{'execute':'migrate-incoming',"
+                                "'arguments':{'uri':%s}}", uri);
+        migration_wait(dst);
+        g_assert_cmphex(qtest_readb(dst, BASE + 0xd), ==,
+                        source ? 0xc9 : 0xc0);
+        assert_complementary_pads(dst, 1, 4, true);
+        qtest_clock_step(dst, 12 * 125);
+        assert_complementary_pads(dst, 1, 4, false);
+        /* Switch to chopping after load: carrier state was never gated. */
+        qtest_writeb(dst, BASE + 0xd, source ? 0x79 : 0x70);
+        assert_complementary_pads(dst, 1, 0, false);
+        qtest_set_irq_in(dst, "/machine/mcu/port", "pin", 4, 0);
+        if (!source) {
+            assert_complementary_pads(dst, 0, 0, false);
+        }
+        qtest_quit(dst);
+        qtest_quit(src);
+        unlink(file);
+        rmdir(dir);
+    }
+}
+
 /* Independent steady-carrier oracle, including the initial inactive window. */
 static void test_complementary_waveform(void)
 {
@@ -2129,6 +2290,10 @@ static void test_pad_package64(void)
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
+    qtest_add_func("/rx113-mtu/complementary-tgcr-migration",
+                   test_complementary_tgcr_migration);
+    qtest_add_func("/rx113-mtu/complementary-tgcr",
+                   test_complementary_tgcr);
     qtest_add_func("/rx113-mtu/complementary-arbitration",
                    test_complementary_arbitration);
     qtest_add_func("/rx113-mtu/complementary-polarity",
