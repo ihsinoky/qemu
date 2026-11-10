@@ -154,7 +154,7 @@ qtests_rx = (config_all_devices.has_key('CONFIG_RX_ICU') ? ['rx-icu-test'] : [])
     ['rx113-lcdc-test', 'rx113-rtc-test', 'rx113-port-test',
      'rx113-clock-test', 'rx113-sci-test', 'rx113-iwdt-test',
      'rx113-mtu-test', 'rx113-s12ad-test', 'rx113-dtc-test',
-     'rx113-elc-test'] : [])
+     'rx113-elc-test', 'rx113-doc-test'] : [])
 
 qtests_hppa = \
   qtests_filter + \
