@@ -55,6 +55,11 @@ static unsigned pin_name(unsigned pin)
     return (pin / 8) * 16 + pin % 8;
 }
 
+static bool cacref_pin(unsigned name)
+{
+    return name == 0x15 || name == 0x27 || name == 0xa0 || name == 0xc7;
+}
+
 static uint8_t port_pins(RX113PortState *s, unsigned port)
 {
     return s->package_pins == 64 ? pins64[port] : pins100[port];
@@ -166,6 +171,7 @@ static uint8_t port_mask(RX113PortState *s, hwaddr addr)
 static void port_update(RX113PortState *s)
 {
     uint8_t irq_levels = 0;
+    bool cacref = false;
 
     memset(s->levels, 0, sizeof(s->levels));
     memset(s->driving, 0, sizeof(s->driving));
@@ -204,6 +210,11 @@ static void port_update(RX113PortState *s)
                              (s->regs[PCR + gp] & (1 << gb)));
                 }
             }
+            /* Tables 19.3..19.16: CACREF uses PSEL=7 on these pads. */
+            if (cacref_pin(name) && peripheral && !(pfs & ASEL) &&
+                (pfs & PSEL) == 7) {
+                cacref |= level;
+            }
             s->levels[port] |= level << bit;
             s->driving[port] |= drive << bit;
             if (gp != port) {
@@ -219,6 +230,7 @@ static void port_update(RX113PortState *s)
         qemu_set_irq(s->pin_out[pin], level);
         qemu_set_irq(s->pin_oe[pin], drive);
     }
+    qemu_set_irq(s->cacref, cacref);
     for (unsigned i = 0; i < 8; i++) {
         qemu_set_irq(s->irq[i], (irq_levels >> i) & 1);
     }
@@ -280,10 +292,20 @@ static void port_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
     }
     s->regs[addr] = (s->regs[addr] & ~mask) | (val & mask);
     if (addr >= PMR && addr < PMR + RX113_PORT_COUNT && val & mask) {
-        qemu_log_mask(LOG_UNIMP,
-                      "rx113-port: peripheral pad signals are unavailable "
-                      "(PMR port %u = 0x%02x)\n", (unsigned)(addr - PMR),
-                      (unsigned)(val & mask));
+        unsigned port = addr - PMR;
+        uint8_t unsupported = val & mask;
+
+        for (unsigned bit = 0; bit < 8; bit++) {
+            if (cacref_pin(port * 16 + bit) &&
+                (s->regs[PFS + port * 8 + bit] & (PSEL | ASEL)) == 7) {
+                unsupported &= ~(1 << bit);
+            }
+        }
+        if (unsupported) {
+            qemu_log_mask(LOG_UNIMP,
+                          "rx113-port: peripheral pad signals are unavailable "
+                          "(PMR port %u = 0x%02x)\n", port, unsupported);
+        }
     }
     port_update(s);
 }
@@ -369,6 +391,7 @@ static void port_init(Object *obj)
     memory_region_init_io(&s->iomem, obj, &port_ops, s, TYPE_RX113_PORT,
                           sizeof(s->regs));
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
+    qdev_init_gpio_out_named(dev, &s->cacref, "cacref", 1);
     qdev_init_gpio_in_named(dev, port_input, "pin", RX113_PORT_PINS);
     qdev_init_gpio_out_named(dev, s->pin_out, "pin-out", RX113_PORT_PINS);
     qdev_init_gpio_out_named(dev, s->pin_oe, "pin-oe", RX113_PORT_PINS);

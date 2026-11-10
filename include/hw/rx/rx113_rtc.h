@@ -29,6 +29,7 @@ struct RX113RTCState {
     qemu_irq prd;
     qemu_irq cup;
     qemu_irq prd_lcdc;
+    qemu_irq rtc_enable;
 
     /* Calendar mode counters, raw BCD register values (24.2.2 - 24.2.8) */
     uint8_t sec;
