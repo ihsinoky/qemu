@@ -34,6 +34,8 @@ struct RX113PortState {
     qemu_irq nmi;
     qemu_irq mtu_feedback[3];
     qemu_irq mtic5[3];
+    qemu_irq rxd_lines[8];
+    qemu_irq sck_sense[8];
     bool ctsu_fixed, ctsu_level;
     uint16_t mtioc, mtioc_oe, poe_cutoff;
     /* Issue #50: TMR compare outputs and the RTCOUT pin level. */

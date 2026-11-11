@@ -247,6 +247,46 @@ static int sck_signal(unsigned name, unsigned psel)
 }
 
 /*
+ * Tables 19.3-19.16: SCI receive pads (Issue #65 stage 2). The
+ * signal index follows the same channel order as the TXD map.
+ */
+static int rxd_signal(unsigned name, unsigned psel)
+{
+    switch (psel) {
+    case 10:
+        switch (name) {
+        case 0x11: case 0x21:
+            return 0;
+        case 0x15: case 0x30:
+            return 1;
+        case 0x52:
+            return 2;
+        case 0xa2: case 0xa3: case 0xc2:
+            return 3;
+        case 0xa6: case 0xc6:
+            return 5;
+        case 0xb6: case 0xe4:
+            return 6;
+        }
+        break;
+    case 11:
+        switch (name) {
+        case 0x02: case 0x27: case 0xb0:
+            return 4;
+        case 0xc6:
+            return 1;
+        }
+        break;
+    case 12:
+        if (name == 0x11 || name == 0x17 || name == 0xe2) {
+            return 7;
+        }
+        break;
+    }
+    return -1;
+}
+
+/*
  * Tables 19.3 to 19.16: the LCDC pin functions use PSEL=24
  * (Issue #63). Four Port B pads carry both a common and a segment
  * function; the LCDC pad state decides which one a pad drives
@@ -643,6 +683,33 @@ static void port_update(RX113PortState *s, bool notify)
     for (unsigned i = 0; i < 8; i++) {
         qemu_set_irq(s->irq[i], (irq_levels >> i) & 1);
     }
+    /*
+     * Forward the resolved RXD and SCK pad levels to the SCIs
+     * (Issue #65 stage 2). A channel with no selected pad reads as
+     * idle high.
+     */
+    for (unsigned sig = 0; sig < 8; sig++) {
+        bool rxd = true, sck = true;
+
+        for (unsigned port = 0; port < RX113_PORT_COUNT; port++) {
+            for (unsigned bit = 0; bit < 8; bit++) {
+                unsigned name = port * 16 + bit;
+                unsigned psel = s->regs[PFS + port * 8 + bit] & PSEL;
+
+                if (!(s->regs[PMR + port] & (1 << bit))) {
+                    continue;
+                }
+                if (rxd_signal(name, psel) == (int)sig) {
+                    rxd = (s->levels[port] >> bit) & 1;
+                }
+                if (sck_signal(name, psel) == (int)sig) {
+                    sck = (s->levels[port] >> bit) & 1;
+                }
+            }
+        }
+        qemu_set_irq(s->rxd_lines[sig], rxd);
+        qemu_set_irq(s->sck_sense[sig], sck);
+    }
 }
 
 /* Table 19.1: POE inputs all use PSEL=7. */
@@ -924,6 +991,10 @@ static void port_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
                            s->regs[PFS + port * 8 + bit] & PSEL) >= 0) {
                 unsupported &= ~(1 << bit);
             }
+            if (rxd_signal(port * 16 + bit,
+                           s->regs[PFS + port * 8 + bit] & PSEL) >= 0) {
+                unsupported &= ~(1 << bit);
+            }
         }
         if (unsupported) {
             qemu_log_mask(LOG_UNIMP,
@@ -1042,6 +1113,8 @@ static void port_init(Object *obj)
     qdev_init_gpio_out_named(dev, &s->nmi, "nmi", 1);
     qdev_init_gpio_out_named(dev, s->mtu_feedback, "mtu-feedback", 3);
     qdev_init_gpio_out_named(dev, s->mtic5, "mtic5", 3);
+    qdev_init_gpio_out_named(dev, s->rxd_lines, "rxd", 8);
+    qdev_init_gpio_out_named(dev, s->sck_sense, "sck-sense", 8);
     qdev_init_gpio_in_named(dev, port_mtioc_input, "mtioc",
                             RX113_MTIOC_PINS * 2);
     qdev_init_gpio_in_named(dev, port_tmo_input, "tmo", 8);

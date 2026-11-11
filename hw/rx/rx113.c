@@ -913,6 +913,7 @@ static void register_sci(RX113State *s, unsigned unit)
     qdev_prop_set_chr(DEVICE(sci), "chardev", serial_hd(unit));
     qdev_prop_set_uint64(DEVICE(sci), "input-freq", RX113_PCLKB_HZ);
     qdev_prop_set_bit(DEVICE(sci), "has-output", true);
+    qdev_prop_set_bit(DEVICE(sci), "has-input", true);
     sysbus_realize(sci, &error_abort);
 
     for (i = 0; i < SCI_NR_IRQ; i++) {
@@ -1046,6 +1047,13 @@ static DeviceState *register_port(RX113State *s)
             qdev_connect_gpio_out_named(DEVICE(&s->sci[unit]), "sck-oe", 0,
                                         qdev_get_gpio_in_named(dev, "sck",
                                                                signal + 8));
+            qdev_connect_gpio_out_named(dev, "rxd", signal,
+                                        qdev_get_gpio_in_named(
+                                            DEVICE(&s->sci[unit]), "rxd", 0));
+            qdev_connect_gpio_out_named(dev, "sck-sense", signal,
+                                        qdev_get_gpio_in_named(
+                                            DEVICE(&s->sci[unit]), "sck-in",
+                                            0));
         }
     }
     return dev;
