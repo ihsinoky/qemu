@@ -56,4 +56,19 @@ struct RX113LCDCState {
 void rx113_lcdc_set_clock(DeviceState *dev, uint64_t hz, unsigned source,
                           bool stopped);
 
+/*
+ * Current COM/SEG pad drive for the PORT model (Issue #63). The
+ * masks follow the pin functions of Tables 19.3 to 19.16 at
+ * PSEL = 24: com bit n is COMn, seg bit n is SEGnn. A set drive bit
+ * means the LCDC actively drives the pin at the matching level bit.
+ * A module-stopped LCDC drives nothing. The levels are the digital
+ * abstraction of Figures 34.15 to 34.17 documented in the issue
+ * report: the selected common is driven opposite to a lit segment,
+ * non-selected commons are not driven (their deselect level is a
+ * bias voltage with no digital equivalent).
+ */
+void rx113_lcdc_pad_state(DeviceState *dev, uint8_t *com_level,
+                          uint8_t *com_drive, uint64_t *seg_level,
+                          uint64_t *seg_drive);
+
 #endif /* HW_RX_RX113_LCDC_H */

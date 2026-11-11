@@ -211,6 +211,56 @@ static uint8_t lcdc_segment(const RX113LCDCState *s, unsigned seg)
     return data & (0xff >> (8 - coms));
 }
 
+void rx113_lcdc_pad_state(DeviceState *dev, uint8_t *com_level,
+                          uint8_t *com_drive, uint64_t *seg_level,
+                          uint64_t *seg_drive)
+{
+    RX113LCDCState *s = RX113_LCDC(dev);
+    unsigned coms = lcdc_com_count(s->lcdm0);
+    uint64_t step;
+    unsigned slice;
+    bool phase;
+
+    *com_level = 0;
+    *com_drive = 0;
+    *seg_level = 0;
+    *seg_drive = 0;
+    if (s->stopped) {
+        return;
+    }
+    *com_drive = 0xff;
+    *seg_drive = (1ULL << RX113_LCDC_NR_SEG) - 1;
+    if (!(s->lcdm1 & LCDM1_SCOC) || coms == 0) {
+        /* 34.2.2: with SCOC = 0 the pins output the ground level. */
+        return;
+    }
+    step = lcdc_current_step(s);
+    slice = (step / 2) % coms;
+    /* Figures 34.15 to 34.17, as in lcdc_get_drive_phase(). */
+    phase = s->lcdm0 & LCDM0_LWAVE ? (step / 2) & 1 : step & 1;
+    if (coms == 1) {
+        /* 34.8 (1): static mode outputs the same signal to COM0-3. */
+        *com_drive = 0x0f;
+        *com_level = phase ? 0 : 0x0f;
+    } else {
+        *com_drive = 1 << slice;
+        *com_level = phase ? 0 : *com_drive;
+    }
+    if (lcdc_8_slice(s)) {
+        /* 34.8 (2): SEG11-SEG13 and SEG15 are not segment outputs. */
+        *seg_drive &= ~((1ULL << 11) | (1ULL << 12) |
+                        (1ULL << 13) | (1ULL << 15));
+    }
+    for (unsigned seg = 0; seg < RX113_LCDC_NR_SEG; seg++) {
+        bool lit = (lcdc_segment(s, seg) >> slice) & 1;
+
+        /* A lit segment is driven opposite to the selected common. */
+        if (lit == phase) {
+            *seg_level |= 1ULL << seg;
+        }
+    }
+}
+
 static void lcdc_log_rewrite(const RX113LCDCState *s, const char *what)
 {
     if (s->lcdm1 & LCDM1_SCOC) {
