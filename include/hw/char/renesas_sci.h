@@ -52,6 +52,13 @@ struct RSCIState {
     bool has_output;
     qemu_irq txd;
     qemu_irq txd_oe;
+    qemu_irq sck;
+    qemu_irq sck_oe;
+    /* Clock-synchronous frame state (Issue #65 stage 1). */
+    bool tx_sync;
+    bool tx_sync_rise;
+    int64_t tx_sync_bit_ns;
+    bool sck_level;
     QEMUTimer tx_bit_timer;
     uint8_t tx_shift;
     uint8_t tx_bit;

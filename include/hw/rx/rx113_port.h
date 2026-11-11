@@ -40,6 +40,7 @@ struct RX113PortState {
     uint8_t tmo, tmo_oe;
     bool rtcout_level, rtcout_oe;
     uint8_t txd, txd_oe;
+    uint8_t sck, sck_oe;
 };
 
 void rx113_port_set_poe(RX113PortState *s, uint16_t mask);

@@ -139,6 +139,28 @@ static void sci_txd_push(RSCIState *s)
                             !s->module_stopped);
 }
 
+/*
+ * In clock synchronous mode SCR.CKE bit 1 selects the clock source
+ * (section 28.2.6): 0 selects the internal baud-rate generator and the
+ * SCK pin is a clock output; 1 selects an external clock input.
+ */
+static bool sci_sync_internal_clock(RSCIState *s)
+{
+    return !(FIELD_EX8(s->scr, SCR, CKE) & 2);
+}
+
+static void sci_sck_push(RSCIState *s)
+{
+    if (!s->has_output) {
+        return;
+    }
+    qemu_set_irq(s->sck, s->sck_level);
+    qemu_set_irq(s->sck_oe, FIELD_EX8(s->scr, SCR, TE) &&
+                            FIELD_EX8(s->smr, SMR, CM) &&
+                            sci_sync_internal_clock(s) &&
+                            !s->module_stopped);
+}
+
 static unsigned sci_tx_data_bits(RSCIState *s)
 {
     return 8 - FIELD_EX8(s->smr, SMR, CHR);
@@ -211,6 +233,98 @@ static void sci_tx_arm_bit(RSCIState *s)
     timer_mod(&s->tx_bit_timer, s->tx_deadline);
 }
 
+/*
+ * Clock-synchronous transmission (section 28.5): a frame is eight data
+ * bits with no start, parity or stop bit. TXD changes on the falling
+ * edges of SCK and holds the last bit after the frame; SCK idles high
+ * and pulses once per bit, so the engine steps in half-bit phases.
+ * One bit lasts one model slot, as on the asynchronous path.
+ */
+static bool sci_tx_sync_bit_value(RSCIState *s, unsigned pos)
+{
+    unsigned idx = FIELD_EX8(s->scmr, SCMR, SDIR) ? 7 - pos : pos;
+    bool value = (s->tx_shift >> idx) & 1;
+
+    return FIELD_EX8(s->scmr, SCMR, SINV) ? !value : value;
+}
+
+static void sci_tx_sync_arm(RSCIState *s, int64_t duration)
+{
+    if (s->clock_managed) {
+        s->tx_bit_remaining = duration * s->input_freq;
+    }
+    timer_mod(&s->tx_bit_timer, s->tx_deadline);
+}
+
+static void sci_tx_sync_frame_start_at(RSCIState *s, uint8_t byte,
+                                       int64_t start);
+
+static void sci_tx_sync_expire(RSCIState *s)
+{
+    int64_t half = s->tx_sync_bit_ns / 2;
+
+    if (s->tx_sync_rise) {
+        /* Mid-bit: SCK rises; receivers sample on this edge. */
+        s->sck_level = true;
+        sci_sck_push(s);
+        s->tx_sync_rise = false;
+        s->tx_deadline += s->tx_sync_bit_ns - half;
+        sci_tx_sync_arm(s, s->tx_sync_bit_ns - half);
+        return;
+    }
+    s->tx_bit++;
+    if (s->tx_bit >= s->tx_frame_bits) {
+        s->tx_active = false;
+        s->tx_sync = false;
+        /* TXD holds the last bit and SCK stays high (section 28.5). */
+        if (s->tx_pending_valid) {
+            s->tx_pending_valid = false;
+            sci_tx_sync_frame_start_at(s, s->tx_pending_shift,
+                                       s->tx_deadline);
+        }
+        return;
+    }
+    /* The falling edge presents the next bit. */
+    s->sck_level = false;
+    s->tx_level = sci_tx_sync_bit_value(s, s->tx_bit);
+    sci_sck_push(s);
+    sci_txd_push(s);
+    s->tx_sync_rise = true;
+    s->tx_deadline += half;
+    sci_tx_sync_arm(s, half);
+}
+
+static void sci_tx_sync_frame_start_at(RSCIState *s, uint8_t byte,
+                                       int64_t start)
+{
+    s->tx_shift = byte;
+    s->tx_frame_bits = 8;
+    s->tx_slots = sci_tx_slots(s);
+    s->tx_bit = 0;
+    s->tx_active = true;
+    s->tx_sync = true;
+    s->tx_sync_bit_ns = s->tx_slots ? s->trtime / s->tx_slots : 0;
+    s->tx_level = sci_tx_sync_bit_value(s, 0);
+    s->sck_level = false; /* the frame opens with a falling edge */
+    sci_txd_push(s);
+    sci_sck_push(s);
+    s->tx_sync_rise = true;
+    s->tx_deadline = start + s->tx_sync_bit_ns / 2;
+    sci_tx_sync_arm(s, s->tx_sync_bit_ns / 2);
+}
+
+static void sci_tx_sync_frame_start(RSCIState *s)
+{
+    /* Same pending-slot rule as the asynchronous path (see below). */
+    if (s->tx_active) {
+        s->tx_pending_shift = s->tdr;
+        s->tx_pending_valid = true;
+        return;
+    }
+    sci_tx_sync_frame_start_at(s, s->tdr,
+                               qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+}
+
 static void sci_tx_frame_start_at(RSCIState *s, uint8_t byte, int64_t start);
 
 static void sci_tx_bit_expire(void *opaque)
@@ -218,6 +332,10 @@ static void sci_tx_bit_expire(void *opaque)
     RSCIState *s = opaque;
 
     if (!s->tx_active) {
+        return;
+    }
+    if (s->tx_sync) {
+        sci_tx_sync_expire(s);
         return;
     }
     s->tx_bit++;
@@ -292,11 +410,16 @@ static void send_byte(RSCIState *sci)
     /*
      * The waveform rides the model's existing transfer timing: a frame
      * starts exactly when send_byte() runs (TDR write while idle, or the
-     * queued byte at the previous frame's deadline). Clock-synchronous
-     * mode (SMR.CM) has no start/stop framing and is not serialized.
+     * queued byte at the previous frame's deadline). A synchronous
+     * frame on an external clock advances on SCK input edges, which are
+     * not modelled, so it is not serialized here.
      */
-    if (sci->has_output && !FIELD_EX8(sci->smr, SMR, CM)) {
-        sci_tx_frame_start(sci);
+    if (sci->has_output) {
+        if (!FIELD_EX8(sci->smr, SMR, CM)) {
+            sci_tx_frame_start(sci);
+        } else if (sci_sync_internal_clock(sci)) {
+            sci_tx_sync_frame_start(sci);
+        }
     }
 }
 
@@ -373,11 +496,14 @@ static void sci_write(void *opaque, hwaddr offset, uint64_t val, unsigned size)
         if (sci->has_output) {
             if (!FIELD_EX8(sci->scr, SCR, TE) && sci->tx_active) {
                 sci->tx_active = false;
+                sci->tx_sync = false;
                 sci->tx_pending_valid = false;
                 sci->tx_level = true;
+                sci->sck_level = true;
                 timer_del(&sci->tx_bit_timer);
             }
             sci_txd_push(sci);
+            sci_sck_push(sci);
         }
         break;
     case A_TDR:
@@ -508,6 +634,7 @@ void renesas_sci_set_clock(RSCIState *s, uint64_t freq, bool stopped)
         }
     }
     sci_txd_push(s);
+    sci_sck_push(s);
 }
 
 static void rsci_reset(DeviceState *dev)
@@ -523,7 +650,9 @@ static void rsci_reset(DeviceState *dev)
     }
     timer_del(&sci->tx_bit_timer);
     sci->tx_active = false;
+    sci->tx_sync = false;
     sci->tx_level = true;
+    sci->sck_level = true;
     sci->tx_bit = 0;
     sci->smr = sci->scr = 0x00;
     sci->brr = 0xff;
@@ -537,6 +666,7 @@ static void rsci_reset(DeviceState *dev)
         update_trtime(sci);
     }
     sci_txd_push(sci);
+    sci_sck_push(sci);
 }
 
 static void sci_event(void *opaque, QEMUChrEvent event)
@@ -580,6 +710,8 @@ static void rsci_init(Object *obj)
     qdev_init_gpio_out_named(DEVICE(obj), sci->event, "event", SCI_NR_IRQ);
     qdev_init_gpio_out_named(DEVICE(obj), &sci->txd, "txd", 1);
     qdev_init_gpio_out_named(DEVICE(obj), &sci->txd_oe, "txd-oe", 1);
+    qdev_init_gpio_out_named(DEVICE(obj), &sci->sck, "sck", 1);
+    qdev_init_gpio_out_named(DEVICE(obj), &sci->sck_oe, "sck-oe", 1);
     timer_init_ns(&sci->timer, QEMU_CLOCK_VIRTUAL, txend, sci);
     timer_init_ns(&sci->tx_bit_timer, QEMU_CLOCK_VIRTUAL,
                   sci_tx_bit_expire, sci);
@@ -652,12 +784,13 @@ static int sci_output_post_load(void *opaque, int version_id)
     RSCIState *s = opaque;
 
     sci_txd_push(s);
+    sci_sck_push(s);
     return 0;
 }
 
 static const VMStateDescription vmstate_sci_output = {
     .name = "renesas-sci/output",
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .needed = sci_output_needed,
     .post_load = sci_output_post_load,
@@ -673,6 +806,10 @@ static const VMStateDescription vmstate_sci_output = {
         VMSTATE_INT64(tx_bit_remaining, RSCIState),
         VMSTATE_INT64(tx_deadline, RSCIState),
         VMSTATE_TIMER(tx_bit_timer, RSCIState),
+        VMSTATE_BOOL_V(tx_sync, RSCIState, 2),
+        VMSTATE_BOOL_V(tx_sync_rise, RSCIState, 2),
+        VMSTATE_INT64_V(tx_sync_bit_ns, RSCIState, 2),
+        VMSTATE_BOOL_V(sck_level, RSCIState, 2),
         VMSTATE_END_OF_LIST()
     },
 };
