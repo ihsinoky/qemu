@@ -62,3 +62,64 @@ the SCK pad; stage 2 adds RXD pad sampling.
   external-clock operation (both directions).
 - The asynchronous-mode SCK bit-clock output (SCR.CKE = 01 in
   async mode) is not modelled.
+
+## Stage 2: RXD pad sampling
+
+### Plumbing
+
+- The SCI gains an opt-in `has-input` property and two named GPIO
+  inputs, `rxd` and `sck-in`. The PORT gains an RXD signal map
+  (Tables 19.3 to 19.16, PSEL 10, 11 and 12) in the TXD channel
+  order and two named GPIO outputs, `rxd` and `sck-sense`; on every
+  pad update it forwards the resolved pad level of each channel
+  (idle high when no pad selects the function). rx113.c wires all
+  eight channels and enables `has-input` next to `has-output`.
+- The chardev receive path is unchanged and stays available in
+  parallel; both sources deliver through the same RDR logic
+  (shared `sci_receive_byte` / overrun helper).
+
+### Asynchronous reception
+
+- A falling RXD edge with RE = 1 opens a frame: the start bit is
+  verified at its centre (a shorter low pulse is rejected as a
+  false start), then data bits, the parity/MP position and the
+  first stop bit are sampled at bit centres, at the model's slot
+  timing. Bit order and SINV mirror the transmit engine.
+- Delivery latches FER (stop bit low) and PER (parity mismatch)
+  with the byte, sets SSR.MPB in multi-processor mode, and drops
+  the byte with ORER when RDRF is still set — the chardev path's
+  semantics.
+
+### Synchronous reception and the external clock
+
+- Internal clock, reception only: setting RE starts the SCK
+  output (section 28.5.1) from a dedicated half-phase engine;
+  RXD is sampled on the rising edges in continuous 8-pulse
+  bursts. An overrun stops the clock at the high level, as does
+  clearing RE; clearing ORER through SSR restarts it. While a
+  transmission is active, its engine owns the clock and the
+  receiver samples on the same rising edges (full duplex); the
+  reception-only engine resumes when the frame completes.
+- External clock: the `sck-in` level drives both directions —
+  RXD is sampled on rising edges, and a synchronous transmission
+  (stage 1 left it unserialized) presents its bits on falling
+  edges, with the same pending-slot rule as the other engines.
+- Migration state lives in a new `renesas-sci/input` VMState
+  subsection (version 1, present only with `has-input`).
+
+### Tests and verification
+
+- New suite tests/qtest/rx113-sci-rxd-test (5 cases): async
+  reception with false-start rejection; FER/PER/overrun;
+  reception-only clock generation; full-duplex synchronous
+  transfer; external-clock reception and transmission.
+- Full regression and checkpatch results: see the PR comment.
+
+### Remaining leftovers
+
+- The asynchronous-mode SCK bit-clock output (SCR.CKE = 01 in
+  async mode) is still not modelled.
+- Multi-processor reception filtering (MPIE) is not modelled;
+  the MP bit position is received into SSR.MPB only.
+- The CTS/RTS flow control of sections 28.5.2 (and the async
+  equivalent) is not modelled.
