@@ -61,6 +61,63 @@ REG8(NMICLR, 0x582)
   FIELD(NMICLR, OSTCLR, 2, 1)
 REG8(NMICR, 0x583)
   FIELD(NMICR, NMIMD, 3, 1)
+REG8(NMIFLTE, 0x590)
+  FIELD(NMIFLTE, NFLTEN, 0, 1)
+REG8(NMIFLTC, 0x591)
+  FIELD(NMIFLTC, NFCLKSEL, 0, 2)
+
+/* RX113 NMISR/NMIER/NMICLR share one bit layout (manual 14.2.10-14.2.12). */
+#define RX113_NMI_BITS 0x3b /* NMIST, OSTST, IWDTST, LVD1ST, LVD2ST */
+
+enum {
+    RXICU_NMI_PIN = 0,
+    RXICU_NMI_OST = 1,
+    RXICU_NMI_IWDT = 2,
+};
+
+static void rxicu_nmi_update(RXICUState *icu)
+{
+    qemu_set_irq(icu->_nmi,
+                 (icu->nmisr & icu->nmier & RX113_NMI_BITS) != 0);
+}
+
+static void rxicu_nmi_input(RXICUState *icu, int src, int level)
+{
+    bool prev = icu->nmi_in_level[src] != 0;
+    bool edge;
+
+    icu->nmi_in_level[src] = level != 0;
+    if (!icu->nmi_rx113) {
+        return;
+    }
+    if (src == RXICU_NMI_PIN) {
+        /* NMICR.NMIMD: 0 = falling edge, 1 = rising edge. */
+        edge = (icu->nmicr & R_NMICR_NMIMD_MASK) ? (!prev && level != 0)
+                                                 : (prev && level == 0);
+    } else {
+        edge = !prev && level != 0;
+    }
+    if (edge) {
+        icu->nmisr |= src == RXICU_NMI_PIN ? R_NMISR_NMIST_MASK :
+                      src == RXICU_NMI_OST ? 0x02 : 0x08;
+        rxicu_nmi_update(icu);
+    }
+}
+
+static void rxicu_nmi_pin(void *opaque, int n, int level)
+{
+    rxicu_nmi_input(opaque, RXICU_NMI_PIN, level);
+}
+
+static void rxicu_nmi_ostdi(void *opaque, int n, int level)
+{
+    rxicu_nmi_input(opaque, RXICU_NMI_OST, level);
+}
+
+static void rxicu_nmi_iwdt(void *opaque, int n, int level)
+{
+    rxicu_nmi_input(opaque, RXICU_NMI_IWDT, level);
+}
 
 static void set_irq(RXICUState *icu, int n_IRQ, int req)
 {
@@ -229,12 +286,27 @@ static uint64_t icu_read(void *opaque, hwaddr addr, unsigned size)
     case A_IRQCR ... A_IRQCR + 0x1f:
         return icu->src[64 + reg].sense << R_IRQCR_IRQMD_SHIFT;
     case A_NMISR:
+        return icu->nmi_rx113 ? icu->nmisr & RX113_NMI_BITS : 0;
     case A_NMICLR:
         return 0;
     case A_NMIER:
         return icu->nmier;
     case A_NMICR:
         return icu->nmicr;
+    case A_NMIFLTE:
+        if (icu->nmi_rx113) {
+            return icu->nmiflte;
+        }
+        qemu_log_mask(LOG_UNIMP, "rx_icu: Register 0x%" HWADDR_PRIX " "
+                                 "not implemented.\n", addr);
+        return UINT64_MAX;
+    case A_NMIFLTC:
+        if (icu->nmi_rx113) {
+            return icu->nmifltc;
+        }
+        qemu_log_mask(LOG_UNIMP, "rx_icu: Register 0x%" HWADDR_PRIX " "
+                                 "not implemented.\n", addr);
+        return UINT64_MAX;
     default:
         qemu_log_mask(LOG_UNIMP, "rx_icu: Register 0x%" HWADDR_PRIX " "
                                  "not implemented.\n",
@@ -296,16 +368,49 @@ static void icu_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
     case A_IRQCR ... A_IRQCR + 0x1f:
         icu->src[64 + reg].sense = val >> R_IRQCR_IRQMD_SHIFT;
         break;
+    case A_NMISR:
+        if (!icu->nmi_rx113) {
+            qemu_log_mask(LOG_UNIMP, "rx_icu: Register 0x%" HWADDR_PRIX " "
+                                     "not implemented.\n", addr);
+        }
+        break;
     case A_NMICLR:
+        if (icu->nmi_rx113) {
+            icu->nmiclr = val;
+            icu->nmisr &= ~(val & RX113_NMI_BITS);
+            rxicu_nmi_update(icu);
+        }
         break;
     case A_NMIER:
-        icu->nmier |= val & (R_NMIER_NMIEN_MASK |
-                             R_NMIER_LVDEN_MASK |
-                             R_NMIER_OSTEN_MASK);
+        if (icu->nmi_rx113) {
+            /* Every enable bit is set-once: writes only ever set. */
+            icu->nmier |= val & RX113_NMI_BITS;
+            rxicu_nmi_update(icu);
+        } else {
+            icu->nmier |= val & (R_NMIER_NMIEN_MASK |
+                                 R_NMIER_LVDEN_MASK |
+                                 R_NMIER_OSTEN_MASK);
+        }
         break;
     case A_NMICR:
         if ((icu->nmier & R_NMIER_NMIEN_MASK) == 0) {
             icu->nmicr = val & R_NMICR_NMIMD_MASK;
+        }
+        break;
+    case A_NMIFLTE:
+        if (icu->nmi_rx113) {
+            icu->nmiflte = val & R_NMIFLTE_NFLTEN_MASK;
+        } else {
+            qemu_log_mask(LOG_UNIMP, "rx_icu: Register 0x%" HWADDR_PRIX " "
+                                     "not implemented.\n", addr);
+        }
+        break;
+    case A_NMIFLTC:
+        if (icu->nmi_rx113) {
+            icu->nmifltc = val & R_NMIFLTC_NFCLKSEL_MASK;
+        } else {
+            qemu_log_mask(LOG_UNIMP, "rx_icu: Register 0x%" HWADDR_PRIX " "
+                                     "not implemented.\n", addr);
         }
         break;
     default:
@@ -369,9 +474,13 @@ static void rxicu_init(Object *obj)
 
     qdev_init_gpio_in(DEVICE(d), rxicu_set_irq, NR_IRQS);
     qdev_init_gpio_in_named(DEVICE(d), rxicu_ack_irq, "ack", 1);
+    qdev_init_gpio_in_named(DEVICE(d), rxicu_nmi_pin, "nmi-pin", 1);
+    qdev_init_gpio_in_named(DEVICE(d), rxicu_nmi_ostdi, "nmi-ostdi", 1);
+    qdev_init_gpio_in_named(DEVICE(d), rxicu_nmi_iwdt, "nmi-iwdt", 1);
     sysbus_init_irq(d, &icu->_irq);
     sysbus_init_irq(d, &icu->_fir);
     sysbus_init_irq(d, &icu->_swi);
+    sysbus_init_irq(d, &icu->_nmi);
 }
 
 static void rxicu_finalize(Object *obj)
@@ -381,11 +490,22 @@ static void rxicu_finalize(Object *obj)
     g_free(icu->ipr);
 }
 
+static int rxicu_post_load(void *opaque, int version_id)
+{
+    RXICUState *icu = opaque;
+
+    if (icu->nmi_rx113) {
+        rxicu_nmi_update(icu);
+    }
+    return 0;
+}
+
 static const VMStateDescription vmstate_rxicu = {
     .name = "rx-icu",
     /* Version 2 checks the configured count before loading IPR bytes. */
-    .version_id = 2,
+    .version_id = 3,
     .minimum_version_id = 2,
+    .post_load = rxicu_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT8_ARRAY(ir, RXICUState, NR_IRQS),
         VMSTATE_UINT8_ARRAY(dtcer, RXICUState, NR_IRQS),
@@ -399,6 +519,9 @@ static const VMStateDescription vmstate_rxicu = {
         VMSTATE_UINT8(nmier, RXICUState),
         VMSTATE_UINT8(nmiclr, RXICUState),
         VMSTATE_UINT8(nmicr, RXICUState),
+        VMSTATE_UINT8_V(nmiflte, RXICUState, 3),
+        VMSTATE_UINT8_V(nmifltc, RXICUState, 3),
+        VMSTATE_UINT8_ARRAY_V(nmi_in_level, RXICUState, 3, 3),
         VMSTATE_INT16(req_irq, RXICUState),
         VMSTATE_END_OF_LIST()
     }
@@ -410,6 +533,7 @@ static const Property rxicu_properties[] = {
                       qdev_prop_uint8, uint8_t),
     DEFINE_PROP_ARRAY("trigger-level", RXICUState, nr_sense, init_sense,
                       qdev_prop_uint8, uint8_t),
+    DEFINE_PROP_BOOL("nmi-rx113", RXICUState, nmi_rx113, false),
 };
 
 static void rxicu_class_init(ObjectClass *klass, const void *data)
