@@ -24,6 +24,48 @@
 
 #define LDTY_4SLICE     (3 << 2)
 #define LDTY_8SLICE     (5 << 2)
+#define LCDM0_LWAVE_B   0x20
+
+/* SYSTEM registers used by the clock tests (sections 9 and 11). */
+#define PRCR            0x803fe
+#define MSTPCRD         0x8001c
+#define LCDSCLKCR       0x80050
+#define LCDSCLKCR2      0x80051
+#define MSTPCRD_RUN     0xfffff7ff  /* LCDC module stop released (b11) */
+
+/* RTC registers used by the PRD test (section 24). */
+#define RTC_BASE        0x8c400
+#define RCR1            (RTC_BASE + 0x22)
+#define RCR2            (RTC_BASE + 0x24)
+#define RCR3            (RTC_BASE + 0x26)
+#define RYRCNT          (RTC_BASE + 0x0e)
+#define RMONCNT         (RTC_BASE + 0x0c)
+#define RDAYCNT         (RTC_BASE + 0x0a)
+
+/*
+ * Start a test machine with the LCDC module stop released; on real
+ * hardware the LCDC is stopped at reset (MSTPCRD b11 = 1) and guest
+ * software must release it before use, as the other RX113 tests do.
+ */
+static QTestState *lcdc_init(void)
+{
+    QTestState *qts = qtest_init("-M rx113-r5f51138");
+
+    qtest_writew(qts, PRCR, 0xa503);
+    qtest_writel(qts, MSTPCRD, MSTPCRD_RUN);
+    return qts;
+}
+
+static uint64_t lcdc_prop_int(QTestState *qts, const char *prop)
+{
+    QDict *rsp = qtest_qmp(qts,
+        "{'execute': 'qom-get', 'arguments': "
+        "{'path': '/machine/mcu/lcdc', 'property': %s}}", prop);
+    uint64_t val = qdict_get_int(rsp, "return");
+
+    qobject_unref(rsp);
+    return val;
+}
 
 static char *lcdc_prop(QTestState *qts, const char *prop)
 {
@@ -52,7 +94,7 @@ static void check_segments(QTestState *qts, const char *prop,
 
 static void test_reset(void)
 {
-    QTestState *qts = qtest_init("-M rx113-r5f51138");
+    QTestState *qts = lcdc_init();
     uint8_t zero[NR_SEG] = { 0 };
 
     g_assert_cmphex(qtest_readb(qts, LCDM0), ==, 0);
@@ -70,6 +112,9 @@ static void test_reset(void)
     qtest_writeb(qts, VLCD, 0x13);
     qtest_writeb(qts, SEG(3), 0xff);
     qtest_qmp_assert_success(qts, "{'execute': 'system_reset'}");
+    /* The reset also restores the module stop; release it again. */
+    qtest_writew(qts, PRCR, 0xa503);
+    qtest_writel(qts, MSTPCRD, MSTPCRD_RUN);
     g_assert_cmphex(qtest_readb(qts, LCDM0), ==, 0);
     g_assert_cmphex(qtest_readb(qts, VLCD), ==, 0x04);
     g_assert_cmphex(qtest_readb(qts, SEG(3)), ==, 0);
@@ -78,7 +123,7 @@ static void test_reset(void)
 
 static void test_registers(void)
 {
-    QTestState *qts = qtest_init("-M rx113-r5f51138");
+    QTestState *qts = lcdc_init();
 
     qtest_writeb(qts, LCDM0, 0xa5);
     g_assert_cmphex(qtest_readb(qts, LCDM0), ==, 0xa5);
@@ -106,7 +151,7 @@ static void test_registers(void)
 
 static void test_display_ram(void)
 {
-    QTestState *qts = qtest_init("-M rx113-r5f51138");
+    QTestState *qts = lcdc_init();
     uint8_t expected[NR_SEG];
 
     for (unsigned i = 0; i < NR_SEG; i++) {
@@ -122,7 +167,7 @@ static void test_display_ram(void)
 
 static void test_segment_state(void)
 {
-    QTestState *qts = qtest_init("-M rx113-r5f51138");
+    QTestState *qts = lcdc_init();
     uint8_t expected[NR_SEG] = { 0 };
     g_autofree char *str = NULL;
 
@@ -167,7 +212,7 @@ static void test_segment_state(void)
 
 static void test_8_slice(void)
 {
-    QTestState *qts = qtest_init("-M rx113-r5f51138");
+    QTestState *qts = lcdc_init();
     uint8_t expected[NR_SEG] = { 0 };
 
     qtest_writeb(qts, LCDM0, LDTY_8SLICE | 2);
@@ -182,7 +227,7 @@ static void test_8_slice(void)
 
 static void test_blink(void)
 {
-    QTestState *qts = qtest_init("-M rx113-r5f51138");
+    QTestState *qts = lcdc_init();
     uint8_t expected[NR_SEG] = { 0 };
 
     qtest_writeb(qts, LCDM0, LDTY_4SLICE | 1);
@@ -210,6 +255,155 @@ static void test_blink(void)
     qtest_quit(qts);
 }
 
+static void test_clock_registers(void)
+{
+    QTestState *qts = qtest_init("-M rx113-r5f51138");
+
+    /* Reset values (9.2.15, 9.2.16): source = LOCO, output stopped. */
+    g_assert_cmphex(qtest_readb(qts, LCDSCLKCR), ==, 0);
+    g_assert_cmphex(qtest_readb(qts, LCDSCLKCR2), ==, 1);
+    /* Both registers are PRC0-protected. */
+    qtest_writeb(qts, LCDSCLKCR, 3);
+    qtest_writeb(qts, LCDSCLKCR2, 0);
+    g_assert_cmphex(qtest_readb(qts, LCDSCLKCR), ==, 0);
+    g_assert_cmphex(qtest_readb(qts, LCDSCLKCR2), ==, 1);
+    /* Unlocked: reserved bits read as 0. */
+    qtest_writew(qts, PRCR, 0xa501);
+    qtest_writeb(qts, LCDSCLKCR, 0xff);
+    g_assert_cmphex(qtest_readb(qts, LCDSCLKCR), ==, 0x07);
+    qtest_writeb(qts, LCDSCLKCR2, 0xfe);
+    g_assert_cmphex(qtest_readb(qts, LCDSCLKCR2), ==, 0x00);
+    qtest_writeb(qts, LCDSCLKCR2, 0xff);
+    g_assert_cmphex(qtest_readb(qts, LCDSCLKCR2), ==, 0x01);
+    qtest_quit(qts);
+}
+
+/* Configure the manual's worked example: sub-clock, LCDCL = 256 Hz. */
+static void lcdc_setup_subclock(QTestState *qts)
+{
+    qtest_writeb(qts, LCDSCLKCR, 3);    /* sub-clock oscillator */
+    qtest_writeb(qts, LCDSCLKCR2, 0);   /* source clock output on */
+    qtest_writeb(qts, LCDC0, 0x06);     /* 32768 / 128 = 256 Hz */
+    qtest_writeb(qts, LCDM0, LDTY_4SLICE | 1);
+}
+
+static void test_frame_frequency(void)
+{
+    QTestState *qts = lcdc_init();
+
+    qtest_writeb(qts, LCDM0, LDTY_4SLICE | 1);
+    /* LCDSCLKSTP = 1 at reset stops the source clock: no frame rate. */
+    g_assert_cmpuint(lcdc_prop_int(qts, "frame-frequency"), ==, 0);
+    /* Figure 34.14's example: 256 Hz LCD clock, 4 slices -> 64 Hz. */
+    lcdc_setup_subclock(qts);
+    g_assert_cmpuint(lcdc_prop_int(qts, "frame-frequency"), ==, 64);
+    /* LOCO (4 MHz) uses the main-group table: code 15h divides by 4096. */
+    qtest_writeb(qts, LCDSCLKCR, 0);
+    qtest_writeb(qts, LCDC0, 0x15);
+    g_assert_cmpuint(lcdc_prop_int(qts, "frame-frequency"), ==, 244);
+    /* Code 06h is not in the main-group table: prohibited, no clock. */
+    qtest_writeb(qts, LCDC0, 0x06);
+    g_assert_cmpuint(lcdc_prop_int(qts, "frame-frequency"), ==, 0);
+    qtest_quit(qts);
+}
+
+static void test_scan(void)
+{
+    QTestState *qts = lcdc_init();
+    const char *lcdc = "/machine/mcu/lcdc";
+    /* Half an LCDCL period at 256 Hz. */
+    const int64_t half = 1953125;
+
+    lcdc_setup_subclock(qts);
+    qtest_writeb(qts, LCDM1, LCDM1_SCOC | LCDM1_LCDON);
+    g_assert_cmpuint(lcdc_prop_int(qts, "scan-slice"), ==, 0);
+    g_assert_false(qtest_qom_get_bool(qts, lcdc, "drive-phase"));
+    /* Waveform A inverts the drive phase every half period. */
+    qtest_clock_step(qts, half);
+    g_assert_cmpuint(lcdc_prop_int(qts, "scan-slice"), ==, 0);
+    g_assert_true(qtest_qom_get_bool(qts, lcdc, "drive-phase"));
+    qtest_clock_step(qts, half);
+    g_assert_cmpuint(lcdc_prop_int(qts, "scan-slice"), ==, 1);
+    g_assert_false(qtest_qom_get_bool(qts, lcdc, "drive-phase"));
+    /* The remaining three slices complete the frame. */
+    qtest_clock_step(qts, half * 6);
+    g_assert_cmpuint(lcdc_prop_int(qts, "scan-slice"), ==, 0);
+    g_assert_false(qtest_qom_get_bool(qts, lcdc, "drive-phase"));
+
+    /* Waveform B inverts the phase once per LCDCL period instead. */
+    qtest_writeb(qts, LCDM0, LDTY_4SLICE | 1 | LCDM0_LWAVE_B);
+    g_assert_false(qtest_qom_get_bool(qts, lcdc, "drive-phase"));
+    qtest_clock_step(qts, half);
+    g_assert_false(qtest_qom_get_bool(qts, lcdc, "drive-phase"));
+    qtest_clock_step(qts, half);
+    g_assert_true(qtest_qom_get_bool(qts, lcdc, "drive-phase"));
+    qtest_quit(qts);
+}
+
+static void test_stop(void)
+{
+    QTestState *qts = lcdc_init();
+    const int64_t half = 1953125;
+
+    lcdc_setup_subclock(qts);
+    qtest_writeb(qts, LCDM1, LCDM1_SCOC | LCDM1_LCDON);
+    qtest_clock_step(qts, half * 2);
+    g_assert_cmpuint(lcdc_prop_int(qts, "scan-slice"), ==, 1);
+
+    /* LCDSCLKSTP stops the source clock output: the scan freezes. */
+    qtest_writeb(qts, LCDSCLKCR2, 1);
+    g_assert_cmpuint(lcdc_prop_int(qts, "frame-frequency"), ==, 0);
+    qtest_clock_step(qts, half * 8);
+    g_assert_cmpuint(lcdc_prop_int(qts, "scan-slice"), ==, 1);
+    qtest_writeb(qts, LCDSCLKCR2, 0);
+    qtest_clock_step(qts, half * 2);
+    g_assert_cmpuint(lcdc_prop_int(qts, "scan-slice"), ==, 2);
+
+    /* Module stop: reads return 0, writes are dropped, state is held. */
+    qtest_writel(qts, MSTPCRD, 0xffffffff);
+    g_assert_cmphex(qtest_readb(qts, LCDM0), ==, 0);
+    qtest_writeb(qts, LCDM0, 0);
+    qtest_clock_step(qts, half * 4);
+    qtest_writel(qts, MSTPCRD, MSTPCRD_RUN);
+    g_assert_cmphex(qtest_readb(qts, LCDM0), ==, LDTY_4SLICE | 1);
+    g_assert_cmpuint(lcdc_prop_int(qts, "scan-slice"), ==, 2);
+    qtest_quit(qts);
+}
+
+static void test_prd_from_rtc(void)
+{
+    QTestState *qts = lcdc_init();
+    uint8_t expected[NR_SEG] = { 0 };
+    bool flipped = false;
+
+    qtest_writeb(qts, LCDM0, LDTY_4SLICE | 1);
+    qtest_writeb(qts, SEG(2), 0x61);    /* A: COM0, B: COM1 and COM2 */
+    qtest_writeb(qts, LCDM1, LCDM1_SCOC | LCDM1_LCDON | LCDM1_BLON);
+    expected[2] = 0x1;
+    check_segments(qts, "segments", expected);
+
+    /*
+     * Start the real RTC with the fastest periodic rate (PES = 0110b,
+     * 1/256 s); its PRD output is wired to the LCDC blink input.
+     */
+    qtest_writeb(qts, RCR2, 0x40);
+    qtest_writeb(qts, RYRCNT, 0x24);
+    qtest_writeb(qts, RMONCNT, 0x01);
+    qtest_writeb(qts, RDAYCNT, 0x01);
+    qtest_writeb(qts, RCR1, 0x64);      /* PES = 0110b, PIE = 1 */
+    qtest_writeb(qts, RCR3, 0x01);      /* RTCEN */
+    qtest_writeb(qts, RCR2, 0x41);      /* START */
+    for (unsigned i = 0; i < 20 && !flipped; i++) {
+        qtest_clock_step(qts, 1000000);
+        flipped = qtest_qom_get_bool(qts, "/machine/mcu/lcdc",
+                                      "blink-phase");
+    }
+    g_assert_true(flipped);
+    expected[2] = 0x6;
+    check_segments(qts, "segments", expected);
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -219,5 +413,10 @@ int main(int argc, char **argv)
     qtest_add_func("/rx113-lcdc/segment-state", test_segment_state);
     qtest_add_func("/rx113-lcdc/8-slice", test_8_slice);
     qtest_add_func("/rx113-lcdc/blink", test_blink);
+    qtest_add_func("/rx113-lcdc/clock-registers", test_clock_registers);
+    qtest_add_func("/rx113-lcdc/frame-frequency", test_frame_frequency);
+    qtest_add_func("/rx113-lcdc/scan", test_scan);
+    qtest_add_func("/rx113-lcdc/stop", test_stop);
+    qtest_add_func("/rx113-lcdc/prd-from-rtc", test_prd_from_rtc);
     return g_test_run();
 }

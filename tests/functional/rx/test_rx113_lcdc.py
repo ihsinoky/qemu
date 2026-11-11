@@ -30,8 +30,14 @@ class RX113Lcdc(QemuSystemTest):
         return bytes([0xf9, 0x14, offset, value])
 
     def program(self):
+        # Release the LCDC module stop first, as on real hardware
+        # (MSTPCRD b11 is set at reset). Hand-assembled, verified with
+        # rx-elf-objdump:
+        #   mov.l #0x803fe,r1; mov.w #0xa503,[r1]   (PRCR: unlock)
+        #   mov.l #0x8001c,r1; mov.l #0xfffff7ff,r2; mov.l r2,[r1]
+        code = bytes.fromhex('fb1efe0308f81903a5fb1e1c0008fb2afff7e312')
         # mov.l #LCDC_BASE,r1
-        code = b'\xfb\x12' + struct.pack('<I', self.LCDC_BASE)
+        code += b'\xfb\x12' + struct.pack('<I', self.LCDC_BASE)
         # 4-time slice (LDTY = 3), 1/3 bias (LBAS = 1), waveform A, MDSET = 0
         code += self.store(self.LCDM0, 0x0d)
         for seg, value in self.PATTERN.items():
