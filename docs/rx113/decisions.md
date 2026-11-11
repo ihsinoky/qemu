@@ -216,3 +216,19 @@ is invented. Pending transactions keep their existing snapshot
 ordering. This follows the implement-by-default principle (D-006)
 and is an emulation convention, not a claim about hardware
 behaviour.
+
+## D-017: Oscillator-stop detection follows the IWDT NMI precedent
+
+Section 9.5.2 couples oscillator-stop detection (SYSTEM OSTDCR/
+OSTDSR) to two outputs: notification to POE and the non-maskable
+OSTDI interrupt. The shared ICU and RX CPU have no NMI input or
+delivery path, the same gap recorded for the IWDT underflow (WUNI)
+in Issue #27. Scope decision, chosen by the PO at the Issue #49
+stage 3 audit stop from the PMO's options: implement POE completely
+on the RX113 side, including OSTDCR/OSTDSR, detection, the POE
+notification, cutoff and release. The OSTDI request is generated at
+the SYSTEM/ICU boundary but not delivered to the CPU, exactly as
+with WUNI, and this limitation is stated in the report. Full NMI
+delivery (shared ICU/CPU work, estimated 2-4 days with RX62N
+regression review) remains a separate cross-cutting theme and is
+not folded into Issue #49.
