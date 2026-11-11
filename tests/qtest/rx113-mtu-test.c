@@ -1678,6 +1678,152 @@ static void test_complementary_arbitration(void)
     }
 }
 
+/* D-015: the two counters reach each duty on different carrier edges. */
+static void test_complementary_duty_irq(void)
+{
+    static const unsigned channels[] = { 3, 3, 3, 4, 4, 4, 4 };
+    static const unsigned regs[] = { 1, 2, 3, 0, 1, 2, 3 };
+    static const unsigned duties[] = { 4, 14, 4, 6, 8, 6, 8 };
+
+    for (unsigned md = 13; md <= 15; md++) {
+        for (unsigned buffers = 0; buffers < 4; buffers++) {
+            QTestState *qts = mtu_init();
+
+            complementary_setup(qts, md);
+            qtest_writeb(qts, BASE + mode[3], md | (buffers << 4));
+            qtest_writeb(qts, BASE + tier[3], 15);
+            qtest_writeb(qts, BASE + tier[4], 15);
+            /* Skipping affects crest/trough only, never duty or C/D. */
+            qtest_writeb(qts, BASE + 0x30, 0x99);
+            qtest_writeb(qts, START, 0xc0);
+            for (unsigned edge = 1; edge <= 72; edge++) {
+                unsigned t = (edge - 1) % 24;
+                unsigned triangle = t <= 12 ? t : 24 - t;
+
+                qtest_clock_step(qts, 124);
+                for (unsigned i = 0; i < ARRAY_SIZE(channels); i++) {
+                    g_assert_cmpuint(qtest_readb(qts,
+                                     IR(vector[channels[i]] + regs[i])), ==, 0);
+                }
+                qtest_clock_step(qts, 1);
+                for (unsigned i = 0; i < ARRAY_SIZE(channels); i++) {
+                    unsigned ch = channels[i], gr = regs[i];
+                    unsigned counter = triangle + (ch == 3 ? 2 : 0);
+                    bool enabled = gr < 2 || (buffers & (1 << (gr - 2)));
+                    bool match = enabled && counter == duties[i];
+
+                    g_test_message("mode %u buffers %u edge %u ch %u gr %u",
+                                   md, buffers, edge, ch, gr);
+                    g_assert_cmpuint(qtest_readb(qts, IR(vector[ch] + gr)),
+                                     ==, match);
+                    qtest_writeb(qts, IR(vector[ch] + gr), 0);
+                }
+                /* Explicitly distinguish U's own counter from MTU4. */
+                if (edge == 3 || edge == 23) {
+                    g_assert_cmpuint(triangle + 2, ==, 4);
+                } else if (edge == 5 || edge == 21) {
+                    g_assert_cmpuint(triangle, ==, 4);
+                    g_assert_cmpuint(triangle + 2, !=, 4);
+                }
+            }
+            qtest_quit(qts);
+        }
+    }
+}
+
+/* Figures 20.47/48: suppressed active turn-ons still request (D-015). */
+static void test_complementary_duty_pending(void)
+{
+    for (unsigned trough = 0; trough < 2; trough++) {
+        for (unsigned both = 0; both < 2; both++) {
+            QTestState *qts = mtu_init();
+            unsigned md = both ? 15 : trough ? 14 : 13;
+            unsigned old = trough ? 3 : 11;
+            unsigned next = trough ? 0 : 14;
+
+            complementary_setup(qts, md);
+            qtest_writeb(qts, BASE + mode[3], 0);
+            qtest_writew(qts, BASE + tgr[3][3], old);
+            qtest_writew(qts, BASE + tgr[4][2], old);
+            qtest_writew(qts, BASE + tgr[4][3], old);
+            qtest_writeb(qts, BASE + mode[3], 0x30 | md);
+            complementary_pads(qts);
+            qtest_writeb(qts, BASE + tier[3], 2);
+            qtest_writeb(qts, BASE + tier[4], 3);
+            qtest_writeb(qts, START, 0xc0);
+            for (unsigned edge = 1; edge <= 60; edge++) {
+                unsigned active = qtest_readw(qts, BASE + tgr[3][1]);
+                unsigned c3 = qtest_readw(qts, BASE + count[3]);
+                unsigned c4 = qtest_readw(qts, BASE + count[4]);
+
+                qtest_clock_step(qts, 125);
+                g_assert_cmpuint(qtest_readb(qts, IR(130)), ==, c3 == active);
+                g_assert_cmpuint(qtest_readb(qts, IR(134)), ==, c4 == active);
+                g_assert_cmpuint(qtest_readb(qts, IR(135)), ==, c4 == active);
+                if (edge == (trough ? 17 : 5)) {
+                    qtest_writew(qts, BASE + tgr[3][3], next);
+                    qtest_writew(qts, BASE + tgr[4][2], next);
+                    qtest_writew(qts, BASE + tgr[4][3], next);
+                }
+                if (edge == (trough ? 24 : 13)) {
+                    /* The temporary value is selected by waveform logic. */
+                    g_assert_cmpuint(active, ==, old);
+                    g_assert_cmpuint(qtest_readb(qts, IR(130)), ==, trough);
+                    if (trough) {
+                        /* Old negative turn-on is canceled by new turn-off. */
+                        assert_complementary_pads(qts, 0, 0, false);
+                    }
+                }
+                if (trough && edge == 25) {
+                    /* MTU4=0 matches temporary duty, but active duty is 3. */
+                    g_assert_cmpuint(active, ==, 3);
+                    g_assert_cmpuint(qtest_readb(qts, IR(134)), ==, 0);
+                    g_assert_cmpuint(qtest_readb(qts, IR(135)), ==, 0);
+                }
+                qtest_writeb(qts, IR(130), 0);
+                qtest_writeb(qts, IR(134), 0);
+                qtest_writeb(qts, IR(135), 0);
+            }
+            qtest_quit(qts);
+        }
+    }
+}
+
+/* Every new raw source reaches ELC even with its TIER bit clear. */
+static void test_complementary_duty_elc(void)
+{
+    static const unsigned sources[] = { 0x11, 0x12, 0x13,
+                                        0x15, 0x16, 0x17, 0x18 };
+    static const unsigned channels[] = { 3, 3, 3, 4, 4, 4, 4 };
+    static const unsigned regs[] = { 1, 2, 3, 0, 1, 2, 3 };
+    static const unsigned duties[] = { 4, 14, 4, 6, 8, 6, 8 };
+
+    for (unsigned i = 0; i < ARRAY_SIZE(sources); i++) {
+        QTestState *qts = mtu_init();
+
+        complementary_setup(qts, 15);
+        qtest_writel(qts, 0x80014, 0xffffffff & ~(1U << 9));
+        qtest_writeb(qts, 0x8b102, sources[i]); /* ELSR1 -> MTU1 start. */
+        qtest_writeb(qts, 0x8b11f, 0xf3);
+        qtest_writeb(qts, 0x8b100, 0x80);
+        qtest_writeb(qts, START, 0xc0);
+        for (unsigned edge = 1; edge <= 48; edge++) {
+            unsigned t = (edge - 1) % 24;
+            unsigned triangle = t <= 12 ? t : 24 - t;
+            bool match = triangle + (channels[i] == 3 ? 2 : 0) == duties[i];
+
+            qtest_clock_step(qts, edge == 1 ? 125 : 93);
+            g_assert_cmpuint(qtest_readb(qts,
+                             IR(vector[channels[i]] + regs[i])), ==, 0);
+            qtest_clock_step(qts, 32); /* Deliver ELC on the next PCLKB. */
+            g_assert_cmpuint(qtest_readb(qts, START), ==,
+                             match ? 0xc2 : 0xc0);
+            qtest_writeb(qts, START, 0xc0);
+        }
+        qtest_quit(qts);
+    }
+}
+
 static void test_complementary_polarity(void)
 {
     QTestState *qts = mtu_init();
@@ -2857,6 +3003,12 @@ int main(int argc, char **argv)
                         GUINT_TO_POINTER(0), test_tgcr);
     qtest_add_func("/rx113-mtu/complementary-arbitration",
                    test_complementary_arbitration);
+    qtest_add_func("/rx113-mtu/complementary-duty-irq",
+                   test_complementary_duty_irq);
+    qtest_add_func("/rx113-mtu/complementary-duty-pending",
+                   test_complementary_duty_pending);
+    qtest_add_func("/rx113-mtu/complementary-duty-elc",
+                   test_complementary_duty_elc);
     qtest_add_func("/rx113-mtu/complementary-polarity",
                    test_complementary_polarity);
     qtest_add_func("/rx113-mtu/complementary-waveform",

@@ -2,6 +2,105 @@
 SPDX-License-Identifier: GPL-2.0-or-later
 -->
 
+# Issue 49: RX113 MTU advanced output — stage 2b duty requests
+
+## Current delivery (2026-11-11)
+
+D-015 duty-interrupt wiring is implemented. **Stage 2b is complete.**
+Stage 3 (POE) was not started; Issue #49 as a whole remains open.
+The earlier delivery records below are historical, including their
+superseded duty-request audit stops. D-015 resolves that audit's policy
+question; this delivery implements the recorded emulation convention,
+without claiming that the manual uniquely specifies the sources.
+
+Base: `e5dfb71377dc98bea9eb1eaa480a0221b2d68df7`.
+Branch: `rx113/issue-49-mtu-advanced`.
+Delivery: uncommitted working-tree changes and
+`.issue49-runtime/issue49-stage2b7-duty.patch`.
+No commit, merge, push, PR or upstream submission was performed.
+RX62N and `docs/rx113/decisions.md` are unchanged.
+
+### Implementation and distinguishing cases
+
+Complementary count edges evaluate requests before counter movement,
+direction changes and temporary-to-active transfers. TGIB3 uses only
+MTU3.TCNT against active MTU3.TGRB; TGIA4/TGIB4 use only MTU4.TCNT
+against their active MTU4 registers. Neither TCNTS nor temporary-bank
+waveform comparisons request duty interrupts. Waveform arbitration does
+not gate requests. The existing request helper supplies TIER gating and
+raw ELC events. Buffered C/D comparisons use their owning counters and
+stored C/D values when selected by MTU3.BFA/BFB, including MTU4 whose
+own buffer bits remain zero. A C/D buffer comparison is distinct from
+a comparison against the internal temporary bank.
+
+The unavailable-duty diagnostic is removed. Crest TGIA3, trough TCIV4,
+TITCR skipping and reset-synchronized PWM's section 20.6.15 suppression
+retain their existing paths. No register layout or migration state changes.
+Authority: D-015 and the supplied Rev.1.20 manual, section 20, especially
+20.3.8, 20.4.1, 20.6.14 and 20.6.15.
+
+Three new qtests cover:
+
+* Modes 13/14/15, all four BFA/BFB combinations, both directions and
+  three carrier cycles with TDDR=2 and half-period 12. The U duty of 4
+  requests TGIB3 at edges 3 and 23, with no request at 5 or 21.
+  V/W requests use MTU4 alone, as do its selected C/D compares.
+  Every edge also checks for early requests at edge time minus 1 ns.
+  Enabled TITCR skipping does not suppress duty or C/D requests.
+* Crest/trough temporary updates in one-boundary and both-boundary
+  modes. With old duty 11 and pending duty 14, edge 13 does not request
+  TGIB3. With old duty 3 and pending duty 0, edge 24 still requests
+  TGIB3 while the canceled negative turn-on leaves all six pads low;
+  edge 25 does not request TGIA4/TGIB4 against temporary duty 0.
+  Requests are checked against the pre-edge active bank through transfer.
+* All seven new duty/C/D ELC sources start MTU1 on only the owning
+  counter's match, with TIER disabled, over two carrier cycles.
+
+### Validation
+
+* RX-only rebuild with `make -C build -j$(nproc)`: pass. The MTU qtest
+  binary was also rebuilt before testing.
+* All three new targeted qtests: pass.
+* RX qtest/functional regression: 32 suites passed, four standard skips,
+  zero failures; all 75 MTU subtests passed in 174.55 seconds.
+* Thorough gdbsim functional suite: pass. Both RX62N gdbsim machines
+  remain listed and pass the three-second QMP running-state smoke check.
+* Existing FIT PLL and HOCO boot/reset probes: pass. SYSTEM virtual-time
+  checks with and without the FIT ELF: pass.
+* Checkpatch on both changed C files and the delivered patch: zero errors,
+  zero warnings. The raw diff uses `--no-signoff` because no commit or
+  author certification is being created. `git diff --check`: pass.
+* Forward/reverse patch dry runs and byte-for-byte reproduction: pass.
+  QEMU and MTU-test binary hashes match those recorded before regression.
+  Only the RX113 MTU, its qtest and this report differ from the base.
+
+Evidence under `.issue49-runtime/`:
+`stage2b7-build.log`, `stage2b7-test-build.log`,
+`stage2b7-duty-{irq,pending,elc}.log`, `stage2b7-regression.log`,
+`stage2b7-gdbsim-functional.log`, `stage2b7-fit-{pll,hoco}.log`,
+`stage2b7-system{,-elf}.log`, `stage2b7-machine-help.log`,
+`stage2b7-gdbsim-smoke.{json,log}`, `stage2b7-checkpatch-{files,patch}.log`,
+`stage2b7-regression-binary.sha256` and `stage2b7-patch-validation.log`.
+
+Reproduce the full regression with
+`bash .issue49-runtime/stage2b7-regression.sh`.
+The environment places meson/ninja first on PATH and all scratch in
+`.issue49-runtime/.t`; generic socket suites use the existing `.s49`
+alias to that directory. No subprojects were fetched.
+
+Patch verification:
+`python3 .issue49-runtime/stage2b7-validate-patch.py`.
+This checks forward/reverse dry runs against the base above, verifies
+forward application reproduces the delivered files byte for byte, and
+verifies reversal restores the base bytes. The patch SHA256 is recorded
+in `.issue49-runtime/issue49-stage2b7-duty.patch.sha256`.
+
+## Historical delivery records
+
+<!--
+SPDX-License-Identifier: GPL-2.0-or-later
+-->
+
 # Issue 49: RX113 MTU advanced output — stage 2b8 TWCR and reset PWM TGCR
 
 ## Current delivery (2026-11-11)

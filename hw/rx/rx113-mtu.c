@@ -731,6 +731,19 @@ static unsigned mtu_complementary_tick(RX113MTUState *s)
             s->region = MTU_TB2_UP;
         }
     }
+    /* D-015: requests use each channel's counter, before any transfer. */
+    for (unsigned n = 3; n <= 4; n++) {
+        RX113MTUChannel *c = &s->ch[n];
+
+        for (unsigned gr = n == 3 ? 1 : 0; gr < 4; gr++) {
+            if (gr >= 2 && !(c3->mode & (0x10 << (gr - 2)))) {
+                continue;
+            }
+            if (c->count == c->tgr[gr]) {
+                mtu_match(s, n, gr);
+            }
+        }
+    }
     mtu_complementary_output(s);
     switch (s->region) {
     case MTU_TB1_DOWN:
@@ -1555,9 +1568,6 @@ static void mtu_write(void *opaque, hwaddr addr, uint64_t value, unsigned size)
             mtu_complementary_snapshot(s);
             mtu_complementary_transfer(s, true);
             mtu_complementary_restart(s);
-            qemu_log_mask(LOG_UNIMP,
-                          "rx113-mtu: complementary PWM "
-                          "duty interrupts unavailable\n");
         }
         c->phase = 0;
         if (n == 3 && mtu_reset_pwm(s)) {
