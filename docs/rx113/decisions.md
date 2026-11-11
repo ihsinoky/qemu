@@ -401,3 +401,27 @@ Points settled by the PMO under the issue instruction:
   four segment numbers are not outputs at all (34.8 (2)).
 - VL1 to VL4 and CAPH/CAPL share PSEL = 24 but are analog power
   pins; they stay unmodelled, as before.
+
+## D-024: SCI synchronous transmission design (Issue #65 stage 1)
+
+Points settled by the PMO under the issue instruction; stage 2
+(RXD sampling) will extend this record.
+
+- A synchronous frame rides the model's existing transfer timing,
+  as the asynchronous waveform does (Issue #50): one synchronous
+  bit lasts one model slot (trtime / slots, the Issue #10 baud
+  formula included), and the pending-byte slot chains frames with
+  no idle gap.
+- SCK is generated from the same bit timer in half-bit phases:
+  low for the first half of a bit (TXD changes on the falling
+  edge), high for the second half (receivers sample on the rising
+  edge), idle high outside frames, and TXD holds the last bit
+  after a frame (section 28.5).
+- The clock source follows section 28.2.6 literally: SCR.CKE
+  bit 1 = 0 is the internal clock (SCK is an output); bit 1 = 1
+  is an external clock. A synchronous frame on an external clock
+  is not serialized in stage 1, because it advances on SCK input
+  edges; the input path arrives with RXD sampling in stage 2.
+- The PORT SCK map (Tables 19.3 to 19.16, PSEL 10/11/12) uses
+  the TXD channel order, so one signal-index table in rx113.c
+  serves both.
