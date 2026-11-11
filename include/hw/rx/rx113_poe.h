@@ -21,7 +21,6 @@ struct RX113POEState {
     qemu_irq irq[2];
     uint16_t regs[8], seen[8];
     uint8_t locks, previous, high, samples[5];
-    bool ostste_used;
     uint8_t stop_cycles;
     uint32_t cycles;
     uint64_t hz, fraction;

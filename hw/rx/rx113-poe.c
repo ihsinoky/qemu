@@ -239,15 +239,8 @@ static void poe_write(void *opaque, hwaddr addr, uint64_t value, unsigned size)
         once = 0x70;
         break;
     case ICSR3:
-        /* D-018: one set, unconditional clear, no subsequent set. */
-        if (mask & 0x200) {
-            if (!(val & 0x200)) {
-                s->regs[reg] &= ~0x200;
-            } else if (!s->ostste_used) {
-                s->regs[reg] |= 0x200;
-                s->ostste_used = true;
-            }
-        }
+        /* D-020 (supersedes D-018): OSTSTE is strictly write-once. */
+        once = 0x200;
         break;
     }
     /* The two ICSR2 fields can be programmed through separate byte writes. */
@@ -312,7 +305,6 @@ static void poe_reset_hold(Object *obj, ResetType type)
     memset(s->seen, 0, sizeof(s->seen));
     memset(s->samples, 0, sizeof(s->samples));
     s->locks = s->stop_cycles = s->cycles = 0;
-    s->ostste_used = false;
     s->previous = s->high = 0x1f;
     s->fraction = 0;
     s->last_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
@@ -329,7 +321,7 @@ static int poe_post_load(void *opaque, int version_id)
 
 static const VMStateDescription vmstate_poe = {
     .name = TYPE_RX113_POE,
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .post_load = poe_post_load,
     .fields = (const VMStateField[]) {
@@ -339,7 +331,6 @@ static const VMStateDescription vmstate_poe = {
         VMSTATE_UINT8(previous, RX113POEState),
         VMSTATE_UINT8(high, RX113POEState),
         VMSTATE_UINT8_ARRAY(samples, RX113POEState, 5),
-        VMSTATE_BOOL(ostste_used, RX113POEState),
         VMSTATE_UINT8(stop_cycles, RX113POEState),
         VMSTATE_UINT32(cycles, RX113POEState),
         VMSTATE_UINT64(hz, RX113POEState),
