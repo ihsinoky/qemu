@@ -12,6 +12,7 @@
 #include "hw/core/qdev-properties.h"
 #include "hw/rx/rx113_port.h"
 #include "hw/rx/rx113_elc.h"
+#include "hw/rx/rx113_lcdc.h"
 #include "hw/rx/rx113_mtu.h"
 #include "hw/rx/rx113_poe.h"
 #include "migration/vmstate.h"
@@ -203,6 +204,131 @@ static int txd_signal(unsigned name, unsigned psel)
     return -1;
 }
 
+/*
+ * Tables 19.3 to 19.16: the LCDC pin functions use PSEL=24
+ * (Issue #63). Four Port B pads carry both a common and a segment
+ * function; the LCDC pad state decides which one a pad drives
+ * (in 8-time-slice mode SEG11-SEG13 and SEG15 are not segment
+ * outputs, section 34.8 (2)).
+ */
+static int lcd_com_signal(unsigned name, unsigned psel)
+{
+    if (psel != 24) {
+        return -1;
+    }
+    switch (name) {
+    case 0xc5:
+        return 0;
+    case 0xc4:
+        return 1;
+    case 0xc3:
+        return 2;
+    case 0xc2:
+        return 3;
+    case 0xb7:
+        return 4;
+    case 0xb6:
+        return 5;
+    case 0xb5:
+        return 6;
+    case 0xb3:
+        return 7;
+    default:
+        return -1;
+    }
+}
+
+static int lcd_seg_signal(unsigned name, unsigned psel)
+{
+    if (psel != 24) {
+        return -1;
+    }
+    switch (name) {
+    case 0x13:
+        return 0;
+    case 0x12:
+        return 1;
+    case 0x11:
+        return 2;
+    case 0x10:
+        return 3;
+    case 0x56:
+        return 4;
+    case 0x53:
+        return 5;
+    case 0x52:
+        return 6;
+    case 0x51:
+        return 7;
+    case 0x50:
+        return 8;
+    case 0xc1:
+        return 9;
+    case 0xc0:
+        return 10;
+    case 0xb7:
+        return 11;
+    case 0xb6:
+        return 12;
+    case 0xb5:
+        return 13;
+    case 0xb4:
+        return 14;
+    case 0xb3:
+        return 15;
+    case 0xb2:
+        return 16;
+    case 0xb1:
+        return 17;
+    case 0xa7:
+        return 18;
+    case 0xa5:
+        return 19;
+    case 0xa4:
+        return 20;
+    case 0xa3:
+        return 21;
+    case 0xa2:
+        return 22;
+    case 0xa1:
+        return 23;
+    case 0xa0:
+        return 24;
+    case 0xf7:
+        return 25;
+    case 0xf6:
+        return 26;
+    case 0xe5:
+        return 27;
+    case 0xe4:
+        return 28;
+    case 0xe3:
+        return 29;
+    case 0xe2:
+        return 30;
+    case 0xe1:
+        return 31;
+    case 0xe0:
+        return 32;
+    case 0xe7:
+        return 33;
+    case 0xe6:
+        return 34;
+    case 0xd4:
+        return 35;
+    case 0xd3:
+        return 36;
+    case 0xd2:
+        return 37;
+    case 0xd1:
+        return 38;
+    case 0xd0:
+        return 39;
+    default:
+        return -1;
+    }
+}
+
 /* Tables 19.3-19.14: RTCOUT uses PSEL=7 on these pads (Issue #50). */
 static bool rtcout_pad(unsigned name, unsigned psel)
 {
@@ -331,6 +457,14 @@ static void port_update(RX113PortState *s, bool notify)
     uint8_t irq_levels = 0;
     bool cacref = false;
     uint8_t feedback = 0, mtic5 = 0;
+    uint8_t lcd_com_level = 0, lcd_com_drive = 0;
+    uint64_t lcd_seg_level = 0, lcd_seg_drive = 0;
+
+    if (s->lcdc) {
+        /* The LCDC scan is projected lazily; pull the pad state. */
+        rx113_lcdc_pad_state(s->lcdc, &lcd_com_level, &lcd_com_drive,
+                             &lcd_seg_level, &lcd_seg_drive);
+    }
 
     memset(s->levels, 0, sizeof(s->levels));
     memset(s->driving, 0, sizeof(s->driving));
@@ -382,6 +516,21 @@ static void port_update(RX113PortState *s, bool notify)
                             drive = s->rtcout_oe;
                             output = drive;
                             level = s->rtcout_level;
+                        } else if ((pfs & PSEL) == 24) {
+                            int com = lcd_com_signal(name, pfs & PSEL);
+                            int seg = lcd_seg_signal(name, pfs & PSEL);
+
+                            if (com >= 0 &&
+                                (lcd_com_drive >> com) & 1) {
+                                drive = true;
+                                output = true;
+                                level = (lcd_com_level >> com) & 1;
+                            } else if (seg >= 0 &&
+                                       (lcd_seg_drive >> seg) & 1) {
+                                drive = true;
+                                output = true;
+                                level = (lcd_seg_level >> seg) & 1;
+                            }
                         }
                     }
                 }
@@ -732,6 +881,10 @@ static char *port_levels(Object *obj, Error **errp)
     RX113PortState *s = RX113_PORT(obj);
     GString *str = g_string_new(NULL);
 
+    /* Refresh first: pulled sources (the LCDC scan) move with time. */
+    port_update(s, false);
+
+
     for (unsigned i = 0; i < RX113_PORT_COUNT; i++) {
         g_string_append_printf(str, "%02x", s->levels[i]);
     }
@@ -742,6 +895,9 @@ static char *port_driving(Object *obj, Error **errp)
 {
     RX113PortState *s = RX113_PORT(obj);
     GString *str = g_string_new(NULL);
+
+    port_update(s, false);
+
 
     for (unsigned i = 0; i < RX113_PORT_COUNT; i++) {
         g_string_append_printf(str, "%02x", s->driving[i]);
@@ -793,6 +949,8 @@ static const VMStateDescription vmstate_port = {
 
 static const Property port_properties[] = {
     DEFINE_PROP_UINT32("package-pins", RX113PortState, package_pins, 100),
+    DEFINE_PROP_LINK("lcdc", RX113PortState, lcdc, TYPE_RX113_LCDC,
+                     DeviceState *),
 };
 
 static void port_realize(DeviceState *dev, Error **errp)
