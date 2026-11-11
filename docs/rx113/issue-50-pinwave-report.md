@@ -104,10 +104,115 @@ destination). All pass; full rx qtest regression is green
   in the experiment plan (Issue #49: 8+ runs, 92 MTU/POE subtests,
   weekly quota 19%→3% plus a reset credit).
 
-## Remaining (Stage 2 and later)
+## Remaining (later)
 
-- Stage 2 (separate go): SCI TXD waveform on the shared SCI model
-  (opt-in output under the D-007 condition), including MPC PSEL
-  entries for TXD pads and PORT mux support.
 - Out of scope, unchanged: LCDC pin waveforms, NMI delivery, RXD
   input sampling, the shared SCI model's known quirks.
+
+## Stage 2: SCI TXD waveform on the shared model
+
+Worker: Muse (Wonder) under the experiment, on
+`rx113/issue-50-stage2-scitxd` from `rx113/dev` tip 977a047ba7.
+Implemented 2026-11-11 in one run.
+
+### Design: the waveform rides the model's transfer timing
+
+- The shared SCI model (hw/char/renesas_sci.c) gains an opt-in
+  `has-output` bool property (default off). With it off, no new code
+  path executes and no VMState subsection is emitted, so RX62N
+  behaviour is unchanged (the D-007 condition, same pattern as the
+  TMR output in Stage 1). RX113 sets it for all eight channels.
+- A bit engine serializes each transmitted byte onto new GPIO outputs
+  `txd` (level) and `txd-oe` (driven while SCR.TE=1 and the module is
+  running). A frame starts exactly when the model's existing
+  send_byte() runs: on a TDR write while idle, or for a queued byte
+  when the previous transfer deadline expires. The backend delivery
+  instant, TDRE/TEND timing and the known quirks (the update_trtime
+  baud formula, immediate delivery) are untouched.
+- Bit time: update_trtime()'s slot count (data + parity + STOP + 1)
+  does not include the start bit, so one slot is exactly one bit time
+  of the model's baud generator, while a serialized frame has one
+  more bit than the slot count. Consequence: TEND asserts at trtime,
+  one bit before the pad frame ends. A byte handed over while the
+  previous frame is still on the pad waits in a pending slot and
+  follows with no idle gap (the TSR-behind-TDR relationship), so
+  back-to-back frames show a full stop bit. This reading is forced by
+  the model's own arithmetic and is recorded here rather than
+  silently harmonized.
+- Frame content (Section 28): start bit (low), data bits LSB first
+  (MSB first with SCMR.SDIR), parity when SMR.PE (even/odd per SMR.PM,
+  computed over the data bits), the MPBT bit in multiprocessor mode,
+  1-2 stop bits (SMR.STOP). SCMR.SINV inverts the data bits only,
+  per the manual's SCMR note. 7-bit data with SMR.CHR.
+- Bit deadlines chain from the previous deadline rather than the
+  callback time, so a stepped (qtest) clock cannot stretch the frame.
+- TE falling mid-frame aborts the frame and releases the pad; module
+  stop releases the pad and freezes the engine via the existing
+  clock bookkeeping (tx_bit_remaining in input-clock cycles, the
+  same mechanism as the frame timer), resuming on restart.
+- Clock-synchronous mode (SMR.CM) has no start/stop framing: the pad
+  is driven (TE) at idle level but the data is not serialized.
+  Recorded as a limitation of this stage.
+- VMState: new `renesas-sci/output` subsection (needed only when
+  has-output) with the shift byte, bit position, frame/slot counts,
+  the pending byte, the current bit's remaining cycles, the current
+  deadline and the bit timer. The level itself is re-pushed on
+  post-load.
+
+### PORT and board
+
+- rx113-port learns the TXD function map from Tables 19.3-19.16
+  (20 pad assignments over PSEL 10/11/12/23 for TXD0/1/2/5/6/8/9/12),
+  a `txd` GPIO input bank (8 levels + 8 output-enables) resolved
+  after TMO in the peripheral mux, and the PMR "unavailable" log
+  exemption. VMState version 6 adds the two TXD masks.
+- rx113.c sets `has-output` on every SCI and wires each channel to
+  its PORT signal (unit order SCI0, 1, 2, 5, 6, 12, 8, 9 maps to
+  signals TXD0, 1, 2, 5, 6, 12, 8, 9).
+
+### Verification
+
+- New suite tests/qtest/rx113-sci-txd-test.c, 5 subtests, all
+  passing: a bit-by-bit 8N1 frame of 0x55 on SCI1/P16 sampled at
+  mid-bit; TE and module-stop release on both TXD0 pads (P10,
+  PB7); 7-bit + even parity and MSB-first order on SCI12/P14; a
+  queued byte starting its frame at the previous frame's end with
+  no idle gap; migration mid-frame (bit position, driven level and
+  completion all continue on the destination).
+- Full RX regression (author side): 18 suites, 465 subtests,
+  0 failures, including rx113-sci-test (backend order, MSTP and
+  clock behaviour of the shared model) and the Stage 1 suites.
+  `-M help` lists all machines; checkpatch reports 0 errors and
+  0 warnings on every touched file.
+- Independent re-run requested from the main side for: the new
+  rx113-sci-txd suite, rx113-sci-test, rx113-port-test,
+  rx113-tmr-test and rx113-clock-test (RX62N invariance evidence:
+  the gdbsim machine is covered by the unchanged-code-path argument
+  plus the full regression; no RX62N-specific SCI test exists).
+
+### Experiment record (Stage 2)
+
+- Wall time 2026-11-11 16:27-18:05 JST (including two environment
+  restarts). Runs to completion: 1. PMO send-backs: 0. Audit stops:
+  0; no new decision was needed - the one judgement call (the
+  start-bit slot reading above) follows the model's arithmetic and
+  is documented rather than decided.
+- Defects found and fixed during the run:
+  1. First build: the PORT TXD input handler was inserted before
+     port_update()'s definition (implicit declaration), and
+     qdev_prop_set_bool does not exist in this tree (Stage 1 used
+     qdev_prop_set_bit). Both fixed before any test ran.
+  2. First waveform sampling was compressed by 10%: the bit
+     duration divided trtime by the serialized frame's bit count,
+     but the model's slot count omits the start bit. Found by
+     dumping the pad at 1 us resolution and matching the transition
+     times against both candidate periods. Fixed by deriving the
+     bit time from the model's slot count and adding the pending
+     slot for queued bytes.
+  3. The migration test's wait helper used a dotted QMP key
+     (qdict_get_str does not resolve paths), segfaulting the test
+     driver. Replaced with the Stage 1 helper's nested lookup.
+  4. One verification loop was accidentally run against the Stage 1
+     worktree's binaries (a copied path) and reported Stage 1
+     numbers; the full regression was re-run in this worktree.
+- qtests added: 5 (one new suite). Codex quota consumed: none.
