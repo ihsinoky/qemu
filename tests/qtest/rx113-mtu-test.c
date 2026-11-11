@@ -3358,11 +3358,15 @@ static void test_poe_migration(gconstpointer data)
         qtest_clock_step(dst, 1);
         assert_pad(dst, 0x14, false, false);
         g_assert_cmphex(qtest_readw(dst, POE + 0xe), ==, 0x1200);
-        qtest_clock_step(dst, 313);
+        qtest_clock_step(dst, 1000);
+        /* D-020: the write-once latch migrated; the clear is ignored. */
         qtest_writew(dst, POE + 0xe, 0x1000);
+        g_assert_cmphex(qtest_readw(dst, POE + 0xe), ==, 0x1200);
+        assert_pad(dst, 0x14, false, false);
+        /* OSTSTF clear remains the release, on the destination too. */
+        qtest_writew(dst, POE + 0xe, 0x200);
+        g_assert_cmphex(qtest_readw(dst, POE + 0xe), ==, 0x200);
         assert_pad(dst, 0x14, true, true);
-        qtest_writew(dst, POE + 0xe, 0x1200);
-        g_assert_cmphex(qtest_readw(dst, POE + 0xe), ==, 0x1000);
     } else {
         assert_pad(dst, 0x14, false, false);
         qtest_writeb(dst, POE + 0xa, 0);
