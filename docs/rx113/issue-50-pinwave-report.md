@@ -216,3 +216,12 @@ Implemented 2026-11-11 in one run.
      worktree's binaries (a copied path) and reported Stage 1
      numbers; the full regression was re-run in this worktree.
 - qtests added: 5 (one new suite). Codex quota consumed: none.
+
+Verification note (2026-11-11, later the same day): re-running
+rx113-clock-test and rx113-elc-test against the long-lived qtest
+TMPDIR intermittently aborted the test driver with libqtest socket
+assertions (qtest_socket_server / qtest_connect) at varying
+subtests. With a fresh TMPDIR both suites pass in full (9/9 and
+55/55). The flake is in the local test environment's socket
+resources, not in the submitted code; verifiers hitting the same
+assert should retry with a fresh TMPDIR.
