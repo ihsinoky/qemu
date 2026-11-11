@@ -96,3 +96,48 @@ evidence, validity boundary, promoted-to. Newest first.
   raising TGIB3 at MTU4-timed transfer points — has no supporting
   text anywhere found and would contradict Table 20.57.
 - **Promoted-to:** Issue #51. No supersede proposed; D-015 stands.
+
+## F-003: Cascade TMO — the manual is explicit (§22.5.1(2)), and the model drops TMO1 in 16-bit count mode (2026-11-11)
+
+- **Conclusion:** The Issue #50 stage-1 report recorded the cascade
+  output behaviour as an unverified reading because "the manual
+  does not state" it. That premise was an oversight: §22.5.1(2)
+  states it directly. In 16-bit count mode, TMO0 follows the
+  16-bit compare match conditions and TMO1 follows the lower
+  8-bit compare match conditions, each under its own channel's
+  TCSR OSA/OSB. In compare match count mode (§22.5.2) the
+  channels are independent. The model matches TMO0 and the count
+  mode, but in 16-bit count mode channel 1 never receives match
+  events (tmr_div() returns 0 for channel 1 when tmr_wide(), so
+  its timer is never scheduled), hence TMO1 is never
+  match-driven. The same missing events also suppress CMIA1/
+  CMIB1 in that mode; §22.6 lists those sources unconditionally.
+- **Confidence:** Proven from the manual text for the pin
+  behaviour; the interrupt side follows from the same event
+  mechanism and the unconditional §22.6 table.
+- **Evidence:**
+  1. RX113 manual §22.5.1(2) "Pin Output" (16-bit count mode):
+     TMO0 control "is in accordance with the 16-bit compare match
+     conditions"; TMO1 control "is in accordance with the lower
+     8-bit compare match conditions".
+  2. RX113 manual §22.5.2: in compare match count mode,
+     interrupts, TMOn output and counter clear follow each
+     channel's own settings (the model conforms here).
+  3. Code: hw/timer/renesas_tmr.c — update_events() computes
+     channel 0 matches on the concatenated 16-bit counter in
+     cascade mode and returns early for channel 1; tmr_div()
+     returns 0 for channel 1 under tmr_wide(); the cascaded
+     channel-1 match generation in tmr_clock_event() runs only
+     when !tmr_wide() (compare match count mode).
+- **Direction:** The model is narrower than hardware (a driven
+  pin stays idle), so mismatches surface as missing activity
+  rather than passing silently — not the dangerous direction,
+  but a fidelity gap against explicit text in code shipped by
+  Issue #50 stage 1.
+- **Validity boundary:** TMR units 0 and 1 (the text covers both;
+  §22.5 describes unit 0 and states unit 1 is the same).
+- **Promoted-to:** Issue #51; a fix (generate channel-1 low-byte
+  match events in wide mode) raised as a PO gate on 2026-11-11.
+  The shared-model change also affects the RX62N TMR, whose
+  manual carries the same cascade text; D-007 regression rules
+  apply.
