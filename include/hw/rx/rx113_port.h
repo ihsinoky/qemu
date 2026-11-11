@@ -37,6 +37,7 @@ struct RX113PortState {
     /* Issue #50: TMR compare outputs and the RTCOUT pin level. */
     uint8_t tmo, tmo_oe;
     bool rtcout_level, rtcout_oe;
+    uint8_t txd, txd_oe;
 };
 
 void rx113_port_set_poe(RX113PortState *s, uint16_t mask);

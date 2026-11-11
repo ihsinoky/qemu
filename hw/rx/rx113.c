@@ -855,6 +855,7 @@ static void register_sci(RX113State *s, unsigned unit)
     /* Keep the original six backends; append SCI8 and SCI9. */
     qdev_prop_set_chr(DEVICE(sci), "chardev", serial_hd(unit));
     qdev_prop_set_uint64(DEVICE(sci), "input-freq", RX113_PCLKB_HZ);
+    qdev_prop_set_bit(DEVICE(sci), "has-output", true);
     sysbus_realize(sci, &error_abort);
 
     for (i = 0; i < SCI_NR_IRQ; i++) {
@@ -959,6 +960,22 @@ static DeviceState *register_port(RX113State *s)
                                     qdev_get_gpio_in_named(dev, "rtcout", 0));
         qdev_connect_gpio_out_named(rtc, "rtcout-oe", 0,
                                     qdev_get_gpio_in_named(dev, "rtcout", 1));
+    }
+    {
+        /* Unit order is SCI0, 1, 2, 5, 6, 12, 8, 9 (sci_channels). */
+        static const uint8_t txd_signal_for_unit[] = { 0, 1, 2, 3, 4, 7, 5, 6 };
+
+        for (unsigned unit = 0; unit < ARRAY_SIZE(txd_signal_for_unit);
+             unit++) {
+            unsigned signal = txd_signal_for_unit[unit];
+
+            qdev_connect_gpio_out_named(DEVICE(&s->sci[unit]), "txd", 0,
+                                        qdev_get_gpio_in_named(dev, "txd",
+                                                               signal));
+            qdev_connect_gpio_out_named(DEVICE(&s->sci[unit]), "txd-oe", 0,
+                                        qdev_get_gpio_in_named(dev, "txd",
+                                                               signal + 8));
+        }
     }
     return dev;
 }

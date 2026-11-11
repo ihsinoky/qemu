@@ -154,6 +154,55 @@ static int tmo_signal(unsigned name, unsigned psel)
     }
 }
 
+/*
+ * Tables 19.3-19.16: SCI transmit pads (Issue #50 stage 2). The signal
+ * index follows the channel order TXD0, TXD1, TXD2, TXD5, TXD6, TXD8,
+ * TXD9, TXD12.
+ */
+static int txd_signal(unsigned name, unsigned psel)
+{
+    switch (psel) {
+    case 10:
+        switch (name) {
+        case 0x10: case 0x20:
+            return 0;
+        case 0x16: case 0x26: case 0x56:
+            return 1;
+        case 0x50:
+            return 2;
+        case 0xa4: case 0xc3:
+            return 3;
+        case 0xa7: case 0xc7:
+            return 5;
+        case 0xb7: case 0xe5:
+            return 6;
+        }
+        break;
+    case 11:
+        if (name == 0xc7) {
+            return 1;
+        }
+        if (name == 0xb1) {
+            return 4;
+        }
+        break;
+    case 12:
+        if (name == 0x26) {
+            return 4;
+        }
+        if (name == 0x10 || name == 0x14 || name == 0xe1) {
+            return 7;
+        }
+        break;
+    case 23:
+        if (name == 0xb7 || name == 0xe1) {
+            return 0;
+        }
+        break;
+    }
+    return -1;
+}
+
 /* Tables 19.3-19.14: RTCOUT uses PSEL=7 on these pads (Issue #50). */
 static bool rtcout_pad(unsigned name, unsigned psel)
 {
@@ -319,11 +368,16 @@ static void port_update(RX113PortState *s, bool notify)
                         level = (s->mtioc >> signal) & 1;
                     } else {
                         int tmo = tmo_signal(name, pfs & PSEL);
+                        int txd = txd_signal(name, pfs & PSEL);
 
                         if (tmo >= 0) {
                             drive = (s->tmo_oe >> tmo) & 1;
                             output = drive;
                             level = (s->tmo >> tmo) & 1;
+                        } else if (txd >= 0) {
+                            drive = (s->txd_oe >> txd) & 1;
+                            output = drive;
+                            level = (s->txd >> txd) & 1;
                         } else if (rtcout_pad(name, pfs & PSEL)) {
                             drive = s->rtcout_oe;
                             output = drive;
@@ -518,6 +572,21 @@ static void port_mtioc_input(void *opaque, int pin, int level)
     port_update(s, true);
 }
 
+static void port_txd_input(void *opaque, int pin, int level)
+{
+    RX113PortState *s = opaque;
+    uint8_t previous = pin < 8 ? s->txd : s->txd_oe;
+
+    if (pin < 8) {
+        s->txd = deposit32(s->txd, pin, 1, !!level);
+    } else {
+        s->txd_oe = deposit32(s->txd_oe, pin - 8, 1, !!level);
+    }
+    if (previous != (pin < 8 ? s->txd : s->txd_oe)) {
+        port_update(s, true);
+    }
+}
+
 static void port_tmo_input(void *opaque, int pin, int level)
 {
     RX113PortState *s = opaque;
@@ -634,6 +703,10 @@ static void port_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
                            s->regs[PFS + port * 8 + bit] & PSEL)) {
                 unsupported &= ~(1 << bit);
             }
+            if (txd_signal(port * 16 + bit,
+                           s->regs[PFS + port * 8 + bit] & PSEL) >= 0) {
+                unsupported &= ~(1 << bit);
+            }
         }
         if (unsupported) {
             qemu_log_mask(LOG_UNIMP,
@@ -694,7 +767,7 @@ static int port_post_load(void *opaque, int version_id)
 
 static const VMStateDescription vmstate_port = {
     .name = TYPE_RX113_PORT,
-    .version_id = 5,
+    .version_id = 6,
     .minimum_version_id = 1,
     .post_load = port_post_load,
     .fields = (const VMStateField[]) {
@@ -710,6 +783,8 @@ static const VMStateDescription vmstate_port = {
         VMSTATE_UINT8_V(tmo_oe, RX113PortState, 5),
         VMSTATE_BOOL_V(rtcout_level, RX113PortState, 5),
         VMSTATE_BOOL_V(rtcout_oe, RX113PortState, 5),
+        VMSTATE_UINT8_V(txd, RX113PortState, 6),
+        VMSTATE_UINT8_V(txd_oe, RX113PortState, 6),
         VMSTATE_END_OF_LIST()
     },
 };
@@ -742,6 +817,7 @@ static void port_init(Object *obj)
                             RX113_MTIOC_PINS * 2);
     qdev_init_gpio_in_named(dev, port_tmo_input, "tmo", 8);
     qdev_init_gpio_in_named(dev, port_rtcout_input, "rtcout", 2);
+    qdev_init_gpio_in_named(dev, port_txd_input, "txd", 16);
     qdev_init_gpio_in_named(dev, port_input, "pin", RX113_PORT_PINS);
     qdev_init_gpio_out_named(dev, s->pin_out, "pin-out", RX113_PORT_PINS);
     qdev_init_gpio_out_named(dev, s->pin_oe, "pin-oe", RX113_PORT_PINS);
