@@ -56,6 +56,8 @@ struct RX113MTUState {
     bool tder_read;
     uint8_t feedback;
     uint8_t mtic5;
+    uint8_t ticcr;
+    uint16_t mtioc_in;
     uint8_t reset_pwm;
     uint16_t tddr;
     uint16_t tcdr;
@@ -1257,6 +1259,102 @@ static void mtu_measurement_input(void *opaque, int pin, int level)
     mtu_schedule(s);
 }
 
+/*
+ * One input capture into TGR (section 20.3.2): the count at the
+ * edge, the match interrupt/event path, and the counter clear when
+ * TCR.CCLR designates this register. A general register serving as
+ * a buffer register does not capture (TMDR BFA/BFB notes).
+ */
+static void mtu_capture(RX113MTUState *s, unsigned n, unsigned gr)
+{
+    RX113MTUChannel *c = &s->ch[n];
+
+    if ((gr == 2 && (c->mode & 0x10)) || (gr == 3 && (c->mode & 0x20))) {
+        return;
+    }
+    c->tgr[gr] = c->count;
+    mtu_match(s, n, gr);
+    if (mtu_clear_gr(c) == (int)gr) {
+        c->count = 0;
+        mtu_buffer(c, 1 << gr, true);
+        mtu_finish_events(s, 1 << n);
+    }
+}
+
+/* Edge and mode gates for a pin-driven capture on (n, gr). */
+static void mtu_capture_edge(RX113MTUState *s, unsigned n, unsigned gr,
+                             bool rising)
+{
+    RX113MTUChannel *c = &s->ch[n];
+    unsigned io = mtu_io(c, gr);
+
+    /* MTIOC3C/3D and MTIOC4C/4D are output-only pins (Table 1.5). */
+    if (gr >= 2 && n >= 3) {
+        return;
+    }
+    if (!mtu_running(s, n) || (c->mode & 15) != 0 || io < 8 || io > 11) {
+        return;
+    }
+    if ((io == 8 && !rising) || (io == 9 && rising)) {
+        return;
+    }
+    mtu_capture(s, n, gr);
+}
+
+/* Could this pin's channel take a capture right now? */
+static bool mtu_capture_armed(RX113MTUState *s, unsigned n, unsigned gr)
+{
+    RX113MTUChannel *c = &s->ch[n];
+    unsigned io = mtu_io(c, gr);
+
+    if (gr >= 2 && n >= 3) {
+        return false;
+    }
+    return mtu_running(s, n) && (c->mode & 15) == 0 && io >= 8 && io <= 11;
+}
+
+/* PORT forwards the resolved MTIOC pad levels (Issue #68). */
+static void mtu_mtioc_in_input(void *opaque, int pin, int level)
+{
+    RX113MTUState *s = opaque;
+    unsigned n, gr;
+    bool cross, want;
+
+    if (((s->mtioc_in >> pin) & 1) == !!level) {
+        return;
+    }
+    s->mtioc_in = deposit32(s->mtioc_in, pin, 1, !!level);
+    for (n = 0; n < 5; n++) {
+        if (pin >= (int)output_base[n] &&
+            pin < (int)(output_base[n] + MIN(tgr_count[n], 4))) {
+            break;
+        }
+    }
+    if (n == 5) {
+        return;
+    }
+    gr = pin - output_base[n];
+    cross = n == 1 && gr < 2 && (s->ticcr & (1 << gr));
+    /*
+     * Only a plausible capture justifies advancing the timers: an
+     * output pad toggling back into the model (the complementary
+     * and PWM outputs share these pins) must not disturb it.
+     */
+    want = mtu_capture_armed(s, n, gr) || (cross &&
+                                           mtu_capture_armed(s, 2, gr));
+    if (!want) {
+        return;
+    }
+    mtu_advance(s);
+    mtu_capture_edge(s, n, gr, !!level);
+    /* TICCR: MTIOC1A/1B edges also feed MTU2.TGRA/TGRB captures. */
+    if (cross) {
+        mtu_capture_edge(s, 2, gr, !!level);
+    }
+    mtu_update_held(s);
+    mtu_schedule(s);
+}
+
 /* Table 20.48-51; raw device clocks, before any board PORT/MPC routing. */
 static void mtu_clock_input(void *opaque, int pin, int level)
 {
@@ -1343,6 +1441,7 @@ enum {
     TCR, TMDR, TIOR, TIER, TSR, TCNT, TGR, TIER2, TBTM,
     TSTR, TSYR, TRWER, TSTR5, TIER5, CLEAR5, TOER, TOCR1, TOCR2, TOLBR,
     TDDR, TCDR, TCBR, TCNTS, TITCR, TITCNT, TBTER, TGCR, TDER, TWCR,
+    TICCR,
 };
 
 typedef struct MTURegister {
@@ -1392,6 +1491,7 @@ static const MTURegister mtu_regs[] = {
     { 0x186, 2, 1, TCNT, 0, 0x00 },
     { 0x188, 2, 1, TGR, 0, 0x00 },
     { 0x18a, 2, 1, TGR, 1, 0x00 },
+    { 0x190, 1, 1, TICCR, 0, 0x03 },
     { 0x200, 1, 2, TCR, 0, 0x7f },
     { 0x201, 1, 2, TMDR, 0, 0x0f },
     { 0x202, 1, 2, TIOR, 0, 0xff },
@@ -1506,6 +1606,8 @@ static uint64_t mtu_read(void *opaque, hwaddr addr, unsigned size)
         return c->tier2;
     case TBTM:
         return c->tbtm;
+    case TICCR:
+        return s->ticcr;
     case TSTR:
         return s->start;
     case TSYR:
@@ -1613,10 +1715,26 @@ static void mtu_write(void *opaque, hwaddr addr, uint64_t value, unsigned size)
                 mtu_output_initial(s, n, gr);
             }
         }
-        if ((n >= 5 && (value & 0x10) && !mtu_measurement(c)) ||
-            (n < 5 && (value & 0x88))) {
+        if (n >= 5 && (value & 0x10) && !mtu_measurement(c)) {
             qemu_log_mask(LOG_UNIMP,
                           "rx113-mtu: input capture path unavailable\n");
+        }
+        if (n < 5) {
+            /*
+             * Still unavailable: the MTU0 11xx capture source
+             * (MTU1.TCNT count clock) and capture selection on the
+             * output-only MTIOC3C/3D and MTIOC4C/4D pins.
+             */
+            for (unsigned gi = 0; gi < 2; gi++) {
+                unsigned gr = r->index * 2 + gi;
+                unsigned io = (value >> (4 * gi)) & 15;
+
+                if (io >= 12 || (io >= 8 && gr >= 2 && n >= 3)) {
+                    qemu_log_mask(LOG_UNIMP,
+                                  "rx113-mtu: input capture path "
+                                  "unavailable\n");
+                }
+            }
         }
         break;
     case TIER:
@@ -1660,6 +1778,9 @@ static void mtu_write(void *opaque, hwaddr addr, uint64_t value, unsigned size)
         break;
     case TBTM:
         c->tbtm = value;
+        break;
+    case TICCR:
+        s->ticcr = value;
         break;
     case TSTR:
         if (mtu_reset_pwm(s) && !(value & (1 << 6))) {
@@ -1780,6 +1901,8 @@ static void mtu_reset_hold(Object *obj, ResetType type)
         }
     }
     s->start = s->sync = s->start5 = s->tier5 = s->clear5 = 0;
+    s->ticcr = 0;
+    s->mtioc_in = 0;
     for (unsigned i = 0; i < RX113_MTU_IRQS; i++) {
         qemu_set_irq(s->irq[i], 0);
     }
@@ -1870,7 +1993,7 @@ static int mtu_post_load(void *opaque, int version_id)
 
 static const VMStateDescription vmstate_mtu = {
     .name = TYPE_RX113_MTU,
-    .version_id = 11,
+    .version_id = 12,
     .minimum_version_id = 1,
     .pre_save = mtu_pre_save,
     .post_load = mtu_post_load,
@@ -1918,6 +2041,8 @@ static const VMStateDescription vmstate_mtu = {
         VMSTATE_UINT8_V(twcr, RX113MTUState, 11),
         VMSTATE_UINT8_V(twcr_read, RX113MTUState, 11),
         VMSTATE_BOOL_V(initial_tb2, RX113MTUState, 11),
+        VMSTATE_UINT8_V(ticcr, RX113MTUState, 12),
+        VMSTATE_UINT16_V(mtioc_in, RX113MTUState, 12),
         VMSTATE_END_OF_LIST()
     },
 };
@@ -1943,6 +2068,8 @@ static void mtu_init(Object *obj)
     qdev_init_gpio_in_named(DEVICE(obj), mtu_clock_input, "mtclk", 4);
     qdev_init_gpio_in_named(DEVICE(obj), mtu_feedback_input, "feedback", 3);
     qdev_init_gpio_in_named(DEVICE(obj), mtu_measurement_input, "mtic5", 3);
+    qdev_init_gpio_in_named(DEVICE(obj), mtu_mtioc_in_input, "mtioc-in",
+                            RX113_MTIOC_PINS);
 }
 
 static void mtu_finalize(Object *obj)
