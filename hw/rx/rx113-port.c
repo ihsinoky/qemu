@@ -7,10 +7,13 @@
 #include "qemu/osdep.h"
 #include "qapi/error.h"
 #include "qemu/log.h"
+#include "qemu/bitops.h"
 #include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/rx/rx113_port.h"
 #include "hw/rx/rx113_elc.h"
+#include "hw/rx/rx113_mtu.h"
+#include "hw/rx/rx113_poe.h"
 #include "migration/vmstate.h"
 
 #define PDR  0x000
@@ -72,6 +75,63 @@ static bool ctsu_pin(unsigned name)
 static bool cacref_pin(unsigned name)
 {
     return name == 0x15 || name == 0x27 || name == 0xa0 || name == 0xc7;
+}
+
+/* Table 19.1 and PFS tables: all MTIC5 alternatives use PSEL=1. */
+static int mtic5_signal(unsigned name)
+{
+    switch (name) {
+    case 0x11:
+    case 0xa4:
+        return 0;
+    case 0x10:
+    case 0xa6:
+        return 1;
+    case 0x56:
+    case 0xb0:
+        return 2;
+    default:
+        return -1;
+    }
+}
+
+/* Tables 19.2-21. Entries are MTIOC signal index + 1; zero is absent. */
+static int mtioc_signal(unsigned name, unsigned psel)
+{
+    static const uint8_t map[3][0x130] = {
+        { /* PSEL = 1 */
+            [0x02] = 4, [0x04] = 1,
+            [0x13] = 2, [0x14] = 9, [0x15] = 2,
+            [0x16] = 11, [0x17] = 9,
+            [0x20] = 5, [0x21] = 6, [0x22] = 10, [0x23] = 12,
+            [0x24] = 13, [0x25] = 15, [0x26] = 7, [0x27] = 8,
+            [0x30] = 14, [0x31] = 16, [0x32] = 3,
+            [0x50] = 7, [0x51] = 15, [0x53] = 8, [0x54] = 14,
+            [0x55] = 16,
+            [0xa0] = 13, [0xa1] = 2, [0xa3] = 4,
+            [0xb1] = 3, [0xb3] = 1, [0xb5] = 7,
+            [0xb6] = 12, [0xb7] = 10,
+            [0xc0] = 11, [0xc1] = 9, [0xc2] = 14, [0xc3] = 16,
+            [0xc4] = 12, [0xc5] = 10, [0xc6] = 11, [0xc7] = 9,
+            /* PD2: Table 1.5 resolves the "MTIOC4BD" typo in 19.17/18. */
+            [0xd1] = 14, [0xd2] = 16,
+            [0xe1] = 15, [0xe2] = 13, [0xe3] = 14,
+            [0xe4] = 16, [0xe5] = 15,
+            [0xf6] = 11, [0xf7] = 9, [0x123] = 11,
+        },
+        { /* PSEL = 2 */
+            [0x16] = 12, [0x17] = 10,
+            [0xb0] = 3, [0xb1] = 15, [0xb3] = 13, [0xb5] = 6,
+            [0xe0] = 7, [0xe3] = 6, [0xe4] = 5, [0xe5] = 8,
+        },
+        { /* PSEL = 3 */
+            [0x14] = 1, [0x17] = 3, [0x56] = 5,
+            [0xa3] = 6, [0xa4] = 8, [0xa6] = 7,
+            [0xb3] = 10, [0xe3] = 1, [0xe4] = 9,
+        },
+    };
+
+    return psel >= 1 && psel <= 3 ? map[psel - 1][name] - 1 : -1;
 }
 
 static uint8_t port_pins(RX113PortState *s, unsigned port)
@@ -187,6 +247,7 @@ static void port_update(RX113PortState *s, bool notify)
     uint8_t old_b = s->levels[11];
     uint8_t irq_levels = 0;
     bool cacref = false;
+    uint8_t feedback = 0, mtic5 = 0;
 
     memset(s->levels, 0, sizeof(s->levels));
     memset(s->driving, 0, sizeof(s->driving));
@@ -215,6 +276,15 @@ static void port_update(RX113PortState *s, bool notify)
                         (s->regs[PDR + gp] & (1 << gb));
                 drive = output;
                 level = s->regs[PODR + gp] & (1 << gb);
+                if (peripheral) {
+                    int signal = mtioc_signal(name, pfs & PSEL);
+
+                    if (signal >= 0) {
+                        drive = ((s->mtioc_oe & ~s->poe_cutoff) >> signal) & 1;
+                        output = drive;
+                        level = (s->mtioc >> signal) & 1;
+                    }
+                }
                 if ((od == 1 && level) || (od == 2 && !level)) {
                     drive = false;
                 }
@@ -223,6 +293,17 @@ static void port_update(RX113PortState *s, bool notify)
                             s->external[port] & (1 << bit) :
                             (!output &&
                              (s->regs[PCR + gp] & (1 << gb)));
+                }
+            }
+            if (peripheral && !(pfs & ASEL)) {
+                int signal = mtioc_signal(name, pfs & PSEL);
+
+                if (signal >= 0 && signal < 3 && level) {
+                    feedback |= 1 << signal;
+                }
+                signal = mtic5_signal(name);
+                if ((pfs & PSEL) == 1 && signal >= 0 && level) {
+                    mtic5 |= 1 << signal;
                 }
             }
             /* Tables 19.3..19.16: CACREF uses PSEL=7 on these pads. */
@@ -253,9 +334,87 @@ static void port_update(RX113PortState *s, bool notify)
     if (notify && s->elc) {
         rx113_elc_port_input(s->elc, old_b, s->levels[11]);
     }
+    if (s->poe) {
+        rx113_poe_port_changed(s->poe);
+    }
     qemu_set_irq(s->cacref, cacref);
+    for (unsigned i = 0; i < 3; i++) {
+        qemu_set_irq(s->mtu_feedback[i], (feedback >> i) & 1);
+        qemu_set_irq(s->mtic5[i], (mtic5 >> i) & 1);
+    }
     for (unsigned i = 0; i < 8; i++) {
         qemu_set_irq(s->irq[i], (irq_levels >> i) & 1);
+    }
+}
+
+/* Table 19.1: POE inputs all use PSEL=7. */
+static int poe_signal(unsigned name)
+{
+    switch (name) {
+    case 0xc4: case 0xa3: case 0x11:
+        return 0;
+    case 0xb5: case 0x10:
+        return 1;
+    case 0xa6: case 0x04: case 0x56:
+        return 2;
+    case 0xb3: case 0xe0: case 0x02: case 0xd4:
+        return 3;
+    case 0x17: case 0x30: case 0xe3: case 0xd3:
+        return 4;
+    default:
+        return -1;
+    }
+}
+
+uint8_t rx113_port_poe_inputs(RX113PortState *s)
+{
+    uint8_t levels = 0x1f;
+
+    for (unsigned pin = 0; pin < RX113_PORT_PINS; pin++) {
+        unsigned port = pin / 8, bit = pin % 8;
+        int signal = poe_signal(pin_name(pin));
+
+        if (signal >= 0 && (port_pins(s, port) & (1 << bit)) &&
+            (s->regs[PMR + port] & (1 << bit)) &&
+            (s->regs[PFS + pin] & (ASEL | PSEL)) == 7 &&
+            !(s->levels[port] & (1 << bit))) {
+            levels &= ~(1 << signal);
+        }
+    }
+    return levels;
+}
+
+/* D-019: any bonded alternate at the active level, independent of PFS. */
+bool rx113_port_mtioc_active(RX113PortState *s, unsigned signal, bool level)
+{
+    for (unsigned pin = 0; pin < RX113_PORT_PINS; pin++) {
+        unsigned port = pin / 8, bit = pin % 8;
+
+        if (!(port_pins(s, port) & (1 << bit))) {
+            continue;
+        }
+        bool pad_level = s->levels[port] & (1 << bit);
+
+        /* ASEL disables PIDR, but not the PFS-independent POE comparator. */
+        if (s->regs[PFS + pin] & ASEL) {
+            pad_level = (s->external_mask[port] & s->external[port]) &
+                        (1 << bit);
+        }
+        for (unsigned psel = 1; psel <= 3; psel++) {
+            if (mtioc_signal(pin_name(pin), psel) == signal &&
+                pad_level == level) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+void rx113_port_set_poe(RX113PortState *s, uint16_t mask)
+{
+    if (s->poe_cutoff != mask) {
+        s->poe_cutoff = mask;
+        port_update(s, true);
     }
 }
 
@@ -293,6 +452,24 @@ void rx113_port_set_ctsu(RX113PortState *s, bool fixed, bool level)
         s->ctsu_level = level;
         port_update(s, true);
     }
+}
+
+static void port_mtioc_input(void *opaque, int pin, int level)
+{
+    RX113PortState *s = opaque;
+    uint16_t previous = pin < RX113_MTIOC_PINS ? s->mtioc : s->mtioc_oe;
+    unsigned bit = pin % RX113_MTIOC_PINS;
+
+    if (((previous >> bit) & 1) == !!level) {
+        return;
+    }
+    if (pin < RX113_MTIOC_PINS) {
+        s->mtioc = deposit32(s->mtioc, pin, 1, !!level);
+    } else {
+        s->mtioc_oe = deposit32(s->mtioc_oe, pin - RX113_MTIOC_PINS, 1,
+                              !!level);
+    }
+    port_update(s, true);
 }
 
 static void port_input(void *opaque, int pin, int level)
@@ -358,6 +535,14 @@ static void port_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
         uint8_t unsupported = val & mask;
 
         for (unsigned bit = 0; bit < 8; bit++) {
+            if (mtioc_signal(port * 16 + bit,
+                             s->regs[PFS + port * 8 + bit] & PSEL) >= 0) {
+                unsupported &= ~(1 << bit);
+            }
+            if (poe_signal(port * 16 + bit) >= 0 &&
+                (s->regs[PFS + port * 8 + bit] & (PSEL | ASEL)) == 7) {
+                unsupported &= ~(1 << bit);
+            }
             if (cacref_pin(port * 16 + bit) &&
                 (s->regs[PFS + port * 8 + bit] & (PSEL | ASEL)) == 7) {
                 unsupported &= ~(1 << bit);
@@ -409,6 +594,7 @@ static void port_reset_hold(Object *obj, ResetType type)
     /* 18.3, 19.2: all control registers zero except PWPR.B0WI. */
     memset(s->regs, 0, sizeof(s->regs));
     s->regs[PWPR] = B0WI;
+    s->poe_cutoff = 0;
     /* External board drivers survive an MCU reset. */
     port_update(s, false);
 }
@@ -421,7 +607,7 @@ static int port_post_load(void *opaque, int version_id)
 
 static const VMStateDescription vmstate_port = {
     .name = TYPE_RX113_PORT,
-    .version_id = 2,
+    .version_id = 4,
     .minimum_version_id = 1,
     .post_load = port_post_load,
     .fields = (const VMStateField[]) {
@@ -430,6 +616,9 @@ static const VMStateDescription vmstate_port = {
         VMSTATE_UINT8_ARRAY(external_mask, RX113PortState, RX113_PORT_COUNT),
         VMSTATE_BOOL_V(ctsu_fixed, RX113PortState, 2),
         VMSTATE_BOOL_V(ctsu_level, RX113PortState, 2),
+        VMSTATE_UINT16_V(poe_cutoff, RX113PortState, 4),
+        VMSTATE_UINT16_V(mtioc, RX113PortState, 3),
+        VMSTATE_UINT16_V(mtioc_oe, RX113PortState, 3),
         VMSTATE_END_OF_LIST()
     },
 };
@@ -456,6 +645,10 @@ static void port_init(Object *obj)
                           sizeof(s->regs));
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
     qdev_init_gpio_out_named(dev, &s->cacref, "cacref", 1);
+    qdev_init_gpio_out_named(dev, s->mtu_feedback, "mtu-feedback", 3);
+    qdev_init_gpio_out_named(dev, s->mtic5, "mtic5", 3);
+    qdev_init_gpio_in_named(dev, port_mtioc_input, "mtioc",
+                            RX113_MTIOC_PINS * 2);
     qdev_init_gpio_in_named(dev, port_input, "pin", RX113_PORT_PINS);
     qdev_init_gpio_out_named(dev, s->pin_out, "pin-out", RX113_PORT_PINS);
     qdev_init_gpio_out_named(dev, s->pin_oe, "pin-oe", RX113_PORT_PINS);

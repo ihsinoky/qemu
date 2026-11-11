@@ -19,6 +19,7 @@ struct RX113PortState {
     SysBusDevice parent_obj;
     MemoryRegion iomem;
     DeviceState *elc;
+    DeviceState *poe;
     uint32_t package_pins;
     uint8_t regs[0x200];
     uint8_t external[RX113_PORT_COUNT];
@@ -29,8 +30,15 @@ struct RX113PortState {
     qemu_irq pin_oe[RX113_PORT_PINS];
     qemu_irq irq[8];
     qemu_irq cacref;
+    qemu_irq mtu_feedback[3];
+    qemu_irq mtic5[3];
     bool ctsu_fixed, ctsu_level;
+    uint16_t mtioc, mtioc_oe, poe_cutoff;
 };
+
+void rx113_port_set_poe(RX113PortState *s, uint16_t mask);
+uint8_t rx113_port_poe_inputs(RX113PortState *s);
+bool rx113_port_mtioc_active(RX113PortState *s, unsigned signal, bool level);
 
 void rx113_port_set_ctsu(RX113PortState *s, bool fixed, bool level);
 
