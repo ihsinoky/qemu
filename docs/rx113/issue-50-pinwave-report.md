@@ -192,7 +192,7 @@ Implemented 2026-11-11 in one run.
 
 ### Experiment record (Stage 2)
 
-- Wall time 2026-11-11 16:27-18:05 JST (including two environment
+- Wall time 2026-11-11 16:27-16:53 JST (including two environment
   restarts). Runs to completion: 1. PMO send-backs: 0. Audit stops:
   0; no new decision was needed - the one judgement call (the
   start-bit slot reading above) follows the model's arithmetic and
