@@ -445,3 +445,32 @@ Stage 2 (RXD sampling) adds:
 - The external-clock direction reuses the same `has-input`
   wiring: the forwarded SCK level is the clock, rising edges
   sample RXD, falling edges present TXD bits.
+
+## D-025: MTIOC input capture discipline (Issue #68)
+
+- The PORT forwards the resolved MTIOC pad levels to the MTU on
+  a new `mtioc-in` GPIO set that reuses the mtioc signal index;
+  the MTU keeps the previous levels and detects edges itself.
+- The input handler advances the timers only when a capture is
+  actually armed (channel running, normal mode, the general
+  register's TIOR field selecting input capture). The MTIOC pins
+  are shared with the timer outputs, so an output pad toggling
+  back into the model must never disturb the timing state; an
+  unconditional advance on every forwarded edge broke the
+  complementary-PWM transfer timing during development and is
+  therefore ruled out.
+- Capture scope follows Table 1.5 and Figure 20.11: MTU0 A-D,
+  MTU1/MTU2/MTU3/MTU4 A/B. Capture selection on the output-only
+  MTIOC3C/3D and MTIOC4C/4D pins and the MTU0 TIOR 11xx source
+  (MTU1.TCNT count clock) stay unimplemented and keep the
+  LOG_UNIMP notice. A general register serving as a buffer
+  register does not capture (TMDR BFA/BFB notes); a capture into
+  TGRA/TGRB writes the register itself, as the ELC operation
+  capture already did.
+- TICCR cross-capture applies MTU2's own TIOR edge selection and
+  mode gates to the MTIOC1A/1B edge; it is not a raw copy of the
+  MTU1 capture.
+- TSR flag storage is a pre-existing, MTU-wide gap (TSR reads
+  return a constant) and is deliberately not fixed here; capture
+  raises its interrupt and ELC event through the same path as a
+  compare match, like every other MTU event source.

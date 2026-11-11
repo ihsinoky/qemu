@@ -1004,6 +1004,9 @@ static DeviceState *register_port(RX113State *s)
         qdev_connect_gpio_out_named(s->mtu, "mtioc-oe", i,
                                    qdev_get_gpio_in_named(dev, "mtioc",
                                                        i + RX113_MTIOC_PINS));
+        qdev_connect_gpio_out_named(dev, "mtioc-in", i,
+                                    qdev_get_gpio_in_named(s->mtu,
+                                                           "mtioc-in", i));
     }
     /* Issue #50: TMR compare outputs (unit * 2 + channel) and RTCOUT. */
     for (unsigned unit = 0; unit < 2; unit++) {

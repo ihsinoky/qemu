@@ -6,6 +6,7 @@
 #define HW_RX_RX113_PORT_H
 
 #include "hw/core/sysbus.h"
+#include "hw/rx/rx113_mtu.h"
 #include "qom/object.h"
 
 #define TYPE_RX113_PORT "rx113-port"
@@ -36,6 +37,7 @@ struct RX113PortState {
     qemu_irq mtic5[3];
     qemu_irq rxd_lines[8];
     qemu_irq sck_sense[8];
+    qemu_irq mtioc_in[RX113_MTIOC_PINS];
     bool ctsu_fixed, ctsu_level;
     uint16_t mtioc, mtioc_oe, poe_cutoff;
     /* Issue #50: TMR compare outputs and the RTCOUT pin level. */

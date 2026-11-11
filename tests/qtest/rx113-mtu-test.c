@@ -3572,6 +3572,123 @@ static void test_poe_registers(void)
     qtest_quit(qts);
 }
 
+/*
+ * Input capture from MTIOC pad edges (Issue #68). P04 is MTIOC0A,
+ * P13 is MTIOC0B and P20 is MTIOC1A, all at PSEL=1; the PORT pin
+ * inputs are port * 8 + bit. TCR=1 gives 125 ns per count.
+ */
+#define TIOR0H (BASE + 0x102)
+#define TIOR1 (BASE + 0x182)
+#define TIOR2 (BASE + 0x202)
+#define TICCR (BASE + 0x190)
+#define PIN_MTIOC0A 4
+#define PIN_MTIOC0B 11
+#define PIN_MTIOC1A 16
+
+static void drive_pin(QTestState *qts, unsigned pin, unsigned level)
+{
+    qtest_set_irq_in(qts, "/machine/mcu/port", "pin", pin, level);
+}
+
+static void test_capture_edges(void)
+{
+    QTestState *qts = mtu_init();
+
+    qtest_writeb(qts, BASE + tcr[0], 1); /* PCLKB/4 */
+    qtest_writeb(qts, BASE + tier[0], 1); /* TGIEA */
+    select_pad(qts, 0x04, 1); /* P04 = MTIOC0A */
+    drive_pin(qts, PIN_MTIOC0A, 0);
+    qtest_writeb(qts, TIOR0H, 0x08); /* TGRA: rising-edge capture */
+    start_channel(qts, 0, true);
+
+    qtest_clock_step(qts, 125 * 40);
+    drive_pin(qts, PIN_MTIOC0A, 1);
+    g_assert_cmpuint(qtest_readw(qts, BASE + tgr[0][0]), ==, 40);
+    g_assert_cmpuint(qtest_readb(qts, IR(vector[0])), ==, 1);
+    qtest_writeb(qts, IR(vector[0]), 0);
+
+    /* A falling edge does not capture in rising-edge mode. */
+    qtest_clock_step(qts, 125 * 10);
+    drive_pin(qts, PIN_MTIOC0A, 0);
+    g_assert_cmpuint(qtest_readw(qts, BASE + tgr[0][0]), ==, 40);
+    drive_pin(qts, PIN_MTIOC0A, 1);
+    g_assert_cmpuint(qtest_readw(qts, BASE + tgr[0][0]), ==, 50);
+
+    /* Falling-edge mode: only the fall captures. */
+    qtest_writeb(qts, TIOR0H, 0x09);
+    qtest_clock_step(qts, 125 * 10);
+    drive_pin(qts, PIN_MTIOC0A, 0);
+    g_assert_cmpuint(qtest_readw(qts, BASE + tgr[0][0]), ==, 60);
+    drive_pin(qts, PIN_MTIOC0A, 1);
+    g_assert_cmpuint(qtest_readw(qts, BASE + tgr[0][0]), ==, 60);
+
+    /* Both-edges mode; a stopped channel captures nothing. */
+    qtest_writeb(qts, TIOR0H, 0x0a);
+    qtest_clock_step(qts, 125 * 10);
+    drive_pin(qts, PIN_MTIOC0A, 0);
+    g_assert_cmpuint(qtest_readw(qts, BASE + tgr[0][0]), ==, 70);
+    start_channel(qts, 0, false);
+    drive_pin(qts, PIN_MTIOC0A, 1);
+    qtest_clock_step(qts, 125 * 10);
+    drive_pin(qts, PIN_MTIOC0A, 0);
+    g_assert_cmpuint(qtest_readw(qts, BASE + tgr[0][0]), ==, 70);
+    qtest_quit(qts);
+}
+
+/* Figure 20.11 shape: TGRB capture designated as the clear source. */
+static void test_capture_clear(void)
+{
+    QTestState *qts = mtu_init();
+
+    qtest_writeb(qts, BASE + tcr[0], 1 | (2 << 5)); /* /4, clear by B */
+    select_pad(qts, 0x04, 1);
+    select_pad(qts, 0x13, 1); /* P13 = MTIOC0B */
+    drive_pin(qts, PIN_MTIOC0A, 0);
+    drive_pin(qts, PIN_MTIOC0B, 1);
+    qtest_writeb(qts, TIOR0H, 0x98); /* A rising capture, B falling */
+    start_channel(qts, 0, true);
+
+    qtest_clock_step(qts, 125 * 24);
+    drive_pin(qts, PIN_MTIOC0A, 1);
+    g_assert_cmpuint(qtest_readw(qts, BASE + tgr[0][0]), ==, 24);
+    qtest_clock_step(qts, 125 * 8);
+    drive_pin(qts, PIN_MTIOC0B, 0);
+    g_assert_cmpuint(qtest_readw(qts, BASE + tgr[0][1]), ==, 32);
+    g_assert_cmpuint(qtest_readw(qts, BASE + count[0]), ==, 0);
+    qtest_clock_step(qts, 125 * 4);
+    g_assert_cmpuint(qtest_readw(qts, BASE + count[0]), ==, 4);
+    qtest_quit(qts);
+}
+
+/* TICCR cross-capture: MTIOC1A edges also capture into MTU2.TGRA. */
+static void test_capture_ticcr(void)
+{
+    QTestState *qts = mtu_init();
+
+    qtest_writeb(qts, BASE + tcr[1], 1);
+    qtest_writeb(qts, BASE + tcr[2], 1);
+    qtest_writeb(qts, TIOR1, 0x08);
+    qtest_writeb(qts, TIOR2, 0x08);
+    select_pad(qts, 0x20, 1); /* P20 = MTIOC1A */
+    drive_pin(qts, PIN_MTIOC1A, 0);
+    qtest_writeb(qts, START, (1 << start_bit[1]) | (1 << start_bit[2]));
+
+    qtest_clock_step(qts, 125 * 20);
+    drive_pin(qts, PIN_MTIOC1A, 1);
+    g_assert_cmpuint(qtest_readw(qts, BASE + tgr[1][0]), ==, 20);
+    /* Untouched: TGR reads the model's 0xffff idle value. */
+    g_assert_cmpuint(qtest_readw(qts, BASE + tgr[2][0]), ==, 0xffff);
+
+    qtest_writeb(qts, TICCR, 1); /* I1AE */
+    g_assert_cmpuint(qtest_readb(qts, TICCR), ==, 1);
+    drive_pin(qts, PIN_MTIOC1A, 0);
+    qtest_clock_step(qts, 125 * 10);
+    drive_pin(qts, PIN_MTIOC1A, 1);
+    g_assert_cmpuint(qtest_readw(qts, BASE + tgr[1][0]), ==, 30);
+    g_assert_cmpuint(qtest_readw(qts, BASE + tgr[2][0]), ==, 30);
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -3699,6 +3816,9 @@ int main(int argc, char **argv)
                         GUINT_TO_POINTER(0), test_poe_migration);
     qtest_add_data_func("/rx113-mtu/poe-migration-oscillator",
                         GUINT_TO_POINTER(1), test_poe_migration);
+    qtest_add_func("/rx113-mtu/capture-edges", test_capture_edges);
+    qtest_add_func("/rx113-mtu/capture-clear", test_capture_clear);
+    qtest_add_func("/rx113-mtu/capture-ticcr", test_capture_ticcr);
     qtest_add_func("/rx113-mtu/poe-package64", test_poe_package64);
     qtest_add_func("/rx113-mtu/poe-system", test_poe_system);
     qtest_add_func("/rx113-mtu/poe-compare-pairs", test_poe_compare_pairs);
