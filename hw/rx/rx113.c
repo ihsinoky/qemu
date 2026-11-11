@@ -1040,6 +1040,12 @@ static DeviceState *register_port(RX113State *s)
             qdev_connect_gpio_out_named(DEVICE(&s->sci[unit]), "txd-oe", 0,
                                         qdev_get_gpio_in_named(dev, "txd",
                                                                signal + 8));
+            qdev_connect_gpio_out_named(DEVICE(&s->sci[unit]), "sck", 0,
+                                        qdev_get_gpio_in_named(dev, "sck",
+                                                               signal));
+            qdev_connect_gpio_out_named(DEVICE(&s->sci[unit]), "sck-oe", 0,
+                                        qdev_get_gpio_in_named(dev, "sck",
+                                                               signal + 8));
         }
     }
     return dev;
