@@ -2,6 +2,166 @@
 SPDX-License-Identifier: GPL-2.0-or-later
 -->
 
+# Issue 49: RX113 MTU advanced output — stage 2b6 TDER and TWCR audit
+
+## Current delivery (2026-11-11)
+
+**Stage 2b and Issue #49 remain incomplete.** The first item of
+`.issue49-runtime/issue-49-stage2b6.md` is implemented: TDER
+read-before-clear and no-dead-time waveforms. Work stops during the
+second item's TWCR audit at the CCE/buffer-transfer evidence gap below,
+in accordance with the instruction to stop instead of guessing.
+TWCR/WRE/CCE and complementary synchronous clearing are not implemented.
+The third item, TGCR gating in reset-synchronized PWM, was not started
+because the brief requires ordered execution. Stage 3 (POE) was not
+started. Earlier delivery sections are historical.
+
+Base: `37c2523fd0b90e8ea7b312d35dc30478ddb6aed4`.
+Branch: `rx113/issue-49-mtu-advanced`.
+Deliverables: working tree and
+`.issue49-runtime/issue49-stage2b6-tder-audit.patch`.
+No commit, merge, push, PR or upstream submission was performed.
+
+### TDER implementation and evidence
+
+Authority: supplied R01UH0448EJ0120 Rev.1.20, printed manual pages.
+
+* 20.2.29, p.445; 20.3.8(f), p.486: TDER resets to 1. Clearing
+  requires a preceding read of 1; writing 1 is unconditional. Writes
+  consume the read qualification. Reserved bits read as zero. TDER is
+  absent from the protected-register list in 20.2.16, p.432, so TRWER
+  does not protect it. Firmware must change it while counters are stopped,
+  as the manual requires; changing it during counting is not validated.
+* Table 20.56 and Figure 20.41, pp.486-487: firmware sets TDDR=1,
+  TGRA3/TGRC3=TCDR+1. The coupled carrier and TCNTS retain their
+  existing count offset and transfer chronology. MTU4 compare matches
+  switch the positive waveform with no pad dead time; coincident turn-on
+  and turn-off retain its latch, as in the existing waveform arbitration.
+* 20.2.18-19, pp.434-437; 20.6.20, pp.543-544: negative output is
+  the inverse of positive output with no dead time, including initial
+  output. Only OLSP/OLSiP selects polarity. Existing TGCR gating remains
+  downstream of the waveform and TOER still controls pad ownership.
+* Migration version 10 saves TDER and its read qualification. Older
+  streams default to dead time enabled, matching their implemented
+  behavior. Existing same-build migration tests pass with TDER=1;
+  migration with TDER=0 or a qualified TDER read has not been tested.
+
+Only RX113 MTU implementation, its qtest and this report change. RX62N,
+PORT and shared SCI/CMT/TMR sources are untouched. The existing partial
+complementary diagnostic remains appropriate. One new qtest covers
+modes 13/14/15 over two carrier cycles, three duties, global/per-phase
+polarity, ignored N polarity, carrier count checks one nanosecond before
+edges, read-before-clear qualification, reserved bits, stop and reset.
+Extreme duties and pending-buffer changes with TDER=0 are not newly
+validated by this delivery.
+
+### TWCR audit: CCE versus the crest transfer boundary
+
+The manual provides two individually clear rules whose interaction is
+not specified:
+
+1. 20.3.8(b), p.484, Figure 20.40, p.485: the temporary bank transfers
+   to active registers **at the end of Tb1**, when upward-counting TCNTS
+   reaches TGRA3. The MTU3.TGRA crest match occurs earlier in Tb1.
+   Writes committed during Tb wait for its end before entering the
+   temporary bank. The current implementation follows these rules.
+2. 20.2.30, p.446; 20.3.8(o), p.502, Figure 20.62: in complementary
+   mode 1, CCE clears MTU3.TCNT, MTU4.TCNT and TCNTS at the TGRA3
+   match. TSYR synchronization, zero duty and PSYE are prohibited for
+   this operation. Neither this text nor the figure specifies the
+   disposition of the interrupted Tb1 transfer or its temporary bank.
+
+Distinguishing setup using the existing test carrier: TDDR=2, TCDR=12,
+TGRA3=14, mode 13 with BFA/BFB enabled, PSYE=0, TSYR=0, old duty 4.
+Commit a new duty 8 into the temporary bank during Ta. In the ordinary
+carrier, the first crest match is count edge 13 and the end-Tb1 transfer
+is edge 15. With CCE, the documented reset at edge 13 prevents TCNTS
+from naturally reaching that later boundary.
+
+A literal restart with no special transfer leaves active duty 4; repeated
+CCE clears can prevent the normal crest transfer indefinitely. Treating
+CCE as an early end-Tb1 transfer changes active duty to 8 at edge 13,
+but adds a transfer condition and timing not stated by the manual.
+Continuing a separate hidden Tb1 completion after clearing TCNTS would
+also require an undocumented mechanism. The alternatives affect active
+TGR readback and the next waveform. A commit write during Tb1 adds the
+question of whether the old temporary bank is consumed before the newly
+pending transaction. Figure 20.62 shows neither bank nor an update.
+Section 20.7's restart procedures do not resolve this CCE case.
+
+**Next step requires PO/PMO resolution:** provide authoritative vendor
+clarification or an RX113 trace for the above setup, including active
+TGR readback around edges 13/15 and a commit during Tb1. Otherwise,
+explicitly choose and record a CCE transfer convention and its ordering
+relative to pending buffer snapshots. No TWCR implementation or tests
+encoding one of these choices remain in this patch. Then complete TWCR
+read-before-set, WRE's noninitial-trough-only retention, CCE and
+synchronous restart tests, followed by reset-synchronized PWM TGCR.
+
+The supplied text does establish that WRE retains output only for a
+later trough Tb2 clear, excludes the initial startup Tb2, and otherwise
+restores TOCR initial output (20.3.8(m)-(n), pp.497-501). Counter stop
+and restart uses the initial counter state (20.6.13, pp.538-539;
+20.7, Figures 20.149-150, pp.569-570). These findings do not resolve
+the separate CCE bank-transfer question.
+
+### Duty-request decision remains PENDING
+
+The historical Duty-request audit section below remains unchanged and
+PENDING with PMO/PO. This run neither wires nor suppresses speculative
+duty/C/D interrupt sources. Existing TGIA3/TCIV4 ICU paths, skipping and
+raw ELC sources are unchanged. This TWCR audit is a separate evidence
+gap; stage 2b cannot yet be described as waiting only for the duty
+interrupt decision.
+
+### Validation
+
+Evidence uses `stage2b6-*` names under `.issue49-runtime/`. The existing
+build and populated subprojects were reused without downloads. All scratch
+uses `.issue49-runtime/.t` or its existing `.s49` socket-path alias.
+
+| Check | Result and runtime evidence |
+| --- | --- |
+| RX-only rebuild | PASS: `stage2b6-build-final.log` |
+| Full MTU qtest | 67/67 PASS, 146.44 seconds: `stage2b6-regression.log` |
+| Configured RX qtests and quick functional tests | 32 suites OK, four existing skips, zero failures: `stage2b6-regression.log` |
+| Existing gdbsim U-Boot functional | PASS: `stage2b6-gdbsim-functional.log` |
+| Cached FIT PLL/HOCO before and after reset | Both PASS: `stage2b6-fit-pll.log`, `stage2b6-fit-hoco.log` |
+| SYSTEM protection/timing without/with FIT ELF | Both PASS: `stage2b6-system.log`, `stage2b6-system-elf.log` |
+| Both gdbsim machines listed/run three seconds | Both PASS: `stage2b6-machine-help.log`, `stage2b6-gdbsim-smoke.log` |
+| Final focused TDER waveform test | PASS: `stage2b6-tder-final.log` |
+| Changed-file and raw-diff checkpatch | Zero errors and warnings: `stage2b6-checkpatch-files.log`, `stage2b6-checkpatch-report.log`, `stage2b6-checkpatch-patch.log` |
+| Forward/reverse patch dry runs and byte reconstruction | PASS: `stage2b6-patch-validation.log` |
+
+All original 66 MTU cases remain. After full regression the only device
+source change was wrapping a long validation condition for style; no
+operation changed. The final rebuild and focused TDER case check the
+resulting tree. `stage2b6-regression-binary.sha256` identifies the binary
+used for full regression; `stage2b6-tested-binary.sha256` identifies the
+final rebuilt binary. Early focused runs exposed two test-oracle setup
+errors (the descending match edge and enabling PSYE for the final cycle
+pad assertion); these were corrected before the passing full regression.
+
+Reproduce from the worktree root:
+
+```sh
+. .issue49-runtime/env.sh
+make -C build -j$(nproc)
+bash .issue49-runtime/stage2b6-regression.sh
+scripts/checkpatch.pl --no-tree -f hw/rx/rx113-mtu.c \
+  tests/qtest/rx113-mtu-test.c docs/rx113/issue-49-mtu-advanced-report.md
+python3 .issue49-runtime/stage2b6-validate-patch.py
+```
+
+The patch contains three tracked files relative to the stated HEAD and
+excludes AGENTS.md, manuals, runtime/build assets, the scratch alias and
+repository metadata. The verifier reconstructs the HEAD files in worktree
+scratch, checks/applies forward and reverse patches, and compares all
+bytes with the working tree and base respectively, without writing `.git`.
+Raw-diff checkpatch uses `--no-signoff` for the uncommitted deliverable.
+Suggested commit subject:
+`hw/rx: Honor RX113 MTU dead-time suppression`.
+
 # Issue 49: RX113 MTU advanced output — stage 2b5 compensation delivery
 
 ## Current delivery (2026-11-11)

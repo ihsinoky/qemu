@@ -1337,6 +1337,68 @@ static void assert_complementary_pads(QTestState *qts, unsigned positive,
     assert_pad(qts, 0x16, false, false);
 }
 
+/* Figure 20.41: TDDR=1 retains the carrier offset, but no pad dead time. */
+static void test_complementary_no_dead_time(void)
+{
+    static const unsigned pads[] = { 0x22, 0x24, 0x30, 0x23, 0x25, 0x31 };
+
+    for (unsigned md = 13; md <= 15; md++) {
+        QTestState *qts = mtu_init();
+
+        /* A write without the qualifying read cannot clear TDER. */
+        qtest_writeb(qts, BASE + 0x34, 0);
+        g_assert_cmpuint(qtest_readb(qts, BASE + 0x34), ==, 1);
+        qtest_writeb(qts, BASE + 0x34, 0xfe);
+        g_assert_cmpuint(qtest_readb(qts, BASE + 0x34), ==, 0);
+        qtest_writeb(qts, BASE + 0x34, 1);
+        qtest_writeb(qts, BASE + 0x34, 0); /* Prior read saw zero. */
+        g_assert_cmpuint(qtest_readb(qts, BASE + 0x34), ==, 1);
+        qtest_writeb(qts, BASE + 0x34, 0);
+        complementary_setup(qts, md);
+        qtest_writeb(qts, BASE + mode[3], 0);
+        qtest_writew(qts, BASE + 0x16, 1);
+        qtest_writew(qts, BASE + tgr[3][2], 13);
+        qtest_writeb(qts, BASE + mode[3], 0x30 | md);
+        complementary_pads(qts);
+        qtest_writeb(qts, START, 0xc0);
+        for (unsigned edge = 0; edge <= 48; edge++) {
+            for (unsigned pol = 0; pol < 4; pol++) {
+                /* Both N settings must be ignored, globally and per phase. */
+                qtest_writeb(qts, BASE + 0xe, pol < 2 ? pol * 3 : 4);
+                qtest_writeb(qts, BASE + 0xf, pol == 2 ? 0x11 : 0x3b);
+                for (unsigned arm = 0; arm < 6; arm++) {
+                    unsigned phase = arm % 3;
+                    unsigned duty = 4 + phase * 2;
+                    unsigned t = edge % 24;
+                    bool on = edge >= 2 && t >= duty + 1 && t < 25 - duty;
+                    unsigned polarity = pol < 2 ? pol :
+                                        (0x11 >> (2 * phase)) & 1;
+
+                    assert_pad(qts, pads[arm], true,
+                               !polarity ^ on ^ (arm >= 3));
+                }
+            }
+            if (edge != 48) {
+                qtest_clock_step(qts, 124);
+                /* No transition before the count edge. */
+                g_assert_cmpuint(qtest_readw(qts, BASE + count[3]), ==,
+                                 edge % 24 <= 12 ? 1 + edge % 24 :
+                                 25 - edge % 24);
+                qtest_clock_step(qts, 1);
+            }
+        }
+        qtest_writeb(qts, START, 0);
+        qtest_writeb(qts, BASE + 0xe, 3);
+        qtest_writeb(qts, BASE + 0xe, 0x43);
+        assert_complementary_pads(qts, 0, 7, true);
+        qtest_qmp_assert_success(qts, "{'execute':'system_reset'}");
+        qtest_writew(qts, 0x803fe, 0xa503);
+        qtest_writel(qts, MSTPCRA, 0xeffffdff);
+        g_assert_cmpuint(qtest_readb(qts, BASE + 0x34), ==, 1);
+        qtest_quit(qts);
+    }
+}
+
 /* Table 20.39 plus independent carrier timing, observed through PORT/PIDR. */
 static void test_complementary_tgcr(void)
 {
@@ -2560,6 +2622,8 @@ int main(int argc, char **argv)
     }
     qtest_add_func("/rx113-mtu/complementary-tgcr-migration",
                    test_complementary_tgcr_migration);
+    qtest_add_func("/rx113-mtu/complementary-no-dead-time",
+                   test_complementary_no_dead_time);
     qtest_add_func("/rx113-mtu/complementary-tgcr",
                    test_complementary_tgcr);
     qtest_add_func("/rx113-mtu/complementary-arbitration",

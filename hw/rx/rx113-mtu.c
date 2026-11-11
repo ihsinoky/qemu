@@ -49,6 +49,8 @@ struct RX113MTUState {
     uint8_t tocr2;
     uint8_t tolbr;
     uint8_t tgcr;
+    uint8_t tder;
+    bool tder_read;
     uint8_t feedback;
     uint8_t mtic5;
     uint8_t reset_pwm;
@@ -285,6 +287,13 @@ static void mtu_output_update(RX113MTUState *s)
             bool on = !s->complementary_initial &&
                       (s->complementary_on & (1 << i));
 
+            if (!s->tder) {
+                /* Figure 20.41: MTU4 compares drive both inverse outputs. */
+                polarity = (s->tocr1 & 4) ?
+                    (s->tocr2 >> (2 * phase)) & 1 : s->tocr1 & 1;
+                on = (!s->complementary_initial &&
+                      (s->complementary_on & (1 << phase))) ^ (i >= 3);
+            }
             if (s->tgcr & 0x40) {
                 /* Table 20.39, in U/V/W positive then negative order. */
                 static const uint8_t arms[] = {
@@ -642,6 +651,14 @@ static void mtu_complementary_output(RX113MTUState *s)
             off_n |= (s->region == MTU_TB2_UP) && s->tcnts == next;
             on_n |= (s->region == MTU_TB2_DOWN || s->tcnts == s->tddr) &&
                     s->tcnts == old;
+        }
+        if (!s->tder) {
+            /* Coincident on/off retains the positive latch, without delay. */
+            if (on_p != off_p) {
+                s->complementary_on = (s->complementary_on & ~p) |
+                                      (on_p ? p : 0);
+            }
+            continue;
         }
         bool hold_p = on_p && off_p;
         bool hold_n = on_n && off_n;
@@ -1251,7 +1268,7 @@ static void mtu_clock_input(void *opaque, int pin, int level)
 enum {
     TCR, TMDR, TIOR, TIER, TSR, TCNT, TGR, TIER2, TBTM,
     TSTR, TSYR, TRWER, TSTR5, TIER5, CLEAR5, TOER, TOCR1, TOCR2, TOLBR,
-    TDDR, TCDR, TCBR, TCNTS, TITCR, TITCNT, TBTER, TGCR,
+    TDDR, TCDR, TCBR, TCNTS, TITCR, TITCNT, TBTER, TGCR, TDER,
 };
 
 typedef struct MTURegister {
@@ -1265,6 +1282,7 @@ typedef struct MTURegister {
 
 static const MTURegister mtu_regs[] = {
     { 0x00d, 1, 3, TGCR, 0, 0x7f },
+    { 0x034, 1, 3, TDER, 0, 0x01 },
     { 0x030, 1, 0, TITCR, 0, 0xff },
     { 0x031, 1, 0, TITCNT, 0, 0x00 },
     { 0x032, 1, 0, TBTER, 0, 0x03 },
@@ -1434,6 +1452,9 @@ static uint64_t mtu_read(void *opaque, hwaddr addr, unsigned size)
         return s->tocr2;
     case TOLBR:
         return s->tolbr;
+    case TDER:
+        s->tder_read = s->tder;
+        return s->tder;
     case TGCR:
         return s->tgcr | 0x80;
     case TDDR:
@@ -1611,6 +1632,12 @@ static void mtu_write(void *opaque, hwaddr addr, uint64_t value, unsigned size)
     case TOCR2:
         s->tocr2 = value;
         break;
+    case TDER:
+        if (value || s->tder_read) {
+            s->tder = value;
+        }
+        s->tder_read = false;
+        break;
     case TGCR:
         s->tgcr = value;
         break;
@@ -1681,6 +1708,8 @@ static void mtu_reset_hold(Object *obj, ResetType type)
     memset(s->pending_matches, 0, sizeof(s->pending_matches));
     s->toer = s->tocr1 = s->tocr2 = s->tolbr = 0;
     s->tgcr = 0;
+    s->tder = 1;
+    s->tder_read = false;
     s->reset_pwm = 0;
     s->tddr = s->tcdr = s->tcbr = UINT16_MAX;
     s->tcnts = 0;
@@ -1727,7 +1756,11 @@ static int mtu_post_load(void *opaque, int version_id)
 {
     RX113MTUState *s = opaque;
 
-    if (!s->hz || s->hz > 160000000 || s->region > MTU_TB2_DOWN ||
+    if (version_id < 10) {
+        s->tder = 1;
+    }
+    if ((s->tder & ~1) || !s->hz || s->hz > 160000000 ||
+        s->region > MTU_TB2_DOWN ||
         (s->mtic5 & ~7) || (s->feedback & ~7) || (s->tgcr & ~0x7f) ||
         (s->titcnt & 0x88) || (s->tbter & ~3) || (s->skip_ready & ~3)) {
         return -EINVAL;
@@ -1751,7 +1784,7 @@ static int mtu_post_load(void *opaque, int version_id)
 
 static const VMStateDescription vmstate_mtu = {
     .name = TYPE_RX113_MTU,
-    .version_id = 9,
+    .version_id = 10,
     .minimum_version_id = 1,
     .pre_save = mtu_pre_save,
     .post_load = mtu_post_load,
@@ -1794,6 +1827,8 @@ static const VMStateDescription vmstate_mtu = {
         VMSTATE_UINT8_V(tgcr, RX113MTUState, 8),
         VMSTATE_UINT8_V(feedback, RX113MTUState, 8),
         VMSTATE_UINT8_V(mtic5, RX113MTUState, 9),
+        VMSTATE_UINT8_V(tder, RX113MTUState, 10),
+        VMSTATE_BOOL_V(tder_read, RX113MTUState, 10),
         VMSTATE_END_OF_LIST()
     },
 };
