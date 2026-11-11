@@ -710,6 +710,23 @@ static void port_update(RX113PortState *s, bool notify)
         qemu_set_irq(s->rxd_lines[sig], rxd);
         qemu_set_irq(s->sck_sense[sig], sck);
     }
+    /* Forward the resolved MTIOC pad levels to the MTU (Issue #68). */
+    for (unsigned sig = 0; sig < RX113_MTIOC_PINS; sig++) {
+        bool level = true;
+
+        for (unsigned port = 0; port < RX113_PORT_COUNT; port++) {
+            for (unsigned bit = 0; bit < 8; bit++) {
+                unsigned name = port * 16 + bit;
+                unsigned psel = s->regs[PFS + port * 8 + bit] & PSEL;
+
+                if ((s->regs[PMR + port] & (1 << bit)) &&
+                    mtioc_signal(name, psel) == (int)sig) {
+                    level = (s->levels[port] >> bit) & 1;
+                }
+            }
+        }
+        qemu_set_irq(s->mtioc_in[sig], level);
+    }
 }
 
 /* Table 19.1: POE inputs all use PSEL=7. */
@@ -1115,6 +1132,8 @@ static void port_init(Object *obj)
     qdev_init_gpio_out_named(dev, s->mtic5, "mtic5", 3);
     qdev_init_gpio_out_named(dev, s->rxd_lines, "rxd", 8);
     qdev_init_gpio_out_named(dev, s->sck_sense, "sck-sense", 8);
+    qdev_init_gpio_out_named(dev, s->mtioc_in, "mtioc-in",
+                             RX113_MTIOC_PINS);
     qdev_init_gpio_in_named(dev, port_mtioc_input, "mtioc",
                             RX113_MTIOC_PINS * 2);
     qdev_init_gpio_in_named(dev, port_tmo_input, "tmo", 8);
