@@ -141,3 +141,30 @@ evidence, validity boundary, promoted-to. Newest first.
   The shared-model change also affects the RX62N TMR, whose
   manual carries the same cascade text; D-007 regression rules
   apply.
+
+## F-004: D-016 (TWCR.CCE clear moves counters only) is consistent with the manual's operation example (2026-11-11)
+
+- **Conclusion:** D-016 stands. Figure 20.62 (Example of Counter
+  Clearing Operation by MTU3.TGRA Compare Match) shows the
+  counters cleared at the TGRA match and the output continuing
+  with the same TCDR / MTU3.TGRB / TDDR levels across the clear;
+  no buffer or temporary-register transfer is depicted at the
+  clear, and no text anywhere assigns the clear a transfer
+  effect. Transfers therefore happen only at their natural
+  boundary, as D-016 composes the two documented rules.
+- **Confidence:** Moderate. Based on the manual's own timing
+  figure plus the absence of contrary text; no external source
+  (errata, app note, forum report) addresses the interaction.
+- **Evidence:**
+  1. RX113 manual §20.2.30 (TWCR): CCE "specifies whether to
+     clear counters at the MTU3.TGRA compare match" — counters
+     only.
+  2. RX113 manual §20.3 (o) and Figure 20.62: the counter is
+     cleared at the TGRA match; TCDR, TGRB and TDDR levels are
+     drawn unchanged across the event and the second cycle
+     repeats identically.
+  3. TWCR.WRE text ties waveform behaviour at synchronous
+     clearing to the Tb interval, again with no transfer effect.
+- **Validity boundary:** Complementary PWM mode 1 (the only mode
+  CCE may be used in, per the manual's notes).
+- **Promoted-to:** Issue #51. No supersede proposed; D-016 stands.
