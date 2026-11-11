@@ -58,8 +58,9 @@ evidence, validity boundary, promoted-to. Newest first.
 - **Validity boundary:** POE2a on RX113 as documented at Rev.1.20;
   corroborated across POE3/POE3a/POE3b generations. Not a
   substitute for a vendor answer or silicon test.
-- **Promoted-to:** Issue #51; supersede of D-018 raised as a PO
-  gate on 2026-11-11 (decision pending).
+- **Promoted-to:** D-020 (supersedes D-018), accepted by the PO on
+  2026-11-11; implemented in PR #55 (strict write-once via the
+  generic section-21 field latch, `poe-ostste-once` qtest).
 
 ## F-002: D-015 (complementary-PWM duty interrupts only on own-counter matches) is supported; no contradicting evidence (2026-11-11)
 
@@ -136,11 +137,17 @@ evidence, validity boundary, promoted-to. Newest first.
   Issue #50 stage 1.
 - **Validity boundary:** TMR units 0 and 1 (the text covers both;
   §22.5 describes unit 0 and states unit 1 is the same).
-- **Promoted-to:** Issue #51; a fix (generate channel-1 low-byte
-  match events in wide mode) raised as a PO gate on 2026-11-11.
-  The shared-model change also affects the RX62N TMR, whose
-  manual carries the same cascade text; D-007 regression rules
-  apply.
+- **Promoted-to:** Fix accepted by the PO on 2026-11-11 and
+  implemented in PR #56: the clock-managed path now generates
+  channel-1 low-byte match events in 16-bit count mode
+  (`cascade-output` qtest, plus an `independent-channels` guard
+  test). The change is confined to the clock-managed path that
+  only RX113 opts into; the legacy path used by RX62N is
+  untouched, so RX62N behaviour is unchanged (the RX62N manual
+  carries the same cascade text, but changing its model was out
+  of scope under D-007). Residual: OVI1 in 16-bit count mode is
+  still not generated; the manual does not state whether the
+  low-byte wrap raises it.
 
 ## F-004: D-016 (TWCR.CCE clear moves counters only) is consistent with the manual's operation example (2026-11-11)
 
