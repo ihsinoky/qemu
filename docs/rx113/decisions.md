@@ -425,3 +425,23 @@ Points settled by the PMO under the issue instruction; stage 2
 - The PORT SCK map (Tables 19.3 to 19.16, PSEL 10/11/12) uses
   the TXD channel order, so one signal-index table in rx113.c
   serves both.
+
+Stage 2 (RXD sampling) adds:
+
+- Pad input is a second opt-in, `has-input`: the PORT forwards
+  the resolved RXD and SCK pad levels (idle high when unselected)
+  and the SCI samples them. The chardev receive path is not
+  replaced; both sources deliver through the same RDR logic, and
+  whichever completes a byte first wins.
+- Asynchronous sampling verifies the start bit at its centre
+  and samples at bit centres, so a sub-half-bit low pulse is a
+  false start, not a frame. FER/PER latch with the byte; an
+  overrun drops it, matching the chardev path.
+- Reception-only clock generation (section 28.5.1) runs on its
+  own half-phase engine so it can stop on overrun and resume
+  after a transmission without disturbing the TX engine; while
+  transmitting, the receiver samples on the TX engine's rising
+  edges (one clock, full duplex).
+- The external-clock direction reuses the same `has-input`
+  wiring: the forwarded SCK level is the clock, rising edges
+  sample RXD, falling edges present TXD bits.

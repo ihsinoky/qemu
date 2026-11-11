@@ -88,6 +88,9 @@ static void sci_clock_sync(RSCIState *s)
     s->clock_tick = now;
 }
 
+static void sci_receive_overrun(RSCIState *sci);
+static void sci_receive_byte(RSCIState *sci, uint8_t byte);
+
 static int can_receive(void *opaque)
 {
     RSCIState *sci = RSCI(opaque);
@@ -113,19 +116,10 @@ static void receive(void *opaque, const uint8_t *buf, int size)
         sci->rx_remaining = sci->trtime * sci->input_freq;
         timer_mod(&sci->rx_timer, sci->rx_next);
     }
-    if (FIELD_EX8(sci->ssr, SSR, RDRF) || size > 1) {
-        sci->ssr = FIELD_DP8(sci->ssr, SSR, ORER, 1);
-        qemu_irq_pulse(sci->event[ERI]);
-        if (FIELD_EX8(sci->scr, SCR, RIE)) {
-            qemu_set_irq(sci->irq[ERI], 1);
-        }
+    if (size > 1) {
+        sci_receive_overrun(sci);
     } else {
-        sci->rdr = buf[0];
-        sci->ssr = FIELD_DP8(sci->ssr, SSR, RDRF, 1);
-        qemu_irq_pulse(sci->event[RXI]);
-        if (FIELD_EX8(sci->scr, SCR, RIE)) {
-            qemu_irq_pulse(sci->irq[RXI]);
-        }
+        sci_receive_byte(sci, buf[0]);
     }
 }
 
@@ -155,10 +149,63 @@ static void sci_sck_push(RSCIState *s)
         return;
     }
     qemu_set_irq(s->sck, s->sck_level);
-    qemu_set_irq(s->sck_oe, FIELD_EX8(s->scr, SCR, TE) &&
+    qemu_set_irq(s->sck_oe, (FIELD_EX8(s->scr, SCR, TE) ||
+                             FIELD_EX8(s->scr, SCR, RE)) &&
                             FIELD_EX8(s->smr, SMR, CM) &&
                             sci_sync_internal_clock(s) &&
                             !s->module_stopped);
+}
+
+/* Shared receive delivery: an overrun drops the new byte. */
+static void sci_receive_overrun(RSCIState *sci)
+{
+    sci->ssr = FIELD_DP8(sci->ssr, SSR, ORER, 1);
+    qemu_irq_pulse(sci->event[ERI]);
+    if (FIELD_EX8(sci->scr, SCR, RIE)) {
+        qemu_set_irq(sci->irq[ERI], 1);
+    }
+}
+
+static void sci_receive_byte(RSCIState *sci, uint8_t byte)
+{
+    if (FIELD_EX8(sci->ssr, SSR, RDRF)) {
+        sci_receive_overrun(sci);
+    } else {
+        sci->rdr = byte;
+        sci->ssr = FIELD_DP8(sci->ssr, SSR, RDRF, 1);
+        qemu_irq_pulse(sci->event[RXI]);
+        if (FIELD_EX8(sci->scr, SCR, RIE)) {
+            qemu_irq_pulse(sci->irq[RXI]);
+        }
+    }
+}
+
+/*
+ * Pad-path delivery: framing and parity errors are latched with the
+ * byte (an overrun still drops it, error flags included).
+ */
+static void sci_pad_deliver(RSCIState *s, uint8_t byte, bool fer, bool per)
+{
+    if (FIELD_EX8(s->ssr, SSR, RDRF)) {
+        sci_receive_overrun(s);
+        return;
+    }
+    if (fer) {
+        s->ssr = FIELD_DP8(s->ssr, SSR, FER, 1);
+    }
+    if (per) {
+        s->ssr = FIELD_DP8(s->ssr, SSR, PER, 1);
+    }
+    s->rdr = byte;
+    s->ssr = FIELD_DP8(s->ssr, SSR, RDRF, 1);
+    qemu_irq_pulse(s->event[RXI]);
+    if (FIELD_EX8(s->scr, SCR, RIE)) {
+        qemu_irq_pulse(s->irq[RXI]);
+        if (fer || per) {
+            qemu_irq_pulse(s->event[ERI]);
+            qemu_set_irq(s->irq[ERI], 1);
+        }
+    }
 }
 
 static unsigned sci_tx_data_bits(RSCIState *s)
@@ -233,6 +280,9 @@ static void sci_tx_arm_bit(RSCIState *s)
     timer_mod(&s->tx_bit_timer, s->tx_deadline);
 }
 
+static void sci_rx_sync_sample(RSCIState *s);
+static void sci_rx_sck_update(RSCIState *s);
+
 /*
  * Clock-synchronous transmission (section 28.5): a frame is eight data
  * bits with no start, parity or stop bit. TXD changes on the falling
@@ -267,6 +317,9 @@ static void sci_tx_sync_expire(RSCIState *s)
         /* Mid-bit: SCK rises; receivers sample on this edge. */
         s->sck_level = true;
         sci_sck_push(s);
+        if (s->has_input && FIELD_EX8(s->scr, SCR, RE)) {
+            sci_rx_sync_sample(s);
+        }
         s->tx_sync_rise = false;
         s->tx_deadline += s->tx_sync_bit_ns - half;
         sci_tx_sync_arm(s, s->tx_sync_bit_ns - half);
@@ -281,6 +334,8 @@ static void sci_tx_sync_expire(RSCIState *s)
             s->tx_pending_valid = false;
             sci_tx_sync_frame_start_at(s, s->tx_pending_shift,
                                        s->tx_deadline);
+        } else {
+            sci_rx_sck_update(s); /* resume reception-only clocking */
         }
         return;
     }
@@ -311,6 +366,7 @@ static void sci_tx_sync_frame_start_at(RSCIState *s, uint8_t byte,
     s->tx_sync_rise = true;
     s->tx_deadline = start + s->tx_sync_bit_ns / 2;
     sci_tx_sync_arm(s, s->tx_sync_bit_ns / 2);
+    sci_rx_sck_update(s); /* transmission takes over the clock */
 }
 
 static void sci_tx_sync_frame_start(RSCIState *s)
@@ -323,6 +379,249 @@ static void sci_tx_sync_frame_start(RSCIState *s)
     }
     sci_tx_sync_frame_start_at(s, s->tdr,
                                qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+}
+
+/*
+ * Pad reception (Issue #65 stage 2, opt-in has-input): the PORT
+ * forwards the resolved RXD and SCK pad levels, and the SCI samples
+ * them with the same bit timing as the transmit engines. The chardev
+ * receive path stays available alongside; whichever source completes
+ * a byte first delivers it.
+ */
+
+/* One synchronous data bit, sampled on a rising SCK edge. */
+static void sci_rx_sync_sample(RSCIState *s)
+{
+    unsigned idx = FIELD_EX8(s->scmr, SCMR, SDIR) ? 7 - s->rx_sync_bit
+                                                  : s->rx_sync_bit;
+    bool level = s->rxd_level;
+
+    if (FIELD_EX8(s->scmr, SCMR, SINV)) {
+        level = !level;
+    }
+    if (level) {
+        s->rx_sync_shift |= 1 << idx;
+    }
+    s->rx_sync_bit++;
+    if (s->rx_sync_bit == 8) {
+        sci_pad_deliver(s, s->rx_sync_shift, false, false);
+        s->rx_sync_shift = 0;
+        s->rx_sync_bit = 0;
+    }
+}
+
+static int64_t sci_rx_sck_bit_ns(RSCIState *s)
+{
+    unsigned slots = sci_tx_slots(s);
+
+    return slots ? s->trtime / slots : 0;
+}
+
+/*
+ * Reception-only clock generation (section 28.5.1): with the
+ * internal clock, setting RE starts the SCK output; an overrun or
+ * clearing RE stops it at the high level. While a transmission is
+ * active its engine owns the clock and this one stays off.
+ */
+static void sci_rx_sck_update(RSCIState *s)
+{
+    bool want = s->has_input && !s->module_stopped &&
+                FIELD_EX8(s->smr, SMR, CM) && sci_sync_internal_clock(s) &&
+                FIELD_EX8(s->scr, SCR, RE) &&
+                !FIELD_EX8(s->ssr, SSR, ORER) && !s->tx_active;
+
+    if (want && !s->rx_sck_active) {
+        int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+        s->rx_sck_active = true;
+        s->rx_sync_shift = 0;
+        s->rx_sync_bit = 0;
+        s->sck_level = false; /* the first falling edge opens a burst */
+        sci_sck_push(s);
+        s->rx_sck_rise_next = true;
+        s->rx_sck_deadline = now + sci_rx_sck_bit_ns(s) / 2;
+        timer_mod(&s->rx_sck_timer, s->rx_sck_deadline);
+    } else if (!want && s->rx_sck_active) {
+        s->rx_sck_active = false;
+        timer_del(&s->rx_sck_timer);
+        s->sck_level = true;
+        sci_sck_push(s);
+    }
+}
+
+static void sci_rx_sck_expire(void *opaque)
+{
+    RSCIState *s = opaque;
+    int64_t bit_ns = sci_rx_sck_bit_ns(s);
+    int64_t half = bit_ns / 2;
+
+    if (!s->rx_sck_active) {
+        return;
+    }
+    if (s->rx_sck_rise_next) {
+        s->sck_level = true;
+        sci_sck_push(s);
+        sci_rx_sync_sample(s);
+        sci_rx_sck_update(s); /* an overrun stops the clock */
+        if (!s->rx_sck_active) {
+            return;
+        }
+        s->rx_sck_rise_next = false;
+        s->rx_sck_deadline += bit_ns - half;
+        timer_mod(&s->rx_sck_timer, s->rx_sck_deadline);
+        return;
+    }
+    s->sck_level = false;
+    sci_sck_push(s);
+    s->rx_sck_rise_next = true;
+    s->rx_sck_deadline += half;
+    timer_mod(&s->rx_sck_timer, s->rx_sck_deadline);
+}
+
+/* Asynchronous sampling: frame positions mirror the TX engine. */
+static void sci_rx_sample_expire(void *opaque)
+{
+    RSCIState *s = opaque;
+    unsigned data_bits = sci_tx_data_bits(s);
+    bool level = s->rxd_level;
+
+    if (!s->rx_active) {
+        return;
+    }
+    if (s->rx_bit == 0) {
+        if (level) {
+            s->rx_active = false; /* false start bit */
+            return;
+        }
+    } else if (s->rx_bit <= data_bits) {
+        unsigned idx = FIELD_EX8(s->scmr, SCMR, SDIR) ?
+                       data_bits - s->rx_bit : s->rx_bit - 1;
+
+        if (FIELD_EX8(s->scmr, SCMR, SINV)) {
+            level = !level;
+        }
+        if (level) {
+            s->rx_shift |= 1 << idx;
+        }
+    } else if (s->rx_bit == data_bits + 1 &&
+               (FIELD_EX8(s->smr, SMR, PE) || FIELD_EX8(s->smr, SMR, MP))) {
+        if (FIELD_EX8(s->smr, SMR, MP) && !FIELD_EX8(s->smr, SMR, PE)) {
+            s->rx_mpb = level;
+        } else {
+            bool parity = __builtin_parity(s->rx_shift);
+
+            if (FIELD_EX8(s->smr, SMR, PM)) {
+                parity = !parity;
+            }
+            if (level != parity) {
+                s->rx_per = true;
+            }
+        }
+    } else {
+        /* The first stop-bit position completes the frame. */
+        if (FIELD_EX8(s->smr, SMR, MP)) {
+            s->ssr = FIELD_DP8(s->ssr, SSR, MPB, s->rx_mpb);
+        }
+        sci_pad_deliver(s, s->rx_shift, !level, s->rx_per);
+        s->rx_active = false;
+        return;
+    }
+    s->rx_bit++;
+    s->rx_deadline += s->rx_bit_ns;
+    timer_mod(&s->rx_sample_timer, s->rx_deadline);
+}
+
+static void sci_rxd_input(void *opaque, int pin, int level)
+{
+    RSCIState *s = opaque;
+    bool previous = s->rxd_level;
+    unsigned slots;
+    int64_t now;
+
+    s->rxd_level = !!level;
+    if (!s->has_input || s->module_stopped ||
+        !FIELD_EX8(s->scr, SCR, RE) || FIELD_EX8(s->smr, SMR, CM) ||
+        !previous || level || s->rx_active) {
+        return;
+    }
+    /* A falling edge may open a start bit. */
+    slots = sci_tx_slots(s);
+    now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    s->rx_bit_ns = slots ? s->trtime / slots : 0;
+    s->rx_shift = 0;
+    s->rx_bit = 0;
+    s->rx_per = false;
+    s->rx_mpb = false;
+    s->rx_active = true;
+    s->rx_deadline = now + s->rx_bit_ns / 2;
+    timer_mod(&s->rx_sample_timer, s->rx_deadline);
+}
+
+/* External-clock synchronous transmission (stage 2). */
+static void sci_tx_ext_frame_start_at(RSCIState *s, uint8_t byte)
+{
+    s->tx_ext_active = true;
+    s->tx_ext_bit = 0;
+    s->tx_shift = byte;
+    s->tx_level = sci_tx_sync_bit_value(s, 0);
+    sci_txd_push(s);
+}
+
+static void sci_tx_ext_frame_start(RSCIState *s)
+{
+    if (s->tx_ext_active) {
+        s->tx_pending_shift = s->tdr;
+        s->tx_pending_valid = true;
+        return;
+    }
+    sci_tx_ext_frame_start_at(s, s->tdr);
+}
+
+static void sci_sck_in_input(void *opaque, int pin, int level)
+{
+    RSCIState *s = opaque;
+    bool previous = s->sck_in_level;
+
+    s->sck_in_level = !!level;
+    if (!s->has_input || s->module_stopped ||
+        !FIELD_EX8(s->smr, SMR, CM) || sci_sync_internal_clock(s) ||
+        previous == s->sck_in_level) {
+        return;
+    }
+    if (s->sck_in_level) {
+        /* Rising edge: sample RXD. */
+        if (FIELD_EX8(s->scr, SCR, RE)) {
+            unsigned idx = FIELD_EX8(s->scmr, SCMR, SDIR) ?
+                           7 - s->rx_ext_bit : s->rx_ext_bit;
+            bool bit = s->rxd_level;
+
+            if (FIELD_EX8(s->scmr, SCMR, SINV)) {
+                bit = !bit;
+            }
+            if (bit) {
+                s->rx_ext_shift |= 1 << idx;
+            }
+            s->rx_ext_bit++;
+            if (s->rx_ext_bit == 8) {
+                sci_pad_deliver(s, s->rx_ext_shift, false, false);
+                s->rx_ext_shift = 0;
+                s->rx_ext_bit = 0;
+            }
+        }
+    } else if (s->tx_ext_active) {
+        /* Falling edge: present the next transmit bit. */
+        s->tx_ext_bit++;
+        if (s->tx_ext_bit >= 8) {
+            s->tx_ext_active = false;
+            if (s->tx_pending_valid) {
+                s->tx_pending_valid = false;
+                sci_tx_ext_frame_start_at(s, s->tx_pending_shift);
+            }
+        } else {
+            s->tx_level = sci_tx_sync_bit_value(s, s->tx_ext_bit);
+            sci_txd_push(s);
+        }
+    }
 }
 
 static void sci_tx_frame_start_at(RSCIState *s, uint8_t byte, int64_t start);
@@ -419,6 +718,8 @@ static void send_byte(RSCIState *sci)
             sci_tx_frame_start(sci);
         } else if (sci_sync_internal_clock(sci)) {
             sci_tx_sync_frame_start(sci);
+        } else if (sci->has_input) {
+            sci_tx_ext_frame_start(sci);
         }
     }
 }
@@ -505,6 +806,13 @@ static void sci_write(void *opaque, hwaddr offset, uint64_t val, unsigned size)
             sci_txd_push(sci);
             sci_sck_push(sci);
         }
+        if (sci->has_input) {
+            if (!FIELD_EX8(sci->scr, SCR, RE) && sci->rx_active) {
+                sci->rx_active = false;
+                timer_del(&sci->rx_sample_timer);
+            }
+            sci_rx_sck_update(sci);
+        }
         break;
     case A_TDR:
         sci->tdr = val;
@@ -523,6 +831,7 @@ static void sci_write(void *opaque, hwaddr offset, uint64_t val, unsigned size)
             FIELD_EX8(sci->ssr, SSR, ERR) == 0) {
             qemu_set_irq(sci->irq[ERI], 0);
         }
+        sci_rx_sck_update(sci); /* a cleared overrun restarts the clock */
         break;
     case A_RDR:
         qemu_log_mask(LOG_GUEST_ERROR, "reneas_sci: RDR is read only.\n");
@@ -618,6 +927,10 @@ void renesas_sci_set_clock(RSCIState *s, uint64_t freq, bool stopped)
     timer_del(&s->timer);
     timer_del(&s->rx_timer);
     timer_del(&s->tx_bit_timer);
+    timer_del(&s->rx_sample_timer);
+    timer_del(&s->rx_sck_timer);
+    s->rx_active = false;
+    s->rx_sck_active = false;
     s->clock_managed = true;
     s->input_freq = freq;
     s->module_stopped = stopped;
@@ -635,6 +948,7 @@ void renesas_sci_set_clock(RSCIState *s, uint64_t freq, bool stopped)
     }
     sci_txd_push(s);
     sci_sck_push(s);
+    sci_rx_sck_update(s);
 }
 
 static void rsci_reset(DeviceState *dev)
@@ -649,11 +963,23 @@ static void rsci_reset(DeviceState *dev)
         sci->tx_remaining = sci->rx_remaining = 0;
     }
     timer_del(&sci->tx_bit_timer);
+    timer_del(&sci->rx_sample_timer);
+    timer_del(&sci->rx_sck_timer);
     sci->tx_active = false;
     sci->tx_sync = false;
     sci->tx_level = true;
     sci->sck_level = true;
     sci->tx_bit = 0;
+    sci->rxd_level = true;
+    sci->sck_in_level = true;
+    sci->rx_active = false;
+    sci->rx_sck_active = false;
+    sci->tx_ext_active = false;
+    sci->tx_ext_bit = 0;
+    sci->rx_sync_bit = 0;
+    sci->rx_sync_shift = 0;
+    sci->rx_ext_bit = 0;
+    sci->rx_ext_shift = 0;
     sci->smr = sci->scr = 0x00;
     sci->brr = 0xff;
     sci->tdr = 0xff;
@@ -712,10 +1038,16 @@ static void rsci_init(Object *obj)
     qdev_init_gpio_out_named(DEVICE(obj), &sci->txd_oe, "txd-oe", 1);
     qdev_init_gpio_out_named(DEVICE(obj), &sci->sck, "sck", 1);
     qdev_init_gpio_out_named(DEVICE(obj), &sci->sck_oe, "sck-oe", 1);
+    qdev_init_gpio_in_named(DEVICE(obj), sci_rxd_input, "rxd", 1);
+    qdev_init_gpio_in_named(DEVICE(obj), sci_sck_in_input, "sck-in", 1);
     timer_init_ns(&sci->timer, QEMU_CLOCK_VIRTUAL, txend, sci);
     timer_init_ns(&sci->tx_bit_timer, QEMU_CLOCK_VIRTUAL,
                   sci_tx_bit_expire, sci);
     timer_init_ns(&sci->rx_timer, QEMU_CLOCK_VIRTUAL, sci_rx_ready, sci);
+    timer_init_ns(&sci->rx_sample_timer, QEMU_CLOCK_VIRTUAL,
+                  sci_rx_sample_expire, sci);
+    timer_init_ns(&sci->rx_sck_timer, QEMU_CLOCK_VIRTUAL,
+                  sci_rx_sck_expire, sci);
 }
 
 static int sci_pre_load(void *opaque)
@@ -814,6 +1146,43 @@ static const VMStateDescription vmstate_sci_output = {
     },
 };
 
+static bool sci_input_needed(void *opaque)
+{
+    RSCIState *s = opaque;
+
+    return s->has_input;
+}
+
+static const VMStateDescription vmstate_sci_input = {
+    .name = "renesas-sci/input",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = sci_input_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_BOOL(rxd_level, RSCIState),
+        VMSTATE_BOOL(sck_in_level, RSCIState),
+        VMSTATE_BOOL(rx_active, RSCIState),
+        VMSTATE_UINT8(rx_shift, RSCIState),
+        VMSTATE_UINT8(rx_bit, RSCIState),
+        VMSTATE_INT64(rx_bit_ns, RSCIState),
+        VMSTATE_INT64(rx_deadline, RSCIState),
+        VMSTATE_BOOL(rx_per, RSCIState),
+        VMSTATE_BOOL(rx_mpb, RSCIState),
+        VMSTATE_TIMER(rx_sample_timer, RSCIState),
+        VMSTATE_BOOL(rx_sck_active, RSCIState),
+        VMSTATE_BOOL(rx_sck_rise_next, RSCIState),
+        VMSTATE_INT64(rx_sck_deadline, RSCIState),
+        VMSTATE_UINT8(rx_sync_shift, RSCIState),
+        VMSTATE_UINT8(rx_sync_bit, RSCIState),
+        VMSTATE_TIMER(rx_sck_timer, RSCIState),
+        VMSTATE_BOOL(tx_ext_active, RSCIState),
+        VMSTATE_UINT8(tx_ext_bit, RSCIState),
+        VMSTATE_UINT8(rx_ext_shift, RSCIState),
+        VMSTATE_UINT8(rx_ext_bit, RSCIState),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static const VMStateDescription vmstate_rsci = {
     .name = "renesas-sci",
     .version_id = 1,
@@ -837,6 +1206,7 @@ static const VMStateDescription vmstate_rsci = {
     .subsections = (const VMStateDescription * const[]) {
         &vmstate_sci_clock,
         &vmstate_sci_output,
+        &vmstate_sci_input,
         NULL
     },
 };
@@ -844,6 +1214,7 @@ static const VMStateDescription vmstate_rsci = {
 static const Property rsci_properties[] = {
     DEFINE_PROP_UINT64("input-freq", RSCIState, input_freq, 0),
     DEFINE_PROP_BOOL("has-output", RSCIState, has_output, false),
+    DEFINE_PROP_BOOL("has-input", RSCIState, has_input, false),
     DEFINE_PROP_CHR("chardev", RSCIState, chr),
 };
 

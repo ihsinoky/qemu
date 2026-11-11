@@ -60,6 +60,28 @@ struct RSCIState {
     int64_t tx_sync_bit_ns;
     bool sck_level;
     QEMUTimer tx_bit_timer;
+    /* Opt-in RXD/SCK pad input sampling (Issue #65 stage 2). */
+    bool has_input;
+    bool rxd_level;
+    bool sck_in_level;
+    QEMUTimer rx_sample_timer;
+    bool rx_active;
+    uint8_t rx_shift;
+    uint8_t rx_bit;
+    int64_t rx_bit_ns;
+    int64_t rx_deadline;
+    bool rx_per;
+    bool rx_mpb;
+    QEMUTimer rx_sck_timer;
+    bool rx_sck_active;
+    bool rx_sck_rise_next;
+    int64_t rx_sck_deadline;
+    uint8_t rx_sync_shift;
+    uint8_t rx_sync_bit;
+    bool tx_ext_active;
+    uint8_t tx_ext_bit;
+    uint8_t rx_ext_shift;
+    uint8_t rx_ext_bit;
     uint8_t tx_shift;
     uint8_t tx_bit;
     uint8_t tx_frame_bits;
