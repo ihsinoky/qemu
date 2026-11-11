@@ -60,6 +60,11 @@ struct RTMRState {
     bool has_elc;
     uint8_t elc_mode;
     bool elc_started;
+    /* Opt-in TMOn pad outputs (Issue #50); unused unless has_output. */
+    bool has_output;
+    uint8_t output[TMR_CH];
+    qemu_irq tmo[TMR_CH];
+    qemu_irq tmo_oe[TMR_CH];
     qemu_irq cmia[TMR_CH];
     qemu_irq cmib[TMR_CH];
     qemu_irq ovi[TMR_CH];

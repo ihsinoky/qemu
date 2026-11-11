@@ -30,6 +30,9 @@ struct RX113RTCState {
     qemu_irq cup;
     qemu_irq prd_lcdc;
     qemu_irq rtc_enable;
+    /* Issue #50: RTCOUT pad level and output enable for the PORT mux. */
+    qemu_irq rtcout;
+    qemu_irq rtcout_oe;
 
     /* Calendar mode counters, raw BCD register values (24.2.2 - 24.2.8) */
     uint8_t sec;

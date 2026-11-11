@@ -90,6 +90,45 @@ static uint16_t tmr_count(uint8_t *r, bool wide, int ch)
     return wide ? (r[0] << 8) | r[1] : r[ch];
 }
 
+/*
+ * Issue #50: TMOn pad output (manual 22.2.6, 22.3.1). Opt-in through
+ * the has-output property; with it clear nothing here runs, so the
+ * legacy RX62N behaviour is untouched. The output enable follows
+ * TCSR: both OSA and OSB zero negates the enable (Hi-Z request);
+ * otherwise the pin is driven, low until the first compare match.
+ */
+static void tmr_output_drive(RTMRState *s, int ch)
+{
+    if (!s->has_output) {
+        return;
+    }
+    qemu_set_irq(s->tmo[ch], s->output[ch]);
+    qemu_set_irq(s->tmo_oe[ch], !s->module_stopped &&
+                 (FIELD_EX8(s->tcsr[ch], TCSR, OSA) ||
+                  FIELD_EX8(s->tcsr[ch], TCSR, OSB)));
+}
+
+static void tmr_output_match(RTMRState *s, int ch, unsigned sel)
+{
+    if (!s->has_output) {
+        return;
+    }
+    switch (sel) {
+    case 1:
+        s->output[ch] = 0;
+        break;
+    case 2:
+        s->output[ch] = 1;
+        break;
+    case 3:
+        s->output[ch] ^= 1;
+        break;
+    default:
+        return;
+    }
+    tmr_output_drive(s, ch);
+}
+
 static void tmr_sync(RTMRState *s)
 {
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
@@ -154,6 +193,12 @@ static void tmr_match(RTMRState *s, int ch, unsigned events)
     }
     if ((events & 2) && FIELD_EX8(s->tcr[ch], TCR, CMIEB)) {
         qemu_irq_pulse(s->cmib[ch]);
+    }
+    if (events & 1) {
+        tmr_output_match(s, ch, FIELD_EX8(s->tcsr[ch], TCSR, OSA));
+    }
+    if (events & 2) {
+        tmr_output_match(s, ch, FIELD_EX8(s->tcsr[ch], TCSR, OSB));
     }
     if ((events & 4) && FIELD_EX8(s->tcr[ch], TCR, OVIE)) {
         qemu_irq_pulse(s->ovi[ch]);
@@ -454,9 +499,23 @@ static void tmr_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
     case A_TCR:
         tmr->tcr[ch] = val;
         break;
-    case A_TCSR:
+    case A_TCSR: {
+        bool was_enabled = FIELD_EX8(tmr->tcsr[ch], TCSR, OSA) ||
+                           FIELD_EX8(tmr->tcsr[ch], TCSR, OSB);
+        bool now_enabled;
+
         tmr->tcsr[ch] = val;
+        now_enabled = FIELD_EX8(tmr->tcsr[ch], TCSR, OSA) ||
+                      FIELD_EX8(tmr->tcsr[ch], TCSR, OSB);
+        if (tmr->has_output) {
+            /* 22.3.1: driven low from enabling until the first match. */
+            if (!was_enabled && now_enabled) {
+                tmr->output[ch] = 0;
+            }
+            tmr_output_drive(tmr, ch);
+        }
         break;
+    }
     case A_TCORA:
         tmr_write_count(tmr, ch, size, tmr->tcora, val);
         break;
@@ -514,6 +573,8 @@ static uint16_t issue_event(RTMRState *tmr, int ch, int sz,
     case cmia:
         if (tcnt >= tcora) {
             qemu_irq_pulse(tmr->event[ch * 3]);
+            tmr_output_match(tmr, ch,
+                             FIELD_EX8(tmr->tcsr[ch], TCSR, OSA));
             if (FIELD_EX8(tmr->tcr[ch], TCR, CCLR) == CCLR_A) {
                 ret = tcnt - tcora;
             }
@@ -530,6 +591,8 @@ static uint16_t issue_event(RTMRState *tmr, int ch, int sz,
     case cmib:
         if (tcnt >= tcorb) {
             qemu_irq_pulse(tmr->event[ch * 3 + 1]);
+            tmr_output_match(tmr, ch,
+                             FIELD_EX8(tmr->tcsr[ch], TCSR, OSB));
             if (FIELD_EX8(tmr->tcr[ch], TCR, CCLR) == CCLR_B) {
                 ret = tcnt - tcorb;
             }
@@ -663,6 +726,7 @@ void renesas_tmr_set_clock(RTMRState *s, uint64_t freq, bool stopped)
     s->module_stopped = stopped;
     for (ch = 0; ch < TMR_CH; ch++) {
         tmr_schedule(s, ch);
+        tmr_output_drive(s, ch);
     }
 }
 
@@ -688,6 +752,9 @@ static void rtmr_reset(DeviceState *dev)
     tmr->tccr[0]  = tmr->tccr[1]  = 0x00;
     tmr->next[0]  = tmr->next[1]  = none;
     tmr->tick = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    tmr->output[0] = tmr->output[1] = 0;
+    tmr_output_drive(tmr, 0);
+    tmr_output_drive(tmr, 1);
 }
 
 static void rtmr_init(Object *obj)
@@ -707,6 +774,8 @@ static void rtmr_init(Object *obj)
     }
     tmr->elc_mode = 3;
     qdev_init_gpio_out_named(DEVICE(obj), tmr->event, "event", TMR_NR_IRQ);
+    qdev_init_gpio_out_named(DEVICE(obj), tmr->tmo, "tmo", TMR_CH);
+    qdev_init_gpio_out_named(DEVICE(obj), tmr->tmo_oe, "tmo-oe", TMR_CH);
     qdev_init_gpio_in_named(DEVICE(obj), tmr_elc_input, "elc", 1);
     timer_init_ns(&tmr->timer[0], QEMU_CLOCK_VIRTUAL, timer_event0, tmr);
     timer_init_ns(&tmr->timer[1], QEMU_CLOCK_VIRTUAL, timer_event1, tmr);
@@ -792,6 +861,22 @@ static const VMStateDescription vmstate_tmr_elc = {
     },
 };
 
+static bool tmr_output_needed(void *opaque)
+{
+    return RTMR(opaque)->has_output;
+}
+
+static const VMStateDescription vmstate_tmr_output = {
+    .name = "rx-tmr/output",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = tmr_output_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT8_ARRAY(output, RTMRState, TMR_CH),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static const VMStateDescription vmstate_rtmr = {
     .name = "rx-tmr",
     .version_id = 1,
@@ -814,6 +899,7 @@ static const VMStateDescription vmstate_rtmr = {
     .subsections = (const VMStateDescription * const[]) {
         &vmstate_tmr_clock,
         &vmstate_tmr_elc,
+        &vmstate_tmr_output,
         NULL
     },
 };
@@ -821,6 +907,7 @@ static const VMStateDescription vmstate_rtmr = {
 static const Property rtmr_properties[] = {
     DEFINE_PROP_UINT64("input-freq", RTMRState, input_freq, 0),
     DEFINE_PROP_BOOL("has-elc", RTMRState, has_elc, false),
+    DEFINE_PROP_BOOL("has-output", RTMRState, has_output, false),
 };
 
 static void rtmr_class_init(ObjectClass *klass, const void *data)

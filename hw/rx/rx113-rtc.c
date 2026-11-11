@@ -345,12 +345,28 @@ static void rtc_advance(RX113RTCState *s, uint64_t ticks)
     }
 }
 
+/* The RTCOUT level is a pure function of the control registers and sub. */
+static bool rtc_rtcout_level(RX113RTCState *s)
+{
+    unsigned bit = (s->rcr1 & RCR1_RTCOS) ? 1 : 7;
+
+    return (s->rcr2 & RCR2_RTCOE) && (s->sub & (1u << bit));
+}
+
+/* Issue #50: push the level and the output enable to the PORT mux. */
+static void rtc_update_rtcout(RX113RTCState *s)
+{
+    qemu_set_irq(s->rtcout, rtc_rtcout_level(s));
+    qemu_set_irq(s->rtcout_oe, !!(s->rcr2 & RCR2_RTCOE));
+}
+
 static void rtc_update_timer(RX113RTCState *s)
 {
     unsigned period = rtc_prd_period(s);
     int64_t ticks = -1;
 
     qemu_set_irq(s->rtc_enable, !!(s->rcr3 & RCR3_RTCEN));
+    rtc_update_rtcout(s);
 
     if (!rtc_running(s)) {
         timer_del(&s->timer);
@@ -366,6 +382,16 @@ static void rtc_update_timer(RX113RTCState *s)
 
         if (ticks < 0 || to_second < ticks) {
             ticks = to_second;
+        }
+    }
+    /* Issue #50: wake at the next RTCOUT edge so the pad level tracks. */
+    if (s->rcr2 & RCR2_RTCOE) {
+        unsigned bit = (s->rcr1 & RCR1_RTCOS) ? 1 : 7;
+        int64_t step = 1 << bit;
+        int64_t to_flip = step - (s->sub & (step - 1));
+
+        if (ticks < 0 || to_flip < ticks) {
+            ticks = to_flip;
         }
     }
     if (ticks < 0) {
@@ -413,10 +439,9 @@ static void rtc_sync(RX113RTCState *s)
 static bool rtc_get_rtcout(Object *obj, Error **errp)
 {
     RX113RTCState *s = RX113_RTC(obj);
-    unsigned bit = (s->rcr1 & RCR1_RTCOS) ? 1 : 7;
 
     rtc_sync(s);
-    return (s->rcr2 & RCR2_RTCOE) && (s->sub & (1u << bit));
+    return rtc_rtcout_level(s);
 }
 
 static bool rtc_get_subclock_running(Object *obj, Error **errp)
@@ -727,6 +752,8 @@ static void rtc_init(Object *obj)
     sysbus_init_irq(sbd, &s->cup);
     sysbus_init_irq(sbd, &s->prd_lcdc);
     qdev_init_gpio_out_named(DEVICE(obj), &s->rtc_enable, "rtc-enable", 1);
+    qdev_init_gpio_out_named(DEVICE(obj), &s->rtcout, "rtcout", 1);
+    qdev_init_gpio_out_named(DEVICE(obj), &s->rtcout_oe, "rtcout-oe", 1);
     timer_init_ns(&s->timer, QEMU_CLOCK_VIRTUAL, rtc_timer_cb, s);
     /* SOSCCR.SOSTP resets to 0: SYSTEM initially requests the sub-clock. */
     s->system_subclock = true;

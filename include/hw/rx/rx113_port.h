@@ -34,6 +34,9 @@ struct RX113PortState {
     qemu_irq mtic5[3];
     bool ctsu_fixed, ctsu_level;
     uint16_t mtioc, mtioc_oe, poe_cutoff;
+    /* Issue #50: TMR compare outputs and the RTCOUT pin level. */
+    uint8_t tmo, tmo_oe;
+    bool rtcout_level, rtcout_oe;
 };
 
 void rx113_port_set_poe(RX113PortState *s, uint16_t mask);

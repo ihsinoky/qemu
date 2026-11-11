@@ -813,6 +813,7 @@ static void register_tmr(RX113State *s, unsigned unit)
                             &s->tmr[unit], TYPE_RENESAS_TMR);
     tmr = SYS_BUS_DEVICE(&s->tmr[unit]);
     qdev_prop_set_bit(DEVICE(tmr), "has-elc", true);
+    qdev_prop_set_bit(DEVICE(tmr), "has-output", true);
     qdev_prop_set_uint64(DEVICE(tmr), "input-freq", RX113_PCLKB_HZ);
     sysbus_realize(tmr, &error_abort);
 
@@ -936,6 +937,28 @@ static DeviceState *register_port(RX113State *s)
         qdev_connect_gpio_out_named(s->mtu, "mtioc-oe", i,
                                    qdev_get_gpio_in_named(dev, "mtioc",
                                                        i + RX113_MTIOC_PINS));
+    }
+    /* Issue #50: TMR compare outputs (unit * 2 + channel) and RTCOUT. */
+    for (unsigned unit = 0; unit < 2; unit++) {
+        for (unsigned ch = 0; ch < 2; ch++) {
+            unsigned sig = unit * 2 + ch;
+
+            qdev_connect_gpio_out_named(DEVICE(&s->tmr[unit]), "tmo", ch,
+                                        qdev_get_gpio_in_named(dev, "tmo",
+                                                               sig));
+            qdev_connect_gpio_out_named(DEVICE(&s->tmr[unit]), "tmo-oe", ch,
+                                        qdev_get_gpio_in_named(dev, "tmo",
+                                                               sig + 4));
+        }
+    }
+    {
+        DeviceState *rtc = DEVICE(object_resolve_path_component(OBJECT(s),
+                                                                "rtc"));
+
+        qdev_connect_gpio_out_named(rtc, "rtcout", 0,
+                                    qdev_get_gpio_in_named(dev, "rtcout", 0));
+        qdev_connect_gpio_out_named(rtc, "rtcout-oe", 0,
+                                    qdev_get_gpio_in_named(dev, "rtcout", 1));
     }
     return dev;
 }
