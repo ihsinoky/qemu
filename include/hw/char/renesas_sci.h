@@ -48,6 +48,21 @@ struct RSCIState {
 
     uint8_t read_ssr;
     int64_t trtime;
+    /* Opt-in TXD pad waveform (Issue #50 stage 2); off by default. */
+    bool has_output;
+    qemu_irq txd;
+    qemu_irq txd_oe;
+    QEMUTimer tx_bit_timer;
+    uint8_t tx_shift;
+    uint8_t tx_bit;
+    uint8_t tx_frame_bits;
+    uint8_t tx_slots;
+    bool tx_pending_valid;
+    uint8_t tx_pending_shift;
+    bool tx_active;
+    bool tx_level;
+    int64_t tx_bit_remaining;
+    int64_t tx_deadline;
     int64_t rx_next;
     /* Set only by renesas_sci_set_clock(); legacy behavior is the default. */
     QEMUTimer rx_timer;

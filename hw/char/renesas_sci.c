@@ -79,6 +79,11 @@ static void sci_clock_sync(RSCIState *s)
                           s->tx_remaining - elapsed * s->input_freq;
         s->rx_remaining = elapsed > s->rx_remaining / s->input_freq ? 0 :
                           s->rx_remaining - elapsed * s->input_freq;
+        if (s->has_output && s->tx_active) {
+            s->tx_bit_remaining =
+                elapsed > s->tx_bit_remaining / s->input_freq ? 0 :
+                s->tx_bit_remaining - elapsed * s->input_freq;
+        }
     }
     s->clock_tick = now;
 }
@@ -124,6 +129,149 @@ static void receive(void *opaque, const uint8_t *buf, int size)
     }
 }
 
+static void sci_txd_push(RSCIState *s)
+{
+    if (!s->has_output) {
+        return;
+    }
+    qemu_set_irq(s->txd, s->tx_level);
+    qemu_set_irq(s->txd_oe, FIELD_EX8(s->scr, SCR, TE) &&
+                            !s->module_stopped);
+}
+
+static unsigned sci_tx_data_bits(RSCIState *s)
+{
+    return 8 - FIELD_EX8(s->smr, SMR, CHR);
+}
+
+static unsigned sci_tx_frame_bits(RSCIState *s)
+{
+    unsigned bits = 1 + sci_tx_data_bits(s);
+
+    if (FIELD_EX8(s->smr, SMR, PE) || FIELD_EX8(s->smr, SMR, MP)) {
+        bits++;
+    }
+    return bits + 1 + FIELD_EX8(s->smr, SMR, STOP);
+}
+
+static bool sci_tx_bit_value(RSCIState *s, unsigned pos)
+{
+    unsigned data_bits = sci_tx_data_bits(s);
+
+    if (pos == 0) {
+        return false; /* start bit */
+    }
+    if (pos <= data_bits) {
+        unsigned idx = FIELD_EX8(s->scmr, SCMR, SDIR) ?
+                       data_bits - pos : pos - 1;
+        bool value = (s->tx_shift >> idx) & 1;
+
+        /* The manual's SCMR note: SINV inverts the data bits only. */
+        return FIELD_EX8(s->scmr, SCMR, SINV) ? !value : value;
+    }
+    if (pos == data_bits + 1 &&
+        (FIELD_EX8(s->smr, SMR, PE) || FIELD_EX8(s->smr, SMR, MP))) {
+        if (FIELD_EX8(s->smr, SMR, MP)) {
+            return FIELD_EX8(s->ssr, SSR, MPBT);
+        }
+        return FIELD_EX8(s->smr, SMR, PM) ?
+               !__builtin_parity(s->tx_shift) :
+               __builtin_parity(s->tx_shift);
+    }
+    return true; /* stop bit(s) */
+}
+
+static int64_t sci_tx_bit_duration(RSCIState *s, unsigned bit)
+{
+    return s->trtime * (bit + 1) / s->tx_slots -
+           s->trtime * bit / s->tx_slots;
+}
+
+/*
+ * The model's own slot count, mirroring update_trtime(): data bits plus
+ * parity plus STOP+1. The start bit is not counted there, so one model
+ * slot is exactly one bit time of the baud generator as this model
+ * computes it (32 * BRR * 2^(2*CKS) / input clock, the Issue #10 baud
+ * formula quirk included), while a serialized frame has one more bit
+ * than the slot count. Frame deadlines therefore accumulate one bit
+ * beyond trtime; TEND keeps the model's own timing.
+ */
+static unsigned sci_tx_slots(RSCIState *s)
+{
+    return sci_tx_data_bits(s) + FIELD_EX8(s->smr, SMR, PE) +
+           FIELD_EX8(s->smr, SMR, STOP) + 1;
+}
+
+static void sci_tx_arm_bit(RSCIState *s)
+{
+    if (s->clock_managed) {
+        s->tx_bit_remaining = sci_tx_bit_duration(s, s->tx_bit) *
+                              s->input_freq;
+    }
+    timer_mod(&s->tx_bit_timer, s->tx_deadline);
+}
+
+static void sci_tx_frame_start_at(RSCIState *s, uint8_t byte, int64_t start);
+
+static void sci_tx_bit_expire(void *opaque)
+{
+    RSCIState *s = opaque;
+
+    if (!s->tx_active) {
+        return;
+    }
+    s->tx_bit++;
+    if (s->tx_bit >= s->tx_frame_bits) {
+        s->tx_active = false;
+        s->tx_level = true; /* idle */
+        sci_txd_push(s);
+        if (s->tx_pending_valid) {
+            /* The queued byte's frame follows with no idle gap. */
+            s->tx_pending_valid = false;
+            sci_tx_frame_start_at(s, s->tx_pending_shift, s->tx_deadline);
+        }
+        return;
+    }
+    s->tx_level = sci_tx_bit_value(s, s->tx_bit);
+    sci_txd_push(s);
+    /*
+     * Chain from the previous deadline, not the callback time: under a
+     * stepped clock a late callback must not stretch the frame.
+     */
+    s->tx_deadline += sci_tx_bit_duration(s, s->tx_bit);
+    sci_tx_arm_bit(s);
+}
+
+static void sci_tx_frame_start_at(RSCIState *s, uint8_t byte, int64_t start)
+{
+    s->tx_shift = byte;
+    s->tx_frame_bits = sci_tx_frame_bits(s);
+    s->tx_slots = sci_tx_slots(s);
+    s->tx_bit = 0;
+    s->tx_active = true;
+    s->tx_level = false; /* start bit */
+    sci_txd_push(s);
+    s->tx_deadline = start + sci_tx_bit_duration(s, 0);
+    sci_tx_arm_bit(s);
+}
+
+static void sci_tx_frame_start(RSCIState *s)
+{
+    /*
+     * send_byte() runs one model slot before the pad frame would end
+     * (the model's trtime omits the start bit), so a byte handed over
+     * while the previous frame is still on the pad waits in the pending
+     * slot and follows with no idle gap, like a TSR behind a busy TDR
+     * transfer on hardware.
+     */
+    if (s->tx_active) {
+        s->tx_pending_shift = s->tdr;
+        s->tx_pending_valid = true;
+        return;
+    }
+    sci_tx_frame_start_at(s, s->tdr, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+}
+
 static void send_byte(RSCIState *sci)
 {
     if (sci->clock_managed) {
@@ -140,6 +288,15 @@ static void send_byte(RSCIState *sci)
     qemu_irq_pulse(sci->event[TXI]);
     if (FIELD_EX8(sci->scr, SCR, TIE)) {
         qemu_irq_pulse(sci->irq[TXI]);
+    }
+    /*
+     * The waveform rides the model's existing transfer timing: a frame
+     * starts exactly when send_byte() runs (TDR write while idle, or the
+     * queued byte at the previous frame's deadline). Clock-synchronous
+     * mode (SMR.CM) has no start/stop framing and is not serialized.
+     */
+    if (sci->has_output && !FIELD_EX8(sci->smr, SMR, CM)) {
+        sci_tx_frame_start(sci);
     }
 }
 
@@ -212,6 +369,15 @@ static void sci_write(void *opaque, hwaddr offset, uint64_t val, unsigned size)
         }
         if (!FIELD_EX8(sci->scr, SCR, RIE)) {
             qemu_set_irq(sci->irq[ERI], 0);
+        }
+        if (sci->has_output) {
+            if (!FIELD_EX8(sci->scr, SCR, TE) && sci->tx_active) {
+                sci->tx_active = false;
+                sci->tx_pending_valid = false;
+                sci->tx_level = true;
+                timer_del(&sci->tx_bit_timer);
+            }
+            sci_txd_push(sci);
         }
         break;
     case A_TDR:
@@ -315,6 +481,9 @@ void renesas_sci_set_clock(RSCIState *s, uint64_t freq, bool stopped)
         s->tx_remaining = timer_pending(&s->timer) ?
             MAX(0, timer_expire_time_ns(&s->timer) - now) * s->input_freq : 0;
         s->rx_remaining = MAX(0, s->rx_next - now) * s->input_freq;
+        s->tx_bit_remaining = timer_pending(&s->tx_bit_timer) ?
+            MAX(0, timer_expire_time_ns(&s->tx_bit_timer) - now) *
+            s->input_freq : 0;
         s->clock_tick = now;
     }
     if (!s->module_stopped) {
@@ -322,6 +491,7 @@ void renesas_sci_set_clock(RSCIState *s, uint64_t freq, bool stopped)
     }
     timer_del(&s->timer);
     timer_del(&s->rx_timer);
+    timer_del(&s->tx_bit_timer);
     s->clock_managed = true;
     s->input_freq = freq;
     s->module_stopped = stopped;
@@ -332,7 +502,12 @@ void renesas_sci_set_clock(RSCIState *s, uint64_t freq, bool stopped)
             timer_mod(&s->timer, now + DIV_ROUND_UP(s->tx_remaining, freq));
         }
         timer_mod(&s->rx_timer, s->rx_next);
+        if (s->has_output && s->tx_active) {
+            s->tx_deadline = now + DIV_ROUND_UP(s->tx_bit_remaining, freq);
+            timer_mod(&s->tx_bit_timer, s->tx_deadline);
+        }
     }
+    sci_txd_push(s);
 }
 
 static void rsci_reset(DeviceState *dev)
@@ -346,6 +521,10 @@ static void rsci_reset(DeviceState *dev)
         sci->tx_pending = false;
         sci->tx_remaining = sci->rx_remaining = 0;
     }
+    timer_del(&sci->tx_bit_timer);
+    sci->tx_active = false;
+    sci->tx_level = true;
+    sci->tx_bit = 0;
     sci->smr = sci->scr = 0x00;
     sci->brr = 0xff;
     sci->tdr = 0xff;
@@ -357,6 +536,7 @@ static void rsci_reset(DeviceState *dev)
     if (sci->clock_managed) {
         update_trtime(sci);
     }
+    sci_txd_push(sci);
 }
 
 static void sci_event(void *opaque, QEMUChrEvent event)
@@ -398,7 +578,11 @@ static void rsci_init(Object *obj)
         sysbus_init_irq(d, &sci->irq[i]);
     }
     qdev_init_gpio_out_named(DEVICE(obj), sci->event, "event", SCI_NR_IRQ);
+    qdev_init_gpio_out_named(DEVICE(obj), &sci->txd, "txd", 1);
+    qdev_init_gpio_out_named(DEVICE(obj), &sci->txd_oe, "txd-oe", 1);
     timer_init_ns(&sci->timer, QEMU_CLOCK_VIRTUAL, txend, sci);
+    timer_init_ns(&sci->tx_bit_timer, QEMU_CLOCK_VIRTUAL,
+                  sci_tx_bit_expire, sci);
     timer_init_ns(&sci->rx_timer, QEMU_CLOCK_VIRTUAL, sci_rx_ready, sci);
 }
 
@@ -456,6 +640,43 @@ static const VMStateDescription vmstate_sci_clock = {
     },
 };
 
+static bool sci_output_needed(void *opaque)
+{
+    RSCIState *s = opaque;
+
+    return s->has_output;
+}
+
+static int sci_output_post_load(void *opaque, int version_id)
+{
+    RSCIState *s = opaque;
+
+    sci_txd_push(s);
+    return 0;
+}
+
+static const VMStateDescription vmstate_sci_output = {
+    .name = "renesas-sci/output",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = sci_output_needed,
+    .post_load = sci_output_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT8(tx_shift, RSCIState),
+        VMSTATE_UINT8(tx_bit, RSCIState),
+        VMSTATE_UINT8(tx_frame_bits, RSCIState),
+        VMSTATE_UINT8(tx_slots, RSCIState),
+        VMSTATE_BOOL(tx_pending_valid, RSCIState),
+        VMSTATE_UINT8(tx_pending_shift, RSCIState),
+        VMSTATE_BOOL(tx_active, RSCIState),
+        VMSTATE_BOOL(tx_level, RSCIState),
+        VMSTATE_INT64(tx_bit_remaining, RSCIState),
+        VMSTATE_INT64(tx_deadline, RSCIState),
+        VMSTATE_TIMER(tx_bit_timer, RSCIState),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static const VMStateDescription vmstate_rsci = {
     .name = "renesas-sci",
     .version_id = 1,
@@ -478,12 +699,14 @@ static const VMStateDescription vmstate_rsci = {
     },
     .subsections = (const VMStateDescription * const[]) {
         &vmstate_sci_clock,
+        &vmstate_sci_output,
         NULL
     },
 };
 
 static const Property rsci_properties[] = {
     DEFINE_PROP_UINT64("input-freq", RSCIState, input_freq, 0),
+    DEFINE_PROP_BOOL("has-output", RSCIState, has_output, false),
     DEFINE_PROP_CHR("chardev", RSCIState, chr),
 };
 
