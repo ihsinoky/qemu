@@ -372,3 +372,32 @@ instruction's requirements, on these PMO-settled points:
   reset like every other gated peripheral, so the qtest and the
   functional guest program now release MSTPCRD bit 11 before use,
   matching the CTSU precedent and real guest software flow.
+
+## D-023: LCDC pad routing abstraction (Issue #63)
+
+Issue #14 modelled the LCDC's logical segment state and Issue #61
+its frame timing; this issue routes the COM/SEG outputs to the
+PORT pads (Tables 19.3 to 19.16, all LCDC functions at PSEL = 24).
+Points settled by the PMO under the issue instruction:
+
+- The PORT pulls the pad state from the LCDC through a QOM link
+  on every pad update, and the `levels`/`driving` QOM getters
+  refresh before reading. The LCDC stays timer-less (D-022): the
+  scan position is projected lazily at observation time.
+- Boolean abstraction of the Table 34.11 voltages: the selected
+  common is driven at the drive-phase level; a segment with data
+  bit 1 (select voltage) is driven opposite to it, a 0 bit
+  (deselect) at the same level, so a lit pixel is exactly the
+  anti-phase pair. Non-selected commons are left undriven: their
+  hardware deselect level is a bias voltage with no boolean
+  equivalent, and driving them at either rail would fabricate a
+  full-swing differential across unselected pixels.
+- Static mode drives COM0 to COM3 with the same selected signal
+  (34.8 (1)). With SCOC = 0 all LCDC pins drive the ground level
+  (34.2.2); under module stop the LCDC drives nothing.
+- The dual-function Port B pads (COM4/SEG11, COM5/SEG12,
+  COM6/SEG13, COM7/SEG15) follow the LCDC mode: segment outputs
+  except in 8-time-slice mode, where they are commons and the
+  four segment numbers are not outputs at all (34.8 (2)).
+- VL1 to VL4 and CAPH/CAPL share PSEL = 24 but are analog power
+  pins; they stay unmodelled, as before.
