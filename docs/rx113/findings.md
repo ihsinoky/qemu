@@ -60,3 +60,39 @@ evidence, validity boundary, promoted-to. Newest first.
   substitute for a vendor answer or silicon test.
 - **Promoted-to:** Issue #51; supersede of D-018 raised as a PO
   gate on 2026-11-11 (decision pending).
+
+## F-002: D-015 (complementary-PWM duty interrupts only on own-counter matches) is supported; no contradicting evidence (2026-11-11)
+
+- **Conclusion:** The current reading stands. Every source defines
+  TGIB3/TGIA4/TGIB4 as their own channel's TCNT-vs-TGR compare
+  match, including in complementary PWM mode; nothing ties their
+  generation to the partner channel's counter or to buffer-transfer
+  timing.
+- **Confidence:** Moderate-high. The manual's definition is direct;
+  external corroboration is consistent but comes from the sibling
+  MTU3a IP rather than RX113 silicon reports.
+- **Evidence:**
+  1. RX113 manual Table 20.57 (MTU Interrupt Sources): TGIB3 =
+     "MTU3.TGRB input capture/compare match", TGIA4/TGIB4 =
+     "MTU4.TGRA/TGRB input capture/compare match" — own-channel
+     definitions with no complementary-mode exception.
+  2. RX113 manual §20.5 (dead time compensation procedure,
+     Figure 20.81): in complementary PWM mode the interrupts used
+     are "generated at the crest (TGIA3) or trough (TCIV4)" — the
+     crest interrupt is MTU3's own TGRA match, the trough is
+     MTU4's own overflow/underflow.
+  3. RX113 manual §20.6.14 (buffer operation in complementary PWM
+     mode) constrains buffer settings and says nothing about
+     interrupt generation moving to the partner channel.
+  4. Linux kernel devicetree bindings for the sibling Renesas
+     MTU3a (RZ/G2L family; reviewed with Renesas maintainers):
+     tgib3 is documented as "MTU3.TGRB input capture/compare
+     match", tgib4 as "MTU4.TGRB input capture/compare match".
+- **Conditions:** Applies to the TGI requests gated by each
+  channel's TIER and the TITCR skipping machinery, which are
+  orthogonal and unchanged.
+- **Validity boundary:** Documentary evidence only; no silicon
+  measurement. The residual scenario — hardware additionally
+  raising TGIB3 at MTU4-timed transfer points — has no supporting
+  text anywhere found and would contradict Table 20.57.
+- **Promoted-to:** Issue #51. No supersede proposed; D-015 stands.
