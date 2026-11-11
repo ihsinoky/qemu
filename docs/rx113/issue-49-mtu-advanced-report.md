@@ -2,9 +2,101 @@
 SPDX-License-Identifier: GPL-2.0-or-later
 -->
 
-# Issue 49: RX113 MTU advanced output — stage 2b duty requests
+# Issue 49: RX113 MTU advanced output — stage 3 audit stop
 
-## Current delivery (2026-11-11)
+## Current status (2026-11-11): stage 3 stopped before implementation
+
+Issue #49 remains open. Stages 1, 2a and 2b are committed through
+`7b62526287c143b9e7801f06f7895e8cb7f19626` on
+`rx113/issue-49-mtu-advanced`. The stage-3 brief requires an audit stop
+if implementing the requested behavior appears to require shared ICU
+changes. The oscillator-stop source exposes that dependency. No POE
+implementation, partial register stub, shared-model change or new qtest
+is delivered by this run. The 75 MTU qtests are the previously recorded
+stage-2b result; they were not rerun for this documentation-only audit.
+
+### Blocking evidence and decision needed
+
+Authority: the supplied R01UH0448EJ0120 Rev.1.20 manual.
+
+* Sections 9.2.13/14 (pp.177–178) define SYSTEM.OSTDCR at 00080040h
+  and OSTDSR at 00080041h. OSTDE enables main-clock failure detection;
+  OSTDIE enables both the interrupt and notification to POE. The current
+  RX113 SYSTEM register inventory in `hw/rx/rx113.c` implements neither
+  register and has no oscillator-failure notification output.
+* Section 9.5.2 (p.189) states that an OSTDF transition with OSTDIE set
+  generates OSTDI and notifies POE. OSTDI is non-maskable. Section
+  14.2.10–12 requires oscillator-stop NMI status, enable and clear
+  behavior; on RX113, OSTST/OSTEN/OSTCLR occupy bit 1.
+* The shared `hw/intc/rx_icu.c` returns zero for NMISR, ignores NMICLR
+  writes, and exposes only ordinary interrupt inputs plus ACK. It has
+  no oscillator-stop/NMI input or NMI output. Its legacy OST bit masks
+  also occupy bit 2, unlike this RX113 manual. `target/rx/cpu.h` exposes
+  only RX_CPU_IRQ and RX_CPU_FIR, so CPU NMI delivery is absent too.
+* Section 21.2.7 (p.588) requires OSTSTF latching, read-before-zero
+  clearing and rejection of clearing while the stop notification remains
+  asserted (at least ten PCLKB cycles after detection). Sections
+  21.3.4/5 (p.593) require oscillator-triggered cutoff and release.
+  An unrelated maskable IRQ or a bare POE test input would not implement
+  the complete documented oscillator-stop source.
+
+POE's own OEI1/OEI2 interrupts are not blocked: Table 14.3 assigns level
+vectors 170/171, already configured as level inputs by RX113. The blocker
+is the accompanying oscillator-stop NMI path, not these two vectors.
+The manual specifies the hardware behavior; the unresolved question is
+permission and acceptance scope, not which vector to invent.
+
+The Issue #27 IWDT report records a request-output-only NMI limitation
+and estimates 2–4 engineering days for shared ICU/CPU NMI work. That is
+useful precedent, but neither the stage-3 brief nor a recorded decision
+explicitly extends that limitation to this new oscillator-stop source.
+D-006 requires such omissions to be raised explicitly. This audit does
+not infer permission to omit OSTDI, overlay ICU NMI registers, mutate
+shared state from an RX113 device, or extend shared ICU/CPU behavior.
+
+The PO/PMO must either authorize the shared ICU/CPU NMI dependency with
+RX62N behavior preserved and regressed, or explicitly accept an RX113
+SYSTEM-to-POE implementation with an observable but undelivered OSTDI
+request, analogous to IWDT. The latter could implement POE cutoff and
+release locally but would leave guest oscillator-stop NMI handling
+unavailable. It needs an explicit scope decision before implementation.
+The worker has not edited `decisions.md` or selected either option.
+
+### Issue acceptance and remaining work
+
+| Acceptance area | Status |
+| --- | --- |
+| Ordinary/PWM pad routing and reset-synchronized PWM | Delivered in stages 1/2a; historical validation below |
+| Complementary crest/trough and duty IRQs | Delivered through stage 2b and D-015 |
+| Dead-time separation, temporary-buffer transfer and interlocks | Delivered in stage 2b, including D-016 CCE policy |
+| POE assertion/release at physical PORT pads | Not implemented or tested; stage 3 audit stop |
+| Full Issue #49 completion | Not achieved |
+
+After resolving the scope decision, stage 3 still needs all seven
+section-21.2 registers, write-once and read-before-clear rules, qualified
+POE0#–3#/8# PORT inputs, sampled detection and release qualification,
+software and oscillator sources, output-level comparison, selective
+high-impedance output gating without stopping MTU, OEI1/OEI2, clock and
+reset/migration handling, and pad-level cutoff/recovery tests. Confirm
+module-stop and ELC applicability against sections 11 and 17 rather
+than assigning an invented gate or event. Estimate: 2–3 engineering days
+for POE after the source boundary is agreed; full shared ICU/CPU NMI
+support adds approximately 2–4 days and RX62N regression review, subject
+to a separate authorized implementation assessment.
+
+### Audit deliverable and validation
+
+This run changes only this report. The patch is
+`.issue49-runtime/issue49-stage3-poe-audit.patch`, relative to the
+stage-2b tip above, and excludes AGENTS.md, runtime/manual/build assets,
+repository metadata and `decisions.md`. Validation records are in
+`.issue49-runtime/stage3-audit-validation.log`: whitespace check,
+checkpatch, forward/reverse patch dry runs and byte-for-byte
+reconstruction. No build or device regression is claimed for this
+report-only change. No commit, merge, push, PR or upstream submission
+was performed.
+
+## Stage 2b delivery (2026-11-11, historical)
 
 D-015 duty-interrupt wiring is implemented. **Stage 2b is complete.**
 Stage 3 (POE) was not started; Issue #49 as a whole remains open.
