@@ -49,6 +49,9 @@ struct RX113MTUState {
     uint8_t tocr2;
     uint8_t tolbr;
     uint8_t tgcr;
+    uint8_t twcr;
+    uint8_t twcr_read;
+    bool initial_tb2;
     uint8_t tder;
     bool tder_read;
     uint8_t feedback;
@@ -260,6 +263,19 @@ static bool mtu_output_enabled(RX113MTUState *s, unsigned n, unsigned gr)
     return true;
 }
 
+/* Table 20.39: apply brushless gating before output polarity. */
+static bool mtu_brushless(RX113MTUState *s, unsigned arm, bool on)
+{
+    static const uint8_t arms[] = {
+        0, 0x21, 0x0a, 0x22, 0x14, 0x11, 0x0c, 0,
+    };
+    unsigned feedback = (s->tgcr & 8) ? s->tgcr & 7 : s->feedback;
+    bool chopping = s->tgcr & (arm < 3 ? 0x10 : 0x20);
+
+    return !(s->tgcr & 0x40) ? on :
+           (arms[feedback] & (1 << arm)) && (!chopping || on);
+}
+
 static void mtu_output_update(RX113MTUState *s)
 {
     if (mtu_reset_pwm(s)) {
@@ -269,11 +285,13 @@ static void mtu_output_update(RX113MTUState *s)
         for (unsigned i = 0; i < 3; i++) {
             unsigned polarity = (s->tocr1 & 4) ?
                                 (s->tocr2 >> (2 * i)) & 1 : s->tocr1 & 1;
-            bool level = (polarity == 0) ^ ((s->reset_pwm >> i) & 1);
+            bool on = (s->reset_pwm >> i) & 1;
 
             /* Without dead time only OLSP/OLSiP selects polarity (20.2.19). */
-            s->output = deposit32(s->output, positive[i], 1, level);
-            s->output = deposit32(s->output, negative[i], 1, !level);
+            s->output = deposit32(s->output, positive[i], 1,
+                                  !polarity ^ mtu_brushless(s, i, on));
+            s->output = deposit32(s->output, negative[i], 1,
+                                  !polarity ^ mtu_brushless(s, i + 3, !on));
         }
     }
     if (mtu_complementary(s)) {
@@ -294,17 +312,7 @@ static void mtu_output_update(RX113MTUState *s)
                 on = (!s->complementary_initial &&
                       (s->complementary_on & (1 << phase))) ^ (i >= 3);
             }
-            if (s->tgcr & 0x40) {
-                /* Table 20.39, in U/V/W positive then negative order. */
-                static const uint8_t arms[] = {
-                    0, 0x21, 0x0a, 0x22, 0x14, 0x11, 0x0c, 0,
-                };
-                unsigned feedback = (s->tgcr & 8) ?
-                                    s->tgcr & 7 : s->feedback;
-                bool chopping = s->tgcr & (i < 3 ? 0x10 : 0x20);
-
-                on = (arms[feedback] & (1 << i)) && (!chopping || on);
-            }
+            on = mtu_brushless(s, i, on);
             s->output = deposit32(s->output, pins[i], 1, !polarity ^ on);
         }
     }
@@ -592,7 +600,7 @@ static void mtu_complementary_transfer(RX113MTUState *s, bool initial)
 }
 
 /* Section 20.6.13: counter stop returns the pair to the initial state. */
-static void mtu_complementary_restart(RX113MTUState *s)
+static void mtu_complementary_clear(RX113MTUState *s)
 {
     s->ch[3].count = s->tddr;
     s->ch[4].count = 0;
@@ -600,6 +608,12 @@ static void mtu_complementary_restart(RX113MTUState *s)
     s->ch[3].phase = s->ch[4].phase = 0;
     s->tcnts = 0;
     s->region = MTU_TB2_UP;
+}
+
+static void mtu_complementary_restart(RX113MTUState *s)
+{
+    mtu_complementary_clear(s);
+    s->initial_tb2 = true;
     s->complementary_on = s->complementary_allow = 0;
     for (unsigned i = 0; i < 3; i++) {
         unsigned duty = i == 0 ? s->ch[3].tgr[1] : s->ch[4].tgr[i - 1];
@@ -780,10 +794,16 @@ static unsigned mtu_complementary_tick(RX113MTUState *s)
         }
         c3->down = c4->down = false;
     }
+    if ((events & MTU_CREST) && mode == 13 && (s->twcr & 0x80)) {
+        /* D-016: counters only; no early or hidden temporary transfer. */
+        mtu_complementary_clear(s);
+        return events;
+    }
     c3->count += c3->down ? -1 : 1;
     c4->count += c4->down ? -1 : 1;
 
     if (end_tb) {
+        s->initial_tb2 = false;
         /*
          * The old temporary bank is consumed first. A write during Tb
          * must not bypass it and change the outgoing half-cycle's data.
@@ -821,6 +841,25 @@ static void mtu_finish_events(RX113MTUState *s, unsigned events)
                     clears |= 1 << n;
                     break;
                 }
+            }
+        }
+    }
+    if (mtu_complementary(s) && (s->sync & 0x40) &&
+        (s->ch[3].tcr >> 5 & 3) == 3) {
+        for (unsigned src = 0; src < 3; src++) {
+            if ((events & (1 << src)) &&
+                (s->sync & (1 << start_bit[src]))) {
+                bool retain = (s->twcr & 1) && !s->initial_tb2 &&
+                              (s->region == MTU_TB2_UP ||
+                               s->region == MTU_TB2_DOWN);
+
+                if (retain) {
+                    mtu_complementary_clear(s);
+                } else {
+                    mtu_complementary_restart(s);
+                }
+                clears |= 0x18;
+                break;
             }
         }
     }
@@ -1165,7 +1204,8 @@ static void mtu_feedback_input(void *opaque, int pin, int level)
         return;
     }
     s->feedback = deposit32(s->feedback, pin, 1, !!level);
-    if (mtu_complementary(s) && (s->tgcr & 0x48) == 0x40) {
+    if ((mtu_complementary(s) || mtu_reset_pwm(s)) &&
+        (s->tgcr & 0x48) == 0x40) {
         mtu_output_update(s);
     }
 }
@@ -1268,7 +1308,7 @@ static void mtu_clock_input(void *opaque, int pin, int level)
 enum {
     TCR, TMDR, TIOR, TIER, TSR, TCNT, TGR, TIER2, TBTM,
     TSTR, TSYR, TRWER, TSTR5, TIER5, CLEAR5, TOER, TOCR1, TOCR2, TOLBR,
-    TDDR, TCDR, TCBR, TCNTS, TITCR, TITCNT, TBTER, TGCR, TDER,
+    TDDR, TCDR, TCBR, TCNTS, TITCR, TITCNT, TBTER, TGCR, TDER, TWCR,
 };
 
 typedef struct MTURegister {
@@ -1282,6 +1322,7 @@ typedef struct MTURegister {
 
 static const MTURegister mtu_regs[] = {
     { 0x00d, 1, 3, TGCR, 0, 0x7f },
+    { 0x060, 1, 3, TWCR, 0, 0x81 },
     { 0x034, 1, 3, TDER, 0, 0x01 },
     { 0x030, 1, 0, TITCR, 0, 0xff },
     { 0x031, 1, 0, TITCNT, 0, 0x00 },
@@ -1376,7 +1417,7 @@ static const MTURegister *mtu_register(hwaddr addr, unsigned size)
 
         if (addr == r->addr && (size == r->size ||
             (size == 2 && (r->kind == TSTR || r->kind == TSYR ||
-                           r->kind == TRWER)))) {
+                           r->kind == TRWER || r->kind == TWCR)))) {
             return r;
         }
     }
@@ -1452,6 +1493,9 @@ static uint64_t mtu_read(void *opaque, hwaddr addr, unsigned size)
         return s->tocr2;
     case TOLBR:
         return s->tolbr;
+    case TWCR:
+        s->twcr_read = ~s->twcr & 0x81;
+        return s->twcr;
     case TDER:
         s->tder_read = s->tder;
         return s->tder;
@@ -1512,8 +1556,8 @@ static void mtu_write(void *opaque, hwaddr addr, uint64_t value, unsigned size)
             mtu_complementary_transfer(s, true);
             mtu_complementary_restart(s);
             qemu_log_mask(LOG_UNIMP,
-                          "rx113-mtu: complementary PWM extended controls "
-                          "and duty interrupts unavailable\n");
+                          "rx113-mtu: complementary PWM "
+                          "duty interrupts unavailable\n");
         }
         c->phase = 0;
         if (n == 3 && mtu_reset_pwm(s)) {
@@ -1632,6 +1676,10 @@ static void mtu_write(void *opaque, hwaddr addr, uint64_t value, unsigned size)
     case TOCR2:
         s->tocr2 = value;
         break;
+    case TWCR:
+        s->twcr = value & (s->twcr | s->twcr_read);
+        s->twcr_read = 0;
+        break;
     case TDER:
         if (value || s->tder_read) {
             s->tder = value;
@@ -1708,6 +1756,8 @@ static void mtu_reset_hold(Object *obj, ResetType type)
     memset(s->pending_matches, 0, sizeof(s->pending_matches));
     s->toer = s->tocr1 = s->tocr2 = s->tolbr = 0;
     s->tgcr = 0;
+    s->twcr = s->twcr_read = 0;
+    s->initial_tb2 = false;
     s->tder = 1;
     s->tder_read = false;
     s->reset_pwm = 0;
@@ -1756,10 +1806,15 @@ static int mtu_post_load(void *opaque, int version_id)
 {
     RX113MTUState *s = opaque;
 
+    if (version_id < 11) {
+        s->twcr = s->twcr_read = 0;
+        s->initial_tb2 = s->complementary_initial;
+    }
     if (version_id < 10) {
         s->tder = 1;
     }
-    if ((s->tder & ~1) || !s->hz || s->hz > 160000000 ||
+    if ((s->twcr & ~0x81) || (s->twcr_read & ~0x81) ||
+        (s->tder & ~1) || !s->hz || s->hz > 160000000 ||
         s->region > MTU_TB2_DOWN ||
         (s->mtic5 & ~7) || (s->feedback & ~7) || (s->tgcr & ~0x7f) ||
         (s->titcnt & 0x88) || (s->tbter & ~3) || (s->skip_ready & ~3)) {
@@ -1784,7 +1839,7 @@ static int mtu_post_load(void *opaque, int version_id)
 
 static const VMStateDescription vmstate_mtu = {
     .name = TYPE_RX113_MTU,
-    .version_id = 10,
+    .version_id = 11,
     .minimum_version_id = 1,
     .pre_save = mtu_pre_save,
     .post_load = mtu_post_load,
@@ -1829,6 +1884,9 @@ static const VMStateDescription vmstate_mtu = {
         VMSTATE_UINT8_V(mtic5, RX113MTUState, 9),
         VMSTATE_UINT8_V(tder, RX113MTUState, 10),
         VMSTATE_BOOL_V(tder_read, RX113MTUState, 10),
+        VMSTATE_UINT8_V(twcr, RX113MTUState, 11),
+        VMSTATE_UINT8_V(twcr_read, RX113MTUState, 11),
+        VMSTATE_BOOL_V(initial_tb2, RX113MTUState, 11),
         VMSTATE_END_OF_LIST()
     },
 };

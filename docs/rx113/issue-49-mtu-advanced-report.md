@@ -2,9 +2,141 @@
 SPDX-License-Identifier: GPL-2.0-or-later
 -->
 
-# Issue 49: RX113 MTU advanced output — stage 2b6 TDER and TWCR audit
+# Issue 49: RX113 MTU advanced output — stage 2b8 TWCR and reset PWM TGCR
 
 ## Current delivery (2026-11-11)
+
+The stage 2b8 brief is implemented in its requested order: TWCR,
+then brushless TGCR gating for reset-synchronized PWM. **The only
+remaining stage 2b work is duty-interrupt wiring under D-015, reserved
+for a separate run.** Stage 3 (POE) was not started. Issue #49 remains
+incomplete. D-016 is implemented as recorded; decisions.md is unchanged.
+
+Base: `90f2f95c4740b242f995d51c825b778fcc27b37b`.
+Branch: `rx113/issue-49-mtu-advanced`.
+Delivery: working-tree changes and
+`.issue49-runtime/issue49-stage2b8-twcr-tgcr.patch`.
+No commit, merge, push, PR or upstream submission was performed.
+
+### TWCR implementation
+
+Authority: supplied R01UH0448EJ0120 Rev.1.20, 20.2.30, p.446;
+20.3.8(m)-(o), pp.497-502; 20.6.13, p.539; 20.7, pp.569-570;
+and the PO's recorded emulation convention D-016.
+
+* TWCR at 0x88660 resets to zero, accepts byte and halfword accesses,
+  and reads reserved bits as zero. Setting WRE or CCE independently
+  requires a preceding read of that bit as zero. Each TWCR write consumes
+  the qualification; clearing is unconditional. TRWER does not protect
+  TWCR. Firmware must follow the manual's stopped-counter programming
+  and mode restrictions.
+* MTU0/1/2 clears synchronize the complementary pair when TSYR enables
+  the source and MTU3 and MTU3.TCR selects synchronous clearing. The pair
+  returns to TCNT3=TDDR, TCNT4=TCNTS=0, upward direction and initial
+  carrier timing. WRE retains the waveform latches and interlocks only
+  in a later trough Tb2. Otherwise the TOCR initial output is restored.
+  A separate full-initial-Tb2 marker prevents the shorter initial pad
+  window from incorrectly permitting retention. A retained clear does
+  not create a new initial-output period; repeated clears still retain.
+* CCE in mode 13 clears the counters at the TGRA3 match. It does not
+  restore initial output or consume the temporary bank. Only the
+  natural end-Tb1 boundary transfers temporary data to active registers.
+  The existing deferred-write snapshot ordering remains: a Tb write
+  waits until the next eligible Ta, including after a counter clear.
+  No early transfer or separate completion mechanism is introduced.
+* Stopping the pair restores the initial counter and output state;
+  restarting resumes from it. Entering complementary mode retains the
+  existing initial snapshot behavior. Guest changes to TWCR while
+  counting, unsupported modes and prohibited CCE combinations are not
+  validated as hardware behavior.
+* Migration version 11 carries TWCR, its per-bit read qualification and
+  the initial-Tb2 marker. Older streams default TWCR to zero and retain
+  their prior behavior. Migration with active CCE and a waiting temporary
+  bank, a qualified CCE read, and initial Tb2 after its initial pad
+  window is covered by the new qtest.
+
+### Reset-synchronized PWM TGCR
+
+The existing Table 20.39 gating is shared by both PWM engines before
+polarity selection. Software and qualified external MTIOC0A/B/C feedback,
+positive/negative chopping, fixed levels and BDC bypass are exercised.
+Reset PWM continues to use OLSP/OLSiP for both inverse outputs, per
+20.2.19; negative polarity bits remain ignored without dead time.
+TOER, TRWER and PORT/MPC qualification remain effective.
+
+### Validation
+
+The D-016 distinguishing test uses TDDR=2, TCDR=12, TGRA3=14,
+old duty 4 and a Ta commit of duty 8. At edge 13 it observes the
+counter clear and active duty 4; repeated CCE periods still leave duty
+4 active. Disabling CCE while stopped then permits duty 8 to transfer
+at the natural end-Tb1 boundary. A second transaction verifies the
+existing deferred snapshot order. No private debug register is added.
+
+A synchronous-clear sweep covers all 29 initial carrier edges, modes
+13/14/15, WRE clear/set, and sources MTU0/1/2, checking counters, pads,
+retention boundaries, repeated retained clears and stop/restart. TGCR
+uses the existing exhaustive feedback/chopping/polarity matrix with six
+representative reset-PWM carrier positions, plus bypass, protection,
+routing, ownership and reset checks. The MTU qtest timeout increases
+from 180 to 240 seconds to accommodate the additional coverage.
+
+
+Final validation on the delivered implementation:
+
+* `make -C build -j$(nproc)`: pass, RX target only, existing subprojects.
+* RX qtest/functional regression: 32 suites passed, 4 standard skips,
+  zero failures; MTU's 72 subtests passed in 170.97 seconds.
+* Thorough gdbsim functional suite: pass. Both existing RX62N gdbsim
+  machines remain listed and pass the QMP running-state smoke checks.
+* FIT PLL and HOCO boot/reset probes: pass. SYSTEM virtual-time checks
+  with and without the FIT ELF: pass.
+* Checkpatch on all changed code/build files and the patch: zero errors,
+  zero warnings. The raw diff uses `--no-signoff` because no commit or
+  author certification is being created, and eight context lines so
+  checkpatch can see the complete migration-validation conditional.
+* Forward/reverse dry runs pass against the base above. Applying the
+  patch reproduces all four working-tree files byte for byte, and
+  reversing it restores their base bytes. RX62N and decisions.md have
+  no diff. The tested QEMU and MTU-test binary hashes remain unchanged
+  through the final regression.
+
+Evidence and reproduction assets are under `.issue49-runtime/`:
+`stage2b8-build-final.log`, `stage2b8-regression.log`,
+`stage2b8-gdbsim-functional.log`, `stage2b8-fit-{pll,hoco}.log`,
+`stage2b8-system{,-elf}.log`, `stage2b8-gdbsim-smoke.log`,
+`stage2b8-checkpatch-{files,patch}.log`,
+`stage2b8-regression-binary.sha256`, `stage2b8-patch-validation.log`,
+`stage2b8-regression.sh` and `stage2b8-validate-patch.py`.
+The first regression overlapped a relink and suffered QEMU launch errors;
+its logs are retained as `stage2b8-regression-first{,-detail}.log` and
+are not counted as passing validation. The final regression ran after
+all builds finished, with no concurrent relinking.
+
+All scratch is in `.issue49-runtime/.t`; generic socket suites use the
+existing `.s49` alias, checked to resolve to that same directory. No
+subprojects were fetched and no scratch was placed in `/tmp`.
+
+Reproduce from this worktree root:
+
+```sh
+. .issue49-runtime/env.sh
+make -C build -j$(nproc)
+bash .issue49-runtime/stage2b8-regression.sh
+scripts/checkpatch.pl --no-tree -f hw/rx/rx113-mtu.c \
+  tests/qtest/rx113-mtu-test.c tests/qtest/meson.build
+scripts/checkpatch.pl --no-tree --no-signoff \
+  .issue49-runtime/issue49-stage2b8-twcr-tgcr.patch
+python3 .issue49-runtime/stage2b8-validate-patch.py
+```
+
+Suggested commit subject: `hw/rx: Implement RX113 TWCR and reset PWM gating`.
+The patch contains only the RX113 MTU implementation, its qtest,
+the qtest timeout and this report. Runtime assets and AGENTS.md are excluded.
+
+## Stage 2b6 TDER and TWCR audit (historical, superseded by D-016)
+
+### Stage 2b6 delivery (2026-11-11)
 
 **Stage 2b and Issue #49 remain incomplete.** The first item of
 `.issue49-runtime/issue-49-stage2b6.md` is implemented: TDER
