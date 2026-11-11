@@ -168,3 +168,56 @@ evidence, validity boundary, promoted-to. Newest first.
 - **Validity boundary:** Complementary PWM mode 1 (the only mode
   CCE may be used in, per the manual's notes).
 - **Promoted-to:** Issue #51. No supersede proposed; D-016 stands.
+
+## F-005: Remaining premises — batch verification results (2026-11-11)
+
+Per-item verdicts for the rest of the Issue #51 list. "Unconfirmed"
+means no source beyond the manual's own text was found either way;
+those items close as documented premises, per the issue protocol.
+
+- **D-019 (POE OSF1 observes all candidate pads): supported.**
+  Rests directly on the OCSR1 footnote in the manual (§21.2.2:
+  the output-level comparison depends on the pin level
+  regardless of the PmnPFS setting). No external source
+  contradicts it.
+- **Module-stop access rule (Issue #10): supported in substance.**
+  Manual §11.4: "the internal states of modules are retained in
+  the module stop state" and "basically the registers in the
+  module stop state cannot be read or written". The model's
+  read-as-0 is the usual concrete form of "cannot be read". The
+  manual's race note (a write immediately after setting MSTP may
+  still land) is a hardware timing window the model does not
+  reproduce; §11.4 itself instructs software not to rely on it,
+  so the simplification is on the safe side.
+- **D-009 (CAC writes during CFME=1 ignored): unconfirmed.**
+  The manual prohibits the writes ("Set the CACR1 register when
+  the CACR0.CFME bit is 0", likewise CACR2 and the limit
+  registers) but nowhere states the hardware effect of violating
+  the prohibition; no errata, app note or forum source found.
+  The model's ignore-plus-guest-error choice is the stricter
+  direction (a violating program's settings cannot silently take
+  effect), so the premise is retained as documented.
+- **D-011 (CTSU stabilization wait, CTSUTRMR factory value):
+  unconfirmed beyond the sanctioned setting.** The RX113 manual
+  fixes CTSUSST to 00010000b with no cycle formula, so the
+  modelled 34-cycle wait at 0x10 (from the CTSU1 QE parameter
+  guide) and the proportional behaviour for other values only
+  affect non-sanctioned settings; the wait has no
+  software-observable contract beyond measurement starting
+  afterwards. No source states a CTSUTRMR factory trim value.
+- **D-014 (ELC duplicate destination arbitration): unconfirmed.**
+  The manual is silent on two ELSR entries selecting the same
+  destination pin, and no external source addresses it. The
+  model's accept-and-apply-in-ELSR-order rule is observable only
+  when two sources drive the same pin in the same instant.
+- **RTCDV hold-only (Issue #20): not a hardware premise.** The
+  register sets sub-clock drive capability, which has no
+  emulation-observable effect; storing and reading it back is a
+  modelling scope choice, not a behavioural claim. No
+  verification applies.
+
+- **Promoted-to:** Issue #51. With F-001 to F-005 the issue's
+  verification list is exhausted: D-015 and D-016 stand, D-019
+  and the module-stop rule are supported, D-009 / D-011 / D-014
+  close unconfirmed, RTCDV is out of scope, and two items await
+  PO decisions (D-018 supersede, F-001; cascade TMO1 fix, F-003).
