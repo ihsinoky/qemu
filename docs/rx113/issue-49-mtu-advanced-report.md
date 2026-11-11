@@ -2,20 +2,138 @@
 SPDX-License-Identifier: GPL-2.0-or-later
 -->
 
-# Issue 49: RX113 MTU advanced output — stage 3 audit stop
+# Issue 49: RX113 MTU advanced output — stage 3b audit stop
 
-## Current status (2026-11-11): stage 3 stopped before implementation
+## Current status (2026-11-11): OSTSTE write/release conflict
 
-Issue #49 remains open. Stages 1, 2a and 2b are committed through
-`7b62526287c143b9e7801f06f7895e8cb7f19626` on
-`rx113/issue-49-mtu-advanced`. The stage-3 brief requires an audit stop
-if implementing the requested behavior appears to require shared ICU
-changes. The oscillator-stop source exposes that dependency. No POE
-implementation, partial register stub, shared-model change or new qtest
-is delivered by this run. The 75 MTU qtests are the previously recorded
-stage-2b result; they were not rerun for this documentation-only audit.
+Issue #49 remains open. Stage 3b stopped under the explicit instruction
+in `.issue49-runtime/issue-49-stage3b.md` to stop on an unresolved design
+decision rather than guess. This is an audit report, not the final Issue
+#49 completion report: no POE implementation or new qtest is delivered.
+Stages 1, 2a and 2b remain as committed through
+`7b62526287c143b9e7801f06f7895e8cb7f19626`; the delivery base for this
+report is `f6bd369ddb6d16e01ca66a0eebf20acf135b8d6d` on
+`rx113/issue-49-mtu-advanced`.
 
-### Blocking evidence and decision needed
+D-017 resolves the previous NMI scope blocker. SYSTEM OSTDCR/OSTDSR,
+oscillator-stop detection, notification to POE, cutoff and release are
+in scope. OSTDI must be generated as a request at the SYSTEM/ICU
+boundary, with CPU delivery left unavailable by the recorded IWDT
+precedent. Shared ICU and CPU changes remain outside this issue.
+The current stop concerns two conflicting requirements within POE
+itself, not permission to implement the oscillator-stop source.
+
+### Conflicting requirements in the supplied manual
+
+Authority: R01UH0448EJ0120 Rev.1.20, section 21. Both statements were
+verified visually in the supplied PDF, not just in its text extraction.
+
+* Section 21.2.7, printed/PDF page 588: ICSR3 is at `0008 890Eh`.
+  Bit 9, OSTSTE, resets to 0 and has access type `R/W*1`.
+  Note 1 says: “Can be modified only once after a reset.” Bit 12,
+  OSTSTF, has a different note: read 1, then write 0 to clear, and
+  clearing is rejected while the stopped-oscillation signal is asserted
+  (at least ten PCLKB cycles after detection).
+* Section 21.3.5, printed/PDF page 593: for oscillator-stop cutoff,
+  “clearing the ICSR3.OSTSTF or ICSR3.OSTSTE bit releases the pins
+  from the high-impedance.” This expressly provides an OSTSTE-clear
+  release path in addition to the OSTSTF-clear path.
+
+Starting at reset, enabling oscillator-stop cutoff requires changing
+OSTSTE from 0 to 1. Subsequently clearing OSTSTE to release the pads
+would be a second modification without a reset. Enforcing the register
+table's write-once rule rejects that release operation; allowing it
+introduces an exception to that rule. Keeping the documented flag-clear
+release path does not resolve the enable-clear path's contradictory
+write acceptance/readback requirements. Sections 21.2.7 and 21.3.5 do
+not state precedence or a write-once exception. D-017 decides the NMI
+boundary and does not decide this register behavior. Neither stage-3
+brief resolves it; both the write rules and documented release
+conditions are explicitly required.
+
+### Guest-visible case requiring a decision
+
+A distinguishing test can isolate MTIOC0A as follows:
+
+1. After reset, route an enabled MTIOC0A waveform through PORT/MPC.
+   Set POECR1.PE0ZE and ICSR3.OSTSTE (`ICSR3 = 0x0200`).
+2. Enable SYSTEM oscillator-stop detection and POE notification, then
+   induce a main-clock failure through the SYSTEM source. Confirm
+   OSTSTF becomes 1 and the MTIOC0A pad driver becomes high-impedance.
+3. Wait until the stop-notification signal is negated and the required
+   ten PCLKB cycles have elapsed. Leave OSTSTF latched.
+4. Write `ICSR3 = 0x1000`: retain OSTSTF by writing 1, but request
+   OSTSTE = 0. This isolates the enable-clear path from flag clearing.
+
+The register-table interpretation keeps `ICSR3 = 0x1200` and the pad
+high-impedance. The release-paragraph interpretation permits
+`ICSR3 = 0x1000` and restores the pad driver, with no other cutoff
+source active. These are observably different firmware behaviors.
+Neither behavior is selected by this delivery.
+
+The PO/PMO must supply a precedence decision or authoritative
+clarification/erratum. If OSTSTE clearing is allowed as an exception,
+the decision must also specify whether subsequent re-enabling is
+allowed and how the write-once lock behaves after clearing. If the
+write-once table takes precedence, the decision must explicitly accept
+that OSTSTE clearing cannot provide the section-21.3.5 release path.
+Once resolved, add the distinguishing register/pad test above along
+with the complete stage-3 source, qualification, interrupt, timing,
+reset and migration coverage. Do not infer an exception from this report.
+
+### Applicability checks completed
+
+* Section 11.2.2–11.2.5, pages 214–218: MSTPCRA/B/C/D assign no
+  POE module-stop bit. MSTPCRA.MSTPA9 gates MTU0–MTU5, not POE.
+  Do not reuse it as a POE gate. Section 21.5.1 separately states
+  that POE stops in software standby and forbids entering that mode
+  when POE is used.
+* Section 17, Tables 17.2/17.3, pages 326–328: POE is neither an
+  ELC destination nor an event source. OEI1/OEI2 are not ELC events.
+* Section 21.4, Table 21.4, and Table 14.3: OEI1/OEI2 are vectors
+  170/171; OSTSTF itself is not an OEI interrupt source. D-017's
+  OSTDI request boundary remains separate.
+* Section 21.5.3, page 594: high-impedance control applies to pads
+  selected for MTU through PMR/PFS, and POE input pins must likewise
+  be selected through PMR/PFS. GPIO output drivers must not be
+  suppressed by an invented global PORT gate.
+
+### Acceptance and delivery
+
+| Acceptance area | Status |
+| --- | --- |
+| Ordinary/PWM pad routing and reset-synchronized PWM | Delivered in stages 1/2a; historical validation below |
+| Complementary crest/trough and duty IRQs | Delivered through stage 2b and D-015 |
+| Dead-time separation, temporary-buffer transfer and interlocks | Delivered in stage 2b, including D-016 CCE policy |
+| POE assertion/release at physical PORT pads | Not delivered; OSTSTE write/release decision required |
+| SYSTEM oscillator-stop source and undelivered OSTDI request | Authorized by D-017; not delivered |
+| Final Issue #49 completion | Not achieved |
+
+The deliverable changes only this report. Experimental source edits
+were removed after identifying the conflict; no partial POE model,
+register stub, new qtest or shared-model change is included. The build
+was restored to the committed source after removing those experiments.
+The experimental build is not evidence of POE correctness. The 75 MTU
+qtests recorded below are historical results, not a new stage-3 test run.
+
+Patch: `.issue49-runtime/issue49-stage3b-ostste-audit.patch`.
+Validation: `.issue49-runtime/stage3b-audit-validation.log`, with
+checkpatch output in `.issue49-runtime/stage3b-audit-checkpatch.log`.
+The patch is restricted to this report and excludes AGENTS.md,
+`decisions.md`, runtime/manual/build assets and repository metadata.
+Validation covers whitespace, checkpatch, forward/reverse patch dry
+runs and reconstruction against the base. The restored source rebuild
+and machine-list smoke are recorded separately; no POE regression or
+completion claim is made. No commit, merge, push, PR or upstream
+submission was performed.
+
+## Previous stage-3 NMI audit (historical; resolved by D-017)
+
+The evidence below preserves the reason for the earlier stop. Its
+request for a scope decision was satisfied by D-017 at the current
+base; it is not the stage-3b blocker.
+
+### Previous NMI audit evidence (historical; resolved by D-017)
 
 Authority: the supplied R01UH0448EJ0120 Rev.1.20 manual.
 
@@ -84,17 +202,6 @@ for POE after the source boundary is agreed; full shared ICU/CPU NMI
 support adds approximately 2–4 days and RX62N regression review, subject
 to a separate authorized implementation assessment.
 
-### Audit deliverable and validation
-
-This run changes only this report. The patch is
-`.issue49-runtime/issue49-stage3-poe-audit.patch`, relative to the
-stage-2b tip above, and excludes AGENTS.md, runtime/manual/build assets,
-repository metadata and `decisions.md`. Validation records are in
-`.issue49-runtime/stage3-audit-validation.log`: whitespace check,
-checkpatch, forward/reverse patch dry runs and byte-for-byte
-reconstruction. No build or device regression is claimed for this
-report-only change. No commit, merge, push, PR or upstream submission
-was performed.
 
 ## Stage 2b delivery (2026-11-11, historical)
 
