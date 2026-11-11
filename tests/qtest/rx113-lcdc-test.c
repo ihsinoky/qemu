@@ -404,6 +404,139 @@ static void test_prd_from_rtc(void)
     qtest_quit(qts);
 }
 
+/* Issue #63: COM/SEG pad levels observed through the PORT model. */
+#define PORT_BASE   0x8c000
+#define PMR(p)      (PORT_BASE + 0x60 + (p))
+#define PWPR        (PORT_BASE + 0x11f)
+#define PFS(p, b)   (PORT_BASE + 0x140 + (p) * 8 + (b))
+#define PORT_1      1
+#define PORT_B      11
+#define PORT_C      12
+
+static unsigned port_prop(QTestState *qts, const char *prop, unsigned port)
+{
+    QDict *rsp = qtest_qmp(qts,
+        "{'execute': 'qom-get', 'arguments': "
+        "{'path': '/machine/mcu/port', 'property': %s}}", prop);
+    const char *str = qdict_get_str(rsp, "return");
+    unsigned val;
+
+    g_assert_cmpuint(strlen(str), ==, 38);
+    g_assert_cmpint(sscanf(str + port * 2, "%2x", &val), ==, 1);
+    qobject_unref(rsp);
+    return val;
+}
+
+/* Select the LCDC pin function (PSEL = 24, 19.3.4) on one pad. */
+static void pad_select_lcd(QTestState *qts, unsigned port, unsigned bit)
+{
+    qtest_writeb(qts, PWPR, 0);
+    qtest_writeb(qts, PWPR, 0x40);
+    qtest_writeb(qts, PFS(port, bit), 24);
+    qtest_writeb(qts, PWPR, 0x80);
+    qtest_writeb(qts, PMR(port),
+                 qtest_readb(qts, PMR(port)) | (1 << bit));
+}
+
+static void test_pads_scan(void)
+{
+    QTestState *qts = lcdc_init();
+    const int64_t half = 1953125;   /* half of the 256 Hz LCDCL */
+
+    lcdc_setup_subclock(qts);
+    qtest_writeb(qts, SEG(0), 0x01);    /* SEG00 lit on slice 0 only */
+    pad_select_lcd(qts, PORT_C, 5);     /* COM0 */
+    pad_select_lcd(qts, PORT_C, 4);     /* COM1 */
+    pad_select_lcd(qts, PORT_C, 2);     /* COM3 */
+    pad_select_lcd(qts, PORT_1, 3);     /* SEG00 */
+    pad_select_lcd(qts, PORT_B, 7);     /* SEG11 in 4-slice mode */
+    qtest_writeb(qts, LCDM1, LCDM1_SCOC | LCDM1_LCDON);
+
+    /* Slice 0, first half: COM0 driven high, SEG00 low (lit). */
+    g_assert_cmphex(port_prop(qts, "driving", PORT_C), ==, 0x20);
+    g_assert_cmphex(port_prop(qts, "levels", PORT_C), ==, 0x20);
+    g_assert_cmphex(port_prop(qts, "driving", PORT_1), ==, 0x08);
+    g_assert_cmphex(port_prop(qts, "levels", PORT_1), ==, 0x00);
+    /* SEG11 is unlit: it follows the selected common's level. */
+    g_assert_cmphex(port_prop(qts, "driving", PORT_B), ==, 0x80);
+    g_assert_cmphex(port_prop(qts, "levels", PORT_B), ==, 0x80);
+
+    /* Second half: the drive phase inverts (waveform A). */
+    qtest_clock_step(qts, half);
+    g_assert_cmphex(port_prop(qts, "levels", PORT_C), ==, 0x00);
+    g_assert_cmphex(port_prop(qts, "levels", PORT_1), ==, 0x08);
+    g_assert_cmphex(port_prop(qts, "levels", PORT_B), ==, 0x00);
+
+    /* Slice 1: COM1 takes over; SEG00 is dark on this slice. */
+    qtest_clock_step(qts, half);
+    g_assert_cmphex(port_prop(qts, "driving", PORT_C), ==, 0x10);
+    g_assert_cmphex(port_prop(qts, "levels", PORT_C), ==, 0x10);
+    g_assert_cmphex(port_prop(qts, "levels", PORT_1), ==, 0x08);
+    qtest_quit(qts);
+}
+
+static void test_pads_waveform_b(void)
+{
+    QTestState *qts = lcdc_init();
+    const int64_t half = 1953125;
+
+    lcdc_setup_subclock(qts);
+    qtest_writeb(qts, LCDM0, LDTY_4SLICE | LCDM0_LWAVE_B | 1);
+    qtest_writeb(qts, SEG(0), 0x01);
+    pad_select_lcd(qts, PORT_C, 5);     /* COM0 */
+    pad_select_lcd(qts, PORT_1, 3);     /* SEG00 */
+    qtest_writeb(qts, LCDM1, LCDM1_SCOC | LCDM1_LCDON);
+
+    g_assert_cmphex(port_prop(qts, "levels", PORT_C), ==, 0x20);
+    qtest_clock_step(qts, half);
+    /* Waveform B holds the phase for the whole slice. */
+    g_assert_cmphex(port_prop(qts, "driving", PORT_C), ==, 0x20);
+    g_assert_cmphex(port_prop(qts, "levels", PORT_C), ==, 0x20);
+    g_assert_cmphex(port_prop(qts, "levels", PORT_1), ==, 0x00);
+    qtest_quit(qts);
+}
+
+static void test_pads_ground_and_stop(void)
+{
+    QTestState *qts = lcdc_init();
+
+    lcdc_setup_subclock(qts);
+    pad_select_lcd(qts, PORT_C, 5);     /* COM0 */
+    pad_select_lcd(qts, PORT_1, 3);     /* SEG00 */
+
+    /* SCOC = 0: ground level is driven on the LCD pins (34.2.2). */
+    g_assert_cmphex(port_prop(qts, "driving", PORT_C), ==, 0x20);
+    g_assert_cmphex(port_prop(qts, "levels", PORT_C), ==, 0x00);
+    g_assert_cmphex(port_prop(qts, "driving", PORT_1), ==, 0x08);
+    g_assert_cmphex(port_prop(qts, "levels", PORT_1), ==, 0x00);
+
+    /* Module stop: the LCDC drives nothing. */
+    qtest_writel(qts, MSTPCRD, 0xffffffff);
+    g_assert_cmphex(port_prop(qts, "driving", PORT_C), ==, 0x00);
+    g_assert_cmphex(port_prop(qts, "driving", PORT_1), ==, 0x00);
+    qtest_quit(qts);
+}
+
+static void test_pads_8_slice(void)
+{
+    QTestState *qts = lcdc_init();
+    const int64_t half = 1953125;
+
+    qtest_writeb(qts, LCDSCLKCR, 3);
+    qtest_writeb(qts, LCDSCLKCR2, 0);
+    qtest_writeb(qts, LCDC0, 0x06);
+    qtest_writeb(qts, LCDM0, LDTY_8SLICE | 1);
+    pad_select_lcd(qts, PORT_B, 7);     /* COM4 in 8-slice mode */
+    qtest_writeb(qts, LCDM1, LCDM1_SCOC | LCDM1_LCDON);
+
+    /* PB7 is SEG11 outside 8-slice mode; here it idles until slice 4. */
+    g_assert_cmphex(port_prop(qts, "driving", PORT_B), ==, 0x00);
+    qtest_clock_step(qts, half * 8);
+    g_assert_cmphex(port_prop(qts, "driving", PORT_B), ==, 0x80);
+    g_assert_cmphex(port_prop(qts, "levels", PORT_B), ==, 0x80);
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -418,5 +551,9 @@ int main(int argc, char **argv)
     qtest_add_func("/rx113-lcdc/scan", test_scan);
     qtest_add_func("/rx113-lcdc/stop", test_stop);
     qtest_add_func("/rx113-lcdc/prd-from-rtc", test_prd_from_rtc);
+    qtest_add_func("/rx113-lcdc/pads-scan", test_pads_scan);
+    qtest_add_func("/rx113-lcdc/pads-waveform-b", test_pads_waveform_b);
+    qtest_add_func("/rx113-lcdc/pads-ground-stop", test_pads_ground_and_stop);
+    qtest_add_func("/rx113-lcdc/pads-8-slice", test_pads_8_slice);
     return g_test_run();
 }

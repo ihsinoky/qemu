@@ -973,6 +973,10 @@ static DeviceState *register_port(RX113State *s)
     DeviceState *dev = qdev_new(TYPE_RX113_PORT);
 
     object_property_add_child(OBJECT(s), "port", OBJECT(dev));
+    if (s->lcdc) {
+        object_property_set_link(OBJECT(dev), "lcdc", OBJECT(s->lcdc),
+                                 &error_abort);
+    }
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_abort);
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, RX113_PORT_BASE);
     for (unsigned i = 0; i < 8; i++) {

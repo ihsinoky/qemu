@@ -20,6 +20,7 @@ struct RX113PortState {
     MemoryRegion iomem;
     DeviceState *elc;
     DeviceState *poe;
+    DeviceState *lcdc;
     uint32_t package_pins;
     uint8_t regs[0x200];
     uint8_t external[RX113_PORT_COUNT];
