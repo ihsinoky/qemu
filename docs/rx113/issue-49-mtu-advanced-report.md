@@ -2,9 +2,133 @@
 SPDX-License-Identifier: GPL-2.0-or-later
 -->
 
-# Issue 49: RX113 MTU advanced output — stage 3b audit stop
+# Issue 49: RX113 MTU advanced output — stage 3c audit stop
 
-## Current status (2026-11-11): OSTSTE write/release conflict
+## Current status (2026-11-11): output-comparison observation point
+
+Issue #49 remains open. D-017 and D-018 at delivery base
+`04042c6be0fec0cfa2a84bfc77d1ae56000589b6` resolve both earlier stops.
+Stage 3c stopped under the explicit stop-on-unresolved-decision rule in
+`.issue49-runtime/issue-49-stage3c.md`. The new question concerns which
+levels feed the output-short comparator when MTIOC functions have
+multiple alternate physical pads. No implementation policy is selected
+by this report. This is an audit delivery, not a completion report.
+
+D-017's SYSTEM-to-POE implementation and undelivered OSTDI request are
+accepted scope. D-018's OSTSTE policy is accepted: set once after reset,
+clear always, and no re-set after clearing until reset. The distinguishing
+`ICSR3 = 0x1000` write must retain OSTSTF, clear OSTSTE and restore the
+selected MTIOC0A pad if no other cutoff source remains. The independent
+OSTSTF-clear release test is also still required. Neither decision needs
+reconsideration.
+
+### Evidence and the remaining gap
+
+Authority: supplied R01UH0448EJ0120 Rev.1.20. OCSR1 page 583 was also
+rendered and checked visually; the footnote below is present in the PDF.
+
+* Section 21.2.2, page 583: OSF1 records overlapping active levels in
+  a Table 21.3 pair. Its setting-condition footnote explicitly makes
+  detection depend on pin level irrespective of MPC.PmnPFS. The same
+  page also requires the MTU output-comparison function to be enabled.
+* Table 21.3, page 580, and Figure 21.1, page 579: the comparator inputs
+  are named MTIOC3B/MTIOC3D, MTIOC4A/MTIOC4C and MTIOC4B/MTIOC4D.
+  They do not identify PORT pad numbers or an alternate-pad selection
+  or reduction rule for the comparator.
+* Table 19.1, pages 366–367: MTIOC3B can use P17, PB3, PB7, PC5 or
+  P22 (the last only in the 100-pin package). MTIOC3D can use P16,
+  PB6, PC4 or P23 (the last only in the 100-pin package). Thus each
+  named input has several possible physical pads.
+* Section 19.3.2(3), page 396, prohibits assigning one function to
+  multiple pins through MPC. It does not say how comparator inputs
+  are chosen when those pads have different functions, particularly
+  when neither pad is selected as MTIOC. The OCSR1 footnote expressly
+  prevents assuming that PFS qualification alone resolves this case.
+* Section 21.3.5, page 593: OSF1 clearing requires inactive MTU outputs.
+  Selecting the observation point is also necessary to specify the
+  corresponding read-before-zero release qualification consistently.
+
+The implementation has raw MTU output levels and separate PORT-resolved
+levels. These are observably different when PORT drives a pad as GPIO
+or an external source drives a high-impedance pad. Treating the named
+comparator inputs as internal MTU signals before MPC would make comparison
+independent of PFS, but would not observe a physical-pad fault. Treating
+them as physical-pad levels requires a rule identifying which of the
+alternate pads supplies each comparator input even when PFS selects
+another function. Neither D-017 nor D-018 chooses between those models;
+the cited descriptions do not supply that missing mapping rule. The
+worker does not invent a fixed pad, combine all alternatives, or silently
+substitute raw waveforms for resolved pad levels.
+
+This is distinct from the settled applicability finding: high-impedance
+**output gating** applies only to PMR/PFS-selected MTU pads. GPIO outputs
+must remain driven. That rule remains accepted, as do the absence of a
+POE module-stop bit and ELC involvement, OEI1/OEI2 vectors 170/171 and
+OSTSTF's exclusion from the OEI sources. They were not re-investigated.
+
+### Distinguishing test required after the observation point is decided
+
+Configure MTU3B/3D compare outputs with inactive-high polarity, keep their
+internal output levels high, enable the first comparison pair through
+POECR2.P1CZEA and enable OCSR1.OIE1/OCE1. Leave all MTIOC3B/3D alternate
+pads in GPIO mode. Drive P22 and P23 low while keeping the other
+MTIOC3B/3D alternatives high, then wait longer than one PCLKB cycle.
+
+An internal-output comparison sees inactive levels and leaves OSF1 and
+OEI1 clear. A physical-pad implementation observing P22/P23 sees an active
+pair and sets OSF1/OEI1; a physical implementation observing another
+pair can produce a different result. Swap which alternate pads are low
+to distinguish pad-selection or reduction policies. GPIO pad drivers must
+remain enabled in every interpretation, because cutoff selection is
+already settled independently. This is a proposed hardware/implementation
+characterization test, not a delivered passing qtest or a claim that any
+one of those observation policies matches the silicon.
+
+A PO/PMO decision or authoritative clarification must identify whether
+the comparator observes internal MTU signals or resolved physical pads.
+If physical pads are required, it must identify the pad mapping/selection
+rule when PFS selects another function, including package differences.
+The release qualification must use the corresponding documented or
+explicitly selected observation point. Once that decision exists,
+resume all stage-3b implementation and tests, including both oscillator
+release paths under D-018; do not treat this audit as permission to omit
+output-level comparison.
+
+### Acceptance and delivery
+
+| Acceptance area | Status |
+| --- | --- |
+| Ordinary/PWM routing and reset-synchronized PWM | Previously delivered; historical evidence below |
+| Complementary crest/trough, duty IRQs and dead time | Previously delivered under D-015 |
+| Buffered transfers/interlocks and CCE policy | Previously delivered under D-016 |
+| Stage-3 POE and SYSTEM oscillator-stop implementation | Not delivered; comparator observation decision required |
+| D-018 ICSR3 readback/pad test and both release paths | Required at resumption; not delivered |
+| Full Issue #49 completion and full new regression run | Not achieved |
+
+Experimental source edits were removed. The delivered change is restricted
+to this report; tracked RX113 sources are restored to the delivery base.
+There are no new qtests or partial register stubs. The experimental build
+log is not POE correctness evidence. The restored-source rebuild and
+machine-list smoke are recorded in
+`.issue49-runtime/stage3c-restored-build.log` and
+`.issue49-runtime/stage3c-restored-smoke.log`. No new full-regression or
+POE acceptance claim is made.
+
+Patch: `.issue49-runtime/issue49-stage3c-comparator-audit.patch`.
+Validation: `.issue49-runtime/stage3c-audit-validation.log` and
+`.issue49-runtime/stage3c-audit-checkpatch.log`. Checks cover whitespace,
+checkpatch, forward/reverse patch dry runs and byte-for-byte report
+reconstruction against the delivery base. The patch excludes AGENTS.md,
+`decisions.md`, runtime/manual/build assets and repository metadata.
+No commit, merge, push, PR or upstream submission was performed.
+
+## Previous stage-3b OSTSTE audit (historical; resolved by D-018)
+
+The following stop and its requests are historical. D-018 resolves the
+write/release conflict; the current stop is the comparator observation
+point described above.
+
+### Previous status (2026-11-11): OSTSTE write/release conflict
 
 Issue #49 remains open. Stage 3b stopped under the explicit instruction
 in `.issue49-runtime/issue-49-stage3b.md` to stop on an unresolved design
