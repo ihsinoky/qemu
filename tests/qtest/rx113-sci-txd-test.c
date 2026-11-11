@@ -270,6 +270,82 @@ static void test_migration(void)
     rmdir(dir);
 }
 
+/*
+ * Clock-synchronous frame on SCI0: TXD0 on P20, SCK0 on P22 (both
+ * PSEL=10). One bit lasts BIT_NS; SCK is low for the first half of each
+ * bit (TXD changes on the falling edge) and high for the second half,
+ * idles high, and TXD holds the last bit after the frame (section 28.5).
+ */
+static void sync_frame(QTestState *qts, const bool bits[8])
+{
+    /* At the frame start SCK has fallen and bit 0 is presented. */
+    assert_pad(qts, 0x22, true, false);
+    assert_pad(qts, 0x20, true, bits[0]);
+    for (unsigned k = 0; k < 8; k++) {
+        qtest_clock_step(qts, BIT_NS / 2);
+        assert_pad(qts, 0x22, true, true); /* rising edge mid-bit */
+        assert_pad(qts, 0x20, true, bits[k]);
+        qtest_clock_step(qts, BIT_NS / 2);
+        if (k < 7) {
+            assert_pad(qts, 0x22, true, false); /* next falling edge */
+            assert_pad(qts, 0x20, true, bits[k + 1]);
+        }
+    }
+    /* After the frame SCK stays high and TXD holds the last bit. */
+    assert_pad(qts, 0x22, true, true);
+    assert_pad(qts, 0x20, true, bits[7]);
+    qtest_clock_step(qts, BIT_NS);
+    assert_pad(qts, 0x22, true, true);
+    assert_pad(qts, 0x20, true, bits[7]);
+}
+
+static void test_sync_tx(void)
+{
+    QTestState *qts = txd_init();
+    /* 0xA5 LSB first: 1 0 1 0 0 1 0 1 */
+    static const bool lsb[8] = {
+        true, false, true, false, false, true, false, true
+    };
+    /* 0xB1 MSB first: 1 0 1 1 0 0 0 1 */
+    static const bool msb[8] = {
+        true, false, true, true, false, false, false, true
+    };
+
+    select_pad(qts, 0x20, 10); /* P20 = TXD0 */
+    select_pad(qts, 0x22, 10); /* P22 = SCK0 */
+    assert_pad(qts, 0x22, false, false); /* TE off: not driven */
+    sci_setup(qts, SCI0, 0x80); /* SMR.CM: clock synchronous mode */
+    qtest_writeb(qts, SCI0 + SCR, SCR_TE);
+    assert_pad(qts, 0x22, true, true); /* SCK idles high */
+    qtest_writeb(qts, SCI0 + TDR, 0xa5);
+    sync_frame(qts, lsb);
+    g_assert_cmphex(qtest_readb(qts, SCI0 + SSR) & SSR_TEND, ==, SSR_TEND);
+
+    qtest_writeb(qts, SCI0 + SCR, 0);
+    qtest_writeb(qts, SCI0 + SCMR, SCMR_SDIR); /* MSB first */
+    qtest_writeb(qts, SCI0 + SCR, SCR_TE);
+    qtest_writeb(qts, SCI0 + TDR, 0xb1);
+    sync_frame(qts, msb);
+    qtest_quit(qts);
+}
+
+/* An external clock (SCR.CKE bit 1) leaves SCK undriven in this stage. */
+static void test_sync_external_clock(void)
+{
+    QTestState *qts = txd_init();
+
+    select_pad(qts, 0x20, 10);
+    select_pad(qts, 0x22, 10);
+    sci_setup(qts, SCI0, 0x80);
+    qtest_writeb(qts, SCI0 + SCR, SCR_TE | 0x02); /* CKE: external */
+    assert_pad(qts, 0x22, false, false);
+    qtest_writeb(qts, SCI0 + TDR, 0xa5);
+    qtest_clock_step(qts, BIT_NS * 10);
+    assert_pad(qts, 0x22, false, false);
+    assert_pad(qts, 0x20, true, true); /* TXD stays at its idle level */
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -278,5 +354,8 @@ int main(int argc, char **argv)
     qtest_add_func("/rx113-sci-txd/formats", test_formats);
     qtest_add_func("/rx113-sci-txd/back-to-back", test_back_to_back);
     qtest_add_func("/rx113-sci-txd/migration", test_migration);
+    qtest_add_func("/rx113-sci-txd/sync-tx", test_sync_tx);
+    qtest_add_func("/rx113-sci-txd/sync-external-clock",
+                   test_sync_external_clock);
     return g_test_run();
 }
