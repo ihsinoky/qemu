@@ -235,6 +235,8 @@ not folded into Issue #49.
 
 ## D-018: OSTSTE write-once is composed with the documented release
 
+Superseded by D-020 (2026-11-11).
+
 Section 21.2.7 marks ICSR3.OSTSTE as modifiable only once after a
 reset, while section 21.3.5 documents clearing OSTSTE as a release
 path from the oscillator-stop high-impedance state; the manual
@@ -263,3 +265,25 @@ limited to PMR/PFS-selected MTU pads, as settled in the stage 3
 audit. This is an emulation convention, not a claim about hardware
 behaviour, and is a candidate for the Issue #51 hardware-behaviour
 cross-check.
+
+## D-020: OSTSTE is strictly write-once (supersedes D-018)
+
+External verification under Issue #51 (findings F-001) found four
+vendor sources converging against the D-018 composition: the
+manual's own contrast between the write-once configuration
+registers and the freely clearable SPOER, migration guide
+R01AN3669 listing ICSR3 among the registers that "can be written
+to only once after a reset", application note R01AN4140 whose
+oscillation-stop recovery clears OSTSTF and never touches OSTSTE,
+and the POE family's set-once configuration convention. The PO
+accepted the supersede on 2026-11-11. OSTSTE now follows the same
+field latch as the other section-21 configuration fields: the
+first write that presents the field after a reset determines its
+value (a write of 0 consumes the modification as well), and later
+writes cannot change it until a reset. The OSTSTF flag clear
+remains effective on every write, so the documented recovery path
+(OSTDF clear, clock reconfiguration, OSTSTF clear) is unchanged;
+only the OSTSTE-clear release path is removed. Whether the latch
+is consumed by a write that does not present the field (a low-byte
+write to ICSR3 touches only reserved bits) is not documented; the
+model follows the ICSR2 precedent of latching per presented field.

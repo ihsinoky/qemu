@@ -3124,7 +3124,7 @@ static void test_poe_comparator(void)
 
 static void test_poe_oscillator(gconstpointer data)
 {
-    bool enable_clear = GPOINTER_TO_UINT(data);
+    bool strict_once = GPOINTER_TO_UINT(data);
     QTestState *qts = mtu_init();
     QDict *rsp;
 
@@ -3149,13 +3149,21 @@ static void test_poe_oscillator(gconstpointer data)
     qtest_writew(qts, POE + 0xe, 0x200);
     g_assert_cmphex(qtest_readw(qts, POE + 0xe), ==, 0x1200);
     qtest_clock_step(qts, 1);
-    if (enable_clear) {
-        /* D-018: retain OSTSTF, clear OSTSTE, restore pad, reject re-set. */
+    if (strict_once) {
+        /* D-020: an OSTSTE clear is ignored; OSTSTF remains the release. */
         qtest_writew(qts, POE + 0xe, 0x1000);
-        g_assert_cmphex(qtest_readw(qts, POE + 0xe), ==, 0x1000);
+        g_assert_cmphex(qtest_readw(qts, POE + 0xe), ==, 0x1200);
+        assert_pad(qts, 0x14, false, false);
+        qtest_writew(qts, POE + 0xe, 0x200);
+        g_assert_cmphex(qtest_readw(qts, POE + 0xe), ==, 0x200);
         assert_pad(qts, 0x14, true, true);
-        qtest_writew(qts, POE + 0xe, 0x1200);
-        g_assert_cmphex(qtest_readw(qts, POE + 0xe), ==, 0x1000);
+        /* OSTSTE stayed armed: a second stop trips the output again. */
+        qtest_clock_step(qts, 1000000);
+        g_assert_cmphex(qtest_readw(qts, POE + 0xe), ==, 0x1200);
+        assert_pad(qts, 0x14, false, false);
+        qtest_writew(qts, POE + 0xe, 0x200);
+        g_assert_cmphex(qtest_readw(qts, POE + 0xe), ==, 0x200);
+        assert_pad(qts, 0x14, true, true);
     } else {
         qtest_writew(qts, POE + 0xe, 0x200);
         g_assert_cmphex(qtest_readw(qts, POE + 0xe), ==, 0x200);
@@ -3168,6 +3176,14 @@ static void test_poe_oscillator(gconstpointer data)
     qtest_writeb(qts, 0x80041, 0);
     g_assert_cmpuint(qtest_readb(qts, 0x80041), ==, 0);
     qtest_system_reset(qts);
+    if (strict_once) {
+        /* A first write of 0 also consumes the one modification. */
+        qtest_writew(qts, POE + 0xe, 0x1000);
+        g_assert_cmphex(qtest_readw(qts, POE + 0xe), ==, 0);
+        qtest_writew(qts, POE + 0xe, 0x200);
+        g_assert_cmphex(qtest_readw(qts, POE + 0xe), ==, 0);
+        qtest_system_reset(qts);
+    }
     qtest_writew(qts, POE + 0xe, 0x200);
     g_assert_cmphex(qtest_readw(qts, POE + 0xe), ==, 0x200);
     qtest_quit(qts);
@@ -3654,7 +3670,7 @@ int main(int argc, char **argv)
 
         qtest_add_data_func(name, GUINT_TO_POINTER(i), test_poe_pin);
     }
-    qtest_add_data_func("/rx113-mtu/poe-ostste-release", GUINT_TO_POINTER(1),
+    qtest_add_data_func("/rx113-mtu/poe-ostste-once", GUINT_TO_POINTER(1),
                         test_poe_oscillator);
     qtest_add_data_func("/rx113-mtu/poe-oststf-release", GUINT_TO_POINTER(0),
                         test_poe_oscillator);
