@@ -246,3 +246,20 @@ accepted as the documented release operation. After a clear,
 OSTSTE cannot be set again until a reset. The OSTSTF flag-clear
 release path is unaffected. This is an emulation convention for a
 manual inconsistency, not a claim about hardware behaviour.
+
+## D-019: POE output comparison observes all alternate pads
+
+Table 21.3 names the POE output-comparison inputs by MTIOC function,
+but each function has several alternate pads (Table 19.1) and the
+manual gives no selection or reduction rule; the OCSR1 footnote
+states only that detection depends on the pin level irrespective of
+MPC.PmnPFS. Emulation policy, chosen by the PO at the Issue #49
+stage 3c audit stop from the PMO's options: a comparator input is
+active when any of the function's alternate pads for the current
+package is at the active level, regardless of PFS assignment. The
+OSF1 clear qualification (section 21.3.5, outputs inactive) uses
+the same observation point. High-impedance output gating remains
+limited to PMR/PFS-selected MTU pads, as settled in the stage 3
+audit. This is an emulation convention, not a claim about hardware
+behaviour, and is a candidate for the Issue #51 hardware-behaviour
+cross-check.
