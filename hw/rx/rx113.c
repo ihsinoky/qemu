@@ -827,6 +827,10 @@ static DeviceState *register_port(RX113State *s)
                                    qdev_get_gpio_in_named(s->mtu,
                                                          "feedback", i));
     }
+    for (unsigned i = 0; i < 3; i++) {
+        qdev_connect_gpio_out_named(dev, "mtic5", i,
+                                   qdev_get_gpio_in_named(s->mtu, "mtic5", i));
+    }
     for (unsigned i = 0; i < RX113_MTIOC_PINS; i++) {
         qdev_connect_gpio_out_named(s->mtu, "mtioc", i,
                                    qdev_get_gpio_in_named(dev, "mtioc", i));

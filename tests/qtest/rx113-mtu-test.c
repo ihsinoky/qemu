@@ -1060,6 +1060,258 @@ static void complementary_setup(QTestState *qts, unsigned md)
     qtest_writeb(qts, BASE + mode[3], 0x30 | md);
 }
 
+static void measurement_pin(QTestState *qts, unsigned name, bool level)
+{
+    qtest_set_irq_in(qts, "/machine/mcu/port", "pin",
+                     (name >> 4) * 8 + (name & 7), level);
+}
+
+/* 20.3.10: all six pad alternatives, levels and clock divisors. */
+static void test_mtu5_measurement(void)
+{
+    static const unsigned pads[2][3] = {
+        { 0xa4, 0xa6, 0xb0 }, { 0x11, 0x10, 0x56 },
+    };
+    static const unsigned divisors[] = { 1, 4, 16, 64 };
+    QTestState *qts = mtu_init();
+
+    for (unsigned route = 0; route < 2; route++) {
+        for (unsigned div = 0; div < 4; div++) {
+            for (unsigned io = 0x19; io <= 0x1f; io++) {
+                if (io == 0x1c) {
+                    continue;
+                }
+                qtest_writeb(qts, BASE + 0x2b4, 0);
+                for (unsigned n = 5; n < 8; n++) {
+                    select_pad(qts, pads[route][n - 5], 1);
+                    measurement_pin(qts, pads[route][n - 5], !(io & 4));
+                    qtest_writeb(qts, BASE + tcr[n], div);
+                    qtest_writeb(qts, BASE + tcr[n] + 2, io);
+                    qtest_writew(qts, BASE + count[n], 0xfffc);
+                    qtest_writew(qts, BASE + tgr[n][0], 0xfffd);
+                }
+                qtest_writeb(qts, BASE + 0x2b4, 7);
+                qtest_clock_step(qts, 4000);
+                for (unsigned n = 5; n < 8; n++) {
+                    g_assert_cmphex(qtest_readw(qts, BASE + count[n]),
+                                    ==, 0xfffc);
+                    measurement_pin(qts, pads[route][n - 5], !!(io & 4));
+                }
+                qtest_clock_step(qts, 5 * divisors[div] * 125);
+                for (unsigned n = 5; n < 8; n++) {
+                    g_assert_cmphex(qtest_readw(qts, BASE + count[n]),
+                                    ==, (uint16_t)(0xfffc + 20));
+                    g_assert_cmphex(qtest_readw(qts, BASE + tgr[n][0]),
+                                    ==, 0xfffd);
+                    g_assert_cmpuint(qtest_readb(qts, IR(vector[n])), ==, 0);
+                    select_pad(qts, pads[route][n - 5], 0);
+                }
+            }
+        }
+    }
+    qtest_quit(qts);
+}
+
+/* 20.3.11: raw crest/trough capture, clear and request enable isolation. */
+static void test_mtu5_compensation(const void *opaque)
+{
+    unsigned setting = GPOINTER_TO_UINT(opaque);
+    QTestState *qts = mtu_init();
+
+    complementary_setup(qts, setting & 15);
+    for (unsigned n = 5; n < 8; n++) {
+        static const unsigned pads[] = { 0xa4, 0xa6, 0xb0 };
+        static const unsigned io[] = { 0x1e, 0x19, 0x1f };
+
+        select_pad(qts, pads[n - 5], 1);
+        measurement_pin(qts, pads[n - 5], (n != 6) ^ !!(setting & 16));
+        qtest_writeb(qts, BASE + tcr[n], 1);
+        qtest_writeb(qts, BASE + tcr[n] + 2,
+                     io[n - 5] ^ ((setting & 16) ? 4 : 0));
+    }
+    qtest_writeb(qts, BASE + 0x30, 0x99); /* Skip first crest and trough. */
+    qtest_writeb(qts, BASE + tier[3], 1);
+    qtest_writeb(qts, BASE + tier[4], 0x10);
+    qtest_writeb(qts, BASE + 0x2b2, 5); /* U and W only. */
+    qtest_writeb(qts, BASE + 0x2b4, 7);
+    qtest_writeb(qts, START, 0xc0);
+    qtest_clock_step(qts, 13 * 125 - 1);
+    g_assert_cmphex(qtest_readw(qts, BASE + tgr[5][0]), ==, 0xffff);
+    qtest_clock_step(qts, 1);
+    g_assert_cmpuint(qtest_readw(qts, BASE + tgr[5][0]), ==, 12);
+    g_assert_cmphex(qtest_readw(qts, BASE + tgr[6][0]), ==, 0xffff);
+    g_assert_cmpuint(qtest_readw(qts, BASE + tgr[7][0]), ==, 12);
+    g_assert_cmpuint(qtest_readb(qts, IR(129)), ==, 0);
+    g_assert_cmpuint(qtest_readb(qts, IR(139)), ==, 1);
+    g_assert_cmpuint(qtest_readb(qts, IR(140)), ==, 0);
+    g_assert_cmpuint(qtest_readb(qts, IR(141)), ==, 1);
+    qtest_writeb(qts, IR(139), 0);
+    qtest_writeb(qts, IR(141), 0);
+    qtest_clock_step(qts, 12 * 125);
+    g_assert_cmpuint(qtest_readw(qts, BASE + tgr[5][0]), ==, 12);
+    g_assert_cmpuint(qtest_readw(qts, BASE + tgr[6][0]), ==, 24);
+    g_assert_cmpuint(qtest_readw(qts, BASE + tgr[7][0]), ==, 24);
+    g_assert_cmpuint(qtest_readb(qts, IR(138)), ==, 0);
+    g_assert_cmpuint(qtest_readb(qts, IR(139)), ==, 0);
+    g_assert_cmpuint(qtest_readb(qts, IR(140)), ==, 0);
+    g_assert_cmpuint(qtest_readb(qts, IR(141)), ==, 1);
+    qtest_writeb(qts, BASE + 0x2b6, 7);
+    qtest_clock_step(qts, 12 * 125);
+    g_assert_cmpuint(qtest_readw(qts, BASE + tgr[5][0]), ==, 36);
+    g_assert_cmpuint(qtest_readw(qts, BASE + count[5]), ==, 0);
+    g_assert_cmpuint(qtest_readw(qts, BASE + count[6]), ==, 37);
+    g_assert_cmpuint(qtest_readw(qts, BASE + count[7]), ==, 0);
+    g_assert_cmpuint(qtest_readb(qts, IR(129)), ==, 1);
+    qtest_clock_step(qts, 12 * 125);
+    g_assert_cmpuint(qtest_readw(qts, BASE + tgr[6][0]), ==, 48);
+    g_assert_cmpuint(qtest_readw(qts, BASE + count[6]), ==, 0);
+    g_assert_cmpuint(qtest_readw(qts, BASE + tgr[7][0]), ==, 11);
+    g_assert_cmpuint(qtest_readw(qts, BASE + count[7]), ==, 0);
+    g_assert_cmpuint(qtest_readb(qts, IR(138)), ==, 1);
+    qtest_quit(qts);
+}
+
+/* Independent prescalers must sample all elapsed clocks before capture. */
+static void test_mtu5_capture_clocks(void)
+{
+    static const unsigned div[] = { 1, 4, 16, 64 };
+
+    for (unsigned d = 0; d < 4; d++) {
+        QTestState *qts = mtu_init();
+
+        complementary_setup(qts, 15);
+        select_pad(qts, 0xa4, 1);
+        measurement_pin(qts, 0xa4, true);
+        qtest_writeb(qts, BASE + tcr[5], d);
+        qtest_writeb(qts, BASE + 0x286, 0x1f);
+        qtest_writeb(qts, BASE + 0x2b4, 4);
+        qtest_writeb(qts, START, 0xc0);
+        qtest_clock_step(qts, 13 * 125);
+        g_assert_cmpuint(qtest_readw(qts, BASE + tgr[5][0]),
+                         ==, (13 * 4 - 1) / div[d]);
+        qtest_clock_step(qts, 12 * 125);
+        g_assert_cmpuint(qtest_readw(qts, BASE + tgr[5][0]),
+                         ==, (25 * 4 - 1) / div[d]);
+        qtest_quit(qts);
+    }
+}
+
+/* PSEL/PMR/ASEL and package bonding qualify the measurement inputs. */
+static void test_mtu5_measurement_routes(void)
+{
+    QTestState *qts = qtest_init("-M rx113-r5f51138 "
+                                 "-global rx113-port.package-pins=64");
+
+    qtest_writew(qts, 0x803fe, 0xa503);
+    qtest_writeb(qts, 0x80036, 0);
+    qtest_clock_step(qts, 34500);
+    qtest_writew(qts, 0x80026, 0x100);
+    qtest_writel(qts, SCKCR, 0);
+    qtest_writel(qts, MSTPCRA, 0xeffffdff);
+
+    qtest_writeb(qts, BASE + 0x286, 0x1f);
+    qtest_writeb(qts, BASE + tcr[5], 1);
+    qtest_writeb(qts, BASE + 0x2b4, 4);
+    measurement_pin(qts, 0xa4, true);
+    qtest_clock_step(qts, 125);
+    g_assert_cmpuint(qtest_readw(qts, BASE + count[5]), ==, 0);
+    select_pad(qts, 0xa4, 2);
+    qtest_clock_step(qts, 125);
+    g_assert_cmpuint(qtest_readw(qts, BASE + count[5]), ==, 0);
+    select_pad(qts, 0xa4, 1);
+    qtest_clock_step(qts, 125);
+    g_assert_cmpuint(qtest_readw(qts, BASE + count[5]), ==, 1);
+    select_pad(qts, 0xa4, 0x81);
+    qtest_clock_step(qts, 125);
+    g_assert_cmpuint(qtest_readw(qts, BASE + count[5]), ==, 1);
+    select_pad(qts, 0xa4, 1);
+    qtest_writeb(qts, PORT_BASE + 0x6a, 0);
+    qtest_clock_step(qts, 125);
+    g_assert_cmpuint(qtest_readw(qts, BASE + count[5]), ==, 1);
+    select_pad(qts, 0xa4, 0);
+    select_pad(qts, 0x11, 1); /* Unbonded on the selected 64-pin part. */
+    measurement_pin(qts, 0x11, true);
+    pin(qts, 0, true); /* MTCLKA is a different signal on PA4. */
+    qtest_clock_step(qts, 125);
+    g_assert_cmpuint(qtest_readw(qts, BASE + count[5]), ==, 1);
+    select_pad(qts, 0xa4, 1);
+    qtest_clock_step(qts, 62);
+    qtest_writel(qts, MSTPCRA, 0xffffffff);
+    qtest_clock_step(qts, 1000);
+    qtest_writel(qts, MSTPCRA, 0xeffffdff);
+    qtest_clock_step(qts, 62);
+    g_assert_cmpuint(qtest_readw(qts, BASE + count[5]), ==, 1);
+    qtest_clock_step(qts, 1);
+    g_assert_cmpuint(qtest_readw(qts, BASE + count[5]), ==, 2);
+    qtest_writeb(qts, BASE + 0x2b4, 0);
+    qtest_clock_step(qts, 125);
+    g_assert_cmpuint(qtest_readw(qts, BASE + count[5]), ==, 2);
+    qtest_qmp_assert_success(qts, "{'execute':'system_reset'}");
+    qtest_writew(qts, 0x803fe, 0xa503);
+    qtest_writel(qts, MSTPCRA, 0xeffffdff);
+    g_assert_cmpuint(qtest_readw(qts, BASE + count[5]), ==, 0);
+    g_assert_cmphex(qtest_readw(qts, BASE + tgr[5][0]), ==, 0xffff);
+    qtest_quit(qts);
+}
+
+/* Firmware calculation and a five-register transaction survive migration. */
+static void test_mtu5_compensation_migration(void)
+{
+    QTestState *src = mtu_init(), *dst;
+    int64_t now;
+    unsigned measured, corrected;
+    g_autofree char *dir = g_dir_make_tmp("rx113-mtu-delay-XXXXXX", NULL);
+    g_autofree char *file = g_strdup_printf("%s/state", dir);
+    g_autofree char *uri = g_strdup_printf("file:%s", file);
+
+    g_assert_nonnull(dir);
+    complementary_setup(src, 15);
+    select_pad(src, 0xa4, 1);
+    measurement_pin(src, 0xa4, true);
+    qtest_writeb(src, BASE + tcr[5], 1);
+    qtest_writeb(src, BASE + 0x286, 0x1e);
+    qtest_writew(src, BASE + count[5], 4);
+    qtest_writeb(src, BASE + 0x2b4, 4);
+    qtest_writeb(src, START, 0xc0);
+    qtest_clock_step(src, 2 * 125);
+    measurement_pin(src, 0xa4, false); /* Two-clock inverter delay. */
+    qtest_clock_step(src, 11 * 125);
+    measured = qtest_readw(src, BASE + tgr[5][0]);
+    g_assert_cmpuint(measured, ==, 6);
+    corrected = qtest_readw(src, BASE + tgr[3][1]) + (measured - 4);
+    qtest_writew(src, BASE + tgr[3][3], corrected);
+    qtest_writew(src, BASE + tgr[4][2], corrected + 2);
+    qtest_writew(src, BASE + tgr[4][3], corrected + 4); /* Commit in Tb1. */
+    g_assert_cmpuint(qtest_readw(src, BASE + tgr[3][1]), ==, 4);
+    measurement_pin(src, 0xa4, true);
+    now = qtest_clock_step(src, 62);
+    qtest_qmp_assert_success(src, "{'execute':'migrate',"
+                            "'arguments':{'uri':%s}}", uri);
+    migration_wait(src);
+    dst = qtest_init("-M rx113-r5f51138 -incoming defer");
+    qtest_clock_set(dst, now);
+    qtest_qmp_assert_success(dst, "{'execute':'migrate-incoming',"
+                            "'arguments':{'uri':%s}}", uri);
+    migration_wait(dst);
+    g_assert_cmpuint(qtest_readw(dst, BASE + count[5]), ==, 6);
+    g_assert_cmpuint(qtest_readw(dst, BASE + tgr[5][0]), ==, 6);
+    g_assert_cmpuint(qtest_readb(dst, IR(139)), ==, 0);
+    qtest_clock_step(dst, 62);
+    g_assert_cmpuint(qtest_readw(dst, BASE + count[5]), ==, 6);
+    qtest_clock_step(dst, 1);
+    g_assert_cmpuint(qtest_readw(dst, BASE + count[5]), ==, 7);
+    qtest_clock_step(dst, 125); /* Old bank consumed, new bank snapshots. */
+    g_assert_cmpuint(qtest_readw(dst, BASE + tgr[3][1]), ==, 4);
+    qtest_clock_step(dst, 12 * 125); /* Next end-Tb2 consumes correction. */
+    g_assert_cmpuint(qtest_readw(dst, BASE + tgr[3][1]), ==, corrected);
+    g_assert_cmpuint(qtest_readw(dst, BASE + tgr[4][0]), ==, corrected + 2);
+    g_assert_cmpuint(qtest_readw(dst, BASE + tgr[4][1]), ==, corrected + 4);
+    qtest_quit(dst);
+    qtest_quit(src);
+    unlink(file);
+    rmdir(dir);
+}
+
 static void complementary_pads(QTestState *qts)
 {
     for (unsigned ch = 3; ch <= 4; ch++) {
@@ -2290,6 +2542,22 @@ static void test_pad_package64(void)
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
+    qtest_add_func("/rx113-mtu/mtu5-capture-clocks",
+                   test_mtu5_capture_clocks);
+    qtest_add_func("/rx113-mtu/mtu5-measurement-routes",
+                   test_mtu5_measurement_routes);
+    qtest_add_func("/rx113-mtu/mtu5-compensation-migration",
+                   test_mtu5_compensation_migration);
+    qtest_add_func("/rx113-mtu/mtu5-measurement", test_mtu5_measurement);
+    for (unsigned md = 13; md <= 15; md++) {
+        for (unsigned low = 0; low < 2; low++) {
+            g_autofree char *name = g_strdup_printf(
+                "/rx113-mtu/mtu5-compensation-%u-%u", md, low);
+
+            qtest_add_data_func(name, GUINT_TO_POINTER(md | (low << 4)),
+                                test_mtu5_compensation);
+        }
+    }
     qtest_add_func("/rx113-mtu/complementary-tgcr-migration",
                    test_complementary_tgcr_migration);
     qtest_add_func("/rx113-mtu/complementary-tgcr",

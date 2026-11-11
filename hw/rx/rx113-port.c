@@ -76,6 +76,24 @@ static bool cacref_pin(unsigned name)
     return name == 0x15 || name == 0x27 || name == 0xa0 || name == 0xc7;
 }
 
+/* Table 19.1 and PFS tables: all MTIC5 alternatives use PSEL=1. */
+static int mtic5_signal(unsigned name)
+{
+    switch (name) {
+    case 0x11:
+    case 0xa4:
+        return 0;
+    case 0x10:
+    case 0xa6:
+        return 1;
+    case 0x56:
+    case 0xb0:
+        return 2;
+    default:
+        return -1;
+    }
+}
+
 /* Tables 19.2-21. Entries are MTIOC signal index + 1; zero is absent. */
 static int mtioc_signal(unsigned name, unsigned psel)
 {
@@ -228,7 +246,7 @@ static void port_update(RX113PortState *s, bool notify)
     uint8_t old_b = s->levels[11];
     uint8_t irq_levels = 0;
     bool cacref = false;
-    uint8_t feedback = 0;
+    uint8_t feedback = 0, mtic5 = 0;
 
     memset(s->levels, 0, sizeof(s->levels));
     memset(s->driving, 0, sizeof(s->driving));
@@ -282,6 +300,10 @@ static void port_update(RX113PortState *s, bool notify)
                 if (signal >= 0 && signal < 3 && level) {
                     feedback |= 1 << signal;
                 }
+                signal = mtic5_signal(name);
+                if ((pfs & PSEL) == 1 && signal >= 0 && level) {
+                    mtic5 |= 1 << signal;
+                }
             }
             /* Tables 19.3..19.16: CACREF uses PSEL=7 on these pads. */
             if (cacref_pin(name) && peripheral && !(pfs & ASEL) &&
@@ -314,6 +336,7 @@ static void port_update(RX113PortState *s, bool notify)
     qemu_set_irq(s->cacref, cacref);
     for (unsigned i = 0; i < 3; i++) {
         qemu_set_irq(s->mtu_feedback[i], (feedback >> i) & 1);
+        qemu_set_irq(s->mtic5[i], (mtic5 >> i) & 1);
     }
     for (unsigned i = 0; i < 8; i++) {
         qemu_set_irq(s->irq[i], (irq_levels >> i) & 1);
@@ -542,6 +565,7 @@ static void port_init(Object *obj)
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
     qdev_init_gpio_out_named(dev, &s->cacref, "cacref", 1);
     qdev_init_gpio_out_named(dev, s->mtu_feedback, "mtu-feedback", 3);
+    qdev_init_gpio_out_named(dev, s->mtic5, "mtic5", 3);
     qdev_init_gpio_in_named(dev, port_mtioc_input, "mtioc",
                             RX113_MTIOC_PINS * 2);
     qdev_init_gpio_in_named(dev, port_input, "pin", RX113_PORT_PINS);

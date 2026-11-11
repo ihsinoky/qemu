@@ -12,6 +12,8 @@
 #include "migration/vmstate.h"
 
 #define CHANNELS 8
+#define MTU_CREST (1U << 30)
+#define MTU_TROUGH (1U << 31)
 
 /* The two dead-time windows bracket the carrier crest and trough. */
 enum {
@@ -48,6 +50,7 @@ struct RX113MTUState {
     uint8_t tolbr;
     uint8_t tgcr;
     uint8_t feedback;
+    uint8_t mtic5;
     uint8_t reset_pwm;
     uint16_t tddr;
     uint16_t tcdr;
@@ -109,6 +112,43 @@ static bool mtu_running(RX113MTUState *s, unsigned n)
     }
     return !s->stopped && ((n < 5 ? s->start : s->start5) &
                            (1 << start_bit[n]));
+}
+
+/* Table 20.28: pulse measurement counts up only at the selected level. */
+static bool mtu_measurement(RX113MTUChannel *c)
+{
+    return (c->tior[0] & 0x1b) == 0x19 ||
+           (c->tior[0] & 0x1b) == 0x1a ||
+           (c->tior[0] & 0x1b) == 0x1b;
+}
+
+static bool mtu_measurement_level(RX113MTUState *s, unsigned n)
+{
+    return !!(s->mtic5 & (1 << (n - 5))) ==
+           !!(s->ch[n].tior[0] & 4);
+}
+
+/* Raw carrier sources, before TITCR skipping (20.3.11). */
+static bool mtu_measurement_capture(RX113MTUState *s, unsigned n,
+                                    unsigned sources)
+{
+    RX113MTUChannel *c = &s->ch[n];
+    unsigned timing = c->tior[0] & 3;
+
+    if (!mtu_measurement(c) || !mtu_running(s, n) ||
+        !(((timing & 2) && (sources & MTU_CREST)) ||
+          ((timing & 1) && (sources & MTU_TROUGH)))) {
+        return false;
+    }
+    c->tgr[0] = c->count;
+    if (s->tier5 & (1 << start_bit[n])) {
+        qemu_irq_pulse(s->irq[irq_base[n]]);
+    }
+    if (s->clear5 & (1 << start_bit[n])) {
+        c->count = 0;
+        return true;
+    }
+    return false;
 }
 
 static unsigned mtu_divisor(RX113MTUState *s, unsigned n)
@@ -701,6 +741,7 @@ static unsigned mtu_complementary_tick(RX113MTUState *s)
     }
 
     if (!c3->down && c3->count == c3->tgr[0]) {
+        events |= MTU_CREST;
         mtu_match(s, 3, 0);
         if (s->tocr1 & 0x40) {
             s->output ^= 1 << 8;
@@ -710,6 +751,7 @@ static unsigned mtu_complementary_tick(RX113MTUState *s)
         }
         c3->down = c4->down = true;
     } else if (c4->down && c4->count == 0) {
+        events |= MTU_TROUGH;
         /* Table 20.57: the trough shares TCIV4 with overflow. */
         mtu_skip_source(s, false);
         events |= 1U << (4 + 16);
@@ -741,6 +783,10 @@ static unsigned mtu_complementary_tick(RX113MTUState *s)
 static void mtu_finish_events(RX113MTUState *s, unsigned events)
 {
     unsigned clears = events & 0x1f;
+
+    for (unsigned n = 5; n < CHANNELS; n++) {
+        mtu_measurement_capture(s, n, events);
+    }
 
     for (unsigned n = 0; n < 5; n++) {
         RX113MTUChannel *c = &s->ch[n];
@@ -929,7 +975,9 @@ static int64_t mtu_deadline(RX113MTUState *s)
     for (unsigned n = 0; n < CHANNELS; n++) {
         unsigned div = mtu_divisor(s, n);
 
-        if (mtu_running(s, n) && div && !mtu_static_zero(s, n)) {
+        if (mtu_running(s, n) && div && !mtu_static_zero(s, n) &&
+            !(n >= 5 && mtu_measurement(&s->ch[n]) &&
+              !mtu_measurement_level(s, n))) {
             uint64_t work = mtu_distance(s, n) * (uint64_t)div *
                             NANOSECONDS_PER_SECOND - s->ch[n].phase;
             uint64_t ns = DIV_ROUND_UP(work, s->hz);
@@ -967,6 +1015,19 @@ static void mtu_advance(RX113MTUState *s)
             work = elapsed * s->hz + c->phase;
             ticks = work / unit;
             c->phase = work % unit;
+            if (n >= 5 && mtu_measurement(c)) {
+                bool last = ticks && c->phase < s->hz;
+                bool enabled = mtu_measurement_level(s, n);
+
+                /* Figure 20.93 captures the value before this clock edge. */
+                if (enabled) {
+                    c->count += ticks - last;
+                }
+                if (!mtu_measurement_capture(s, n, clears) && enabled) {
+                    c->count += last;
+                }
+                continue;
+            }
             if (ticks) {
                 unsigned d = mtu_distance(s, n);
 
@@ -991,7 +1052,7 @@ static void mtu_advance(RX113MTUState *s)
                 }
             }
         }
-        mtu_finish_events(s, clears);
+        mtu_finish_events(s, clears & ~(MTU_CREST | MTU_TROUGH));
         mtu_update_held(s);
         s->last_ns = end;
     }
@@ -1090,6 +1151,19 @@ static void mtu_feedback_input(void *opaque, int pin, int level)
     if (mtu_complementary(s) && (s->tgcr & 0x48) == 0x40) {
         mtu_output_update(s);
     }
+}
+
+/* PORT supplies qualified MTIC5U/V/W levels; pin edges do not capture. */
+static void mtu_measurement_input(void *opaque, int pin, int level)
+{
+    RX113MTUState *s = opaque;
+
+    if (((s->mtic5 >> pin) & 1) == !!level) {
+        return;
+    }
+    mtu_advance(s);
+    s->mtic5 = deposit32(s->mtic5, pin, 1, !!level);
+    mtu_schedule(s);
 }
 
 /* Table 20.48-51; raw device clocks, before any board PORT/MPC routing. */
@@ -1443,7 +1517,7 @@ static void mtu_write(void *opaque, hwaddr addr, uint64_t value, unsigned size)
                 mtu_output_initial(s, n, gr);
             }
         }
-        if ((n >= 5 && (value & 0x10)) ||
+        if ((n >= 5 && (value & 0x10) && !mtu_measurement(c)) ||
             (n < 5 && (value & 0x88))) {
             qemu_log_mask(LOG_UNIMP,
                           "rx113-mtu: input capture path unavailable\n");
@@ -1654,7 +1728,7 @@ static int mtu_post_load(void *opaque, int version_id)
     RX113MTUState *s = opaque;
 
     if (!s->hz || s->hz > 160000000 || s->region > MTU_TB2_DOWN ||
-        (s->feedback & ~7) || (s->tgcr & ~0x7f) ||
+        (s->mtic5 & ~7) || (s->feedback & ~7) || (s->tgcr & ~0x7f) ||
         (s->titcnt & 0x88) || (s->tbter & ~3) || (s->skip_ready & ~3)) {
         return -EINVAL;
     }
@@ -1677,7 +1751,7 @@ static int mtu_post_load(void *opaque, int version_id)
 
 static const VMStateDescription vmstate_mtu = {
     .name = TYPE_RX113_MTU,
-    .version_id = 8,
+    .version_id = 9,
     .minimum_version_id = 1,
     .pre_save = mtu_pre_save,
     .post_load = mtu_post_load,
@@ -1719,6 +1793,7 @@ static const VMStateDescription vmstate_mtu = {
         VMSTATE_UINT8_V(skip_ready, RX113MTUState, 7),
         VMSTATE_UINT8_V(tgcr, RX113MTUState, 8),
         VMSTATE_UINT8_V(feedback, RX113MTUState, 8),
+        VMSTATE_UINT8_V(mtic5, RX113MTUState, 9),
         VMSTATE_END_OF_LIST()
     },
 };
@@ -1743,6 +1818,7 @@ static void mtu_init(Object *obj)
     qdev_init_gpio_in_named(DEVICE(obj), mtu_elc_input, "elc", 12);
     qdev_init_gpio_in_named(DEVICE(obj), mtu_clock_input, "mtclk", 4);
     qdev_init_gpio_in_named(DEVICE(obj), mtu_feedback_input, "feedback", 3);
+    qdev_init_gpio_in_named(DEVICE(obj), mtu_measurement_input, "mtic5", 3);
 }
 
 static void mtu_finalize(Object *obj)

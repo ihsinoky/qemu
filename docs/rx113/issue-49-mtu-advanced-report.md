@@ -2,9 +2,186 @@
 SPDX-License-Identifier: GPL-2.0-or-later
 -->
 
-# Issue 49: RX113 MTU advanced output — stage 2b4 TGCR delivery
+# Issue 49: RX113 MTU advanced output — stage 2b5 compensation delivery
 
 ## Current delivery (2026-11-11)
+
+**Stage 2b and Issue #49 remain incomplete.** Item 1 of
+`.issue49-runtime/issue-49-stage2b5.md` is implemented: MTU5 external
+pulse measurement and crest/trough capture for firmware-driven dead-time
+compensation. Item 2 was audited, but further implementation stops at the
+unresolved duty-request source mapping described below, as required by
+the brief and PO's instruction not to guess. This is a design-evidence
+boundary, not a usage-window cutoff. Stage 3 (POE) was not started.
+Earlier delivery sections and next-step ordering below are historical.
+
+Base: `5a68775ab8df67dff956067f66f3131c63cfa800`.
+Branch: `rx113/issue-49-mtu-advanced`.
+Deliverables: working tree and
+`.issue49-runtime/issue49-stage2b5-compensation.patch`.
+No commit, merge, push, PR or upstream submission was performed; repository
+metadata is read-only.
+
+### Implemented boundary and manual evidence
+
+Authority: supplied R01UH0448EJ0120 Rev.1.20, printed manual pages.
+
+* Table 20.28, p.418; 20.3.10, p.515: TIORU/V/W settings 19h, 1Ah,
+  1Bh measure low pulses; 1Dh, 1Eh, 1Fh measure high pulses. Each MTU5
+  counter counts **up** only while its selected level is present, using
+  its own TCR prescaler and start bit. The up/down signal in Figure 20.82
+  is the complementary carrier direction, not signed delay accumulation.
+  Pin edges themselves do not capture, and pulse measurement alone does
+  not transfer to TGR. Counting wraps modulo 16 bits without inventing an
+  MTU5 overflow vector. Normal MTU5 compare operation remains available.
+* 20.3.11, pp.516-518, Figures 20.79-82: raw complementary crest and
+  trough sources capture TCNTU/V/W into TGRU/V/W according to the low two
+  TIOR bits. These decisions are independent of TIER3/4 and TITCR skipping.
+  Captures use the pre-edge value (20.5.1, Figure 20.93, p.526), including
+  elapsed faster MTU5 clocks before the carrier edge. TCNTCMPCLR clears
+  the selected counter at capture. Existing MTU5 TIER bits gate capture
+  requests on vectors 139/140/141. The manual advises firmware to leave
+  these enables clear and service TGIA3/TCIV4 instead; tests deliberately
+  enable selected MTU5 requests to verify the documented capture source.
+* Figure 20.81 specifies firmware calculation and writes to MTU3.TGRD
+  and MTU4.TGRC/D. No automatic duty correction is implemented. A qtest
+  supplies a measured two-clock delay, calculates the correction in the
+  test's firmware role, writes all three duty buffers with MTU4.TGRD last,
+  and verifies the old temporary bank is consumed before the corrected
+  transaction becomes active. This pending transaction and a live input
+  with fractional counter time survive migration.
+* Table 19.1 and Tables 19.3/9/11-14: qualified MTIC5U input routes are
+  P11/PA4, V routes P10/PA6, and W routes P56/PB0, all with PSEL=1.
+  PORT supplies resolved levels after bonding, PMR, PSEL and ASEL checks.
+  Alternative routes feed the same signal; MTCLK and MTIOC0 feedback
+  remain separate interfaces. General edge capture and noise filtering
+  are outside this compensation delivery and are not claimed.
+* MTU migration version 9 saves the three qualified measurement levels;
+  counters, captures, control bits and fractional clocks use the existing
+  migrated channel state. PORT derives routing from its existing state.
+  Same-build migration is tested; older streams did not implement pulse
+  measurement, and cross-version compensation acceptance is not claimed.
+
+Implementation changes are confined to RX113 MTU, PORT, their RX113 SoC
+wiring and the PORT header. RX62N behavior and sources are untouched.
+Tests and this report also change. The pre-existing uncommitted increase
+of the MTU qtest timeout from 60 to 180 seconds is retained in the patch;
+no tests are excluded. TDER, TWCR and reset-PWM TGCR are not implemented
+here, and the partial complementary diagnostic remains appropriate.
+
+### Duty-request audit: unresolved decision and precise next step
+
+The existing crest TGIA3 vector 129 and trough TCIV4 vector 138 paths,
+including independent skipping and raw ELC sources, remain in place and
+pass regression. Trough alone never requests vector 139; that vector now
+also has its correct MTU5U capture use. No new complementary duty IRQs or
+C/D compare requests have been wired speculatively.
+
+The supplied manual establishes these facts, but does not establish a
+unique request source for the remaining complementary duty cases:
+
+1. Section 20.4.1 and Table 20.57, pp.520-521 list the TGR compare/input
+   capture interrupts and their TIER enables without specifying which
+   complementary counter/temporary comparator supplies each request.
+2. Figure 20.37, p.481 explicitly draws TGRA3 and MTU4 underflow interrupt
+   connections. The duty comparators' drawn connections go to the output
+   controller; the figure does not identify duty IRQ connections. Absence
+   of a drawn connection alone is insufficient evidence of suppression.
+3. Section 20.3.8(b)/(j), pp.484,492-493 defines active versus temporary
+   banks, three counters and turn-off/turn-on priority **for waveforms**.
+   It does not say whether ignored waveform matches still request IRQs,
+   or whether temporary-bank matches are IRQ sources at all.
+4. Section 20.6.14, p.539 specifies complementary buffer grouping through
+   MTU3.BFA/BFB. Section 20.6.15, p.540 explicitly suppresses buffered
+   C/D requests in reset-synchronized PWM. Extending its mode-specific
+   wording to a different complementary comparator path needs evidence.
+
+Concrete distinguishing case: with TDDR=2 and steady U duty=4 in the
+current 12-count half-cycle setup, MTU3.TCNT equals the duty on carrier
+edges 3 and 23; the complementary waveform also uses MTU4.TCNT matches
+on edges 5 and 21. A per-channel-TCNT interpretation requests TGIB3 on
+3/23; an interpretation exposing every waveform compare adds 5/21; an
+interpretation exposing only Figure 20.37's two interrupt connections
+requests neither duty pair. A pending temporary-bank update introduces
+further differences. The manual/brief does not select one of these
+policies explicitly enough to add observable ICU/ELC edges confidently.
+
+**Next step requires PO/PMO resolution:** supply authoritative clarification
+or a hardware trace for TGIB3/TGIA4/TGIB4 in that distinguishing case,
+including a selected Tb update and whether ignored turn-on matches request
+interrupts; resolve C/D behavior when MTU3.BFA/BFB select buffering. If no
+hardware evidence is available, explicitly choose and record an emulation
+convention for those sources before implementation. Add count-edge ICU/ELC
+and pending-bank tests for the approved mapping, then implement it. This
+run stops implementation here rather than choosing that convention.
+
+After that decision, the older unfinished stage 2b controls still require
+implementation and tests: TDER read-before-clear/no-dead-time waveforms
+with TDDR=1 setup; TWCR read-before-set, WRE/CCE and complementary
+synchronous clearing/restart with retained versus initial outputs
+(20.3.8(m)-(o), pp.497-502, and 20.7); and TGCR gating in reset-synchronized
+PWM. Do not begin stage 3 (POE) or declare stage 2b complete before those
+requirements are addressed.
+
+### Validation
+
+Evidence uses `stage2b5-*` names under `.issue49-runtime/`. The existing
+build and populated subprojects were reused without downloads. All scratch
+uses `.issue49-runtime/.t` or its `.s49` socket-path alias.
+
+| Check | Result and runtime evidence |
+| --- | --- |
+| RX-only rebuild | PASS: `stage2b5-build-final.log` |
+| Full MTU qtest | 66/66 PASS, 140.76 seconds: `stage2b5-regression.log` |
+| Configured RX qtests and quick functional tests | 32 suites OK, four existing skips, zero failures: `stage2b5-regression.log` |
+| Existing gdbsim U-Boot functional | PASS: `stage2b5-gdbsim-functional.log` |
+| Cached FIT PLL/HOCO before and after reset | Both PASS: `stage2b5-fit-pll.log`, `stage2b5-fit-hoco.log` |
+| SYSTEM protection/timing without/with FIT ELF | Both PASS: `stage2b5-system.log`, `stage2b5-system-elf.log` |
+| Both gdbsim machines listed/run three seconds | Both PASS: `stage2b5-machine-help.log`, `stage2b5-gdbsim-smoke.log` |
+| Changed-file and raw-diff checkpatch | Zero errors and warnings: `stage2b5-checkpatch-files.log`, `stage2b5-checkpatch-patch.log` |
+| Forward/reverse patch dry runs and byte reconstruction | PASS: `stage2b5-patch-validation.log` |
+
+`stage2b5-tested-binary.sha256` identifies the tested binary. Ten new MTU
+cases cover all six TIOR pulse-measurement settings and both pad routes,
+all four MTU5 prescalers, low/high gating, wraparound, capture selection
+and clearing, raw-source capture despite ICU skipping, selective MTU5
+capture requests, all three complementary modes, bonding/PMR/PSEL/ASEL,
+MTCLK isolation, module-stop fractional retention, counter stop, reset,
+and live measurement/corrected-buffer migration. All original 56 cases
+are retained. The final change after regression only wraps a test source
+line to satisfy checkpatch; it changes no test operation or device source.
+
+The initial route-test setup incorrectly assumed the default package was
+64 pins, then attempted reset-register assertions while MTU was module
+stopped. The test now explicitly selects the 64-pin package and ungates
+MTU before asserting its reset state, matching existing reset tests. No
+device behavior was changed to satisfy those setup errors. Initial filter
+invocations without the `/rx` prefix executed zero tests; the final full
+66-case regression is the acceptance evidence.
+
+Reproduce:
+
+```sh
+. .issue49-runtime/env.sh
+make -C build -j$(nproc)
+bash .issue49-runtime/stage2b5-regression.sh
+scripts/checkpatch.pl --no-tree -f hw/rx/rx113-mtu.c hw/rx/rx113-port.c \
+  hw/rx/rx113.c include/hw/rx/rx113_port.h tests/qtest/rx113-mtu-test.c
+python3 .issue49-runtime/stage2b5-validate-patch.py
+```
+
+The patch contains seven tracked files relative to the stated HEAD. It
+excludes AGENTS.md, manuals, runtime/build assets, the scratch alias and
+repository metadata. The verifier reconstructs the HEAD files in worktree
+scratch, checks/applies forward and reverse patches, and compares all
+bytes with the working tree and base respectively, without writing `.git`.
+Raw-diff checkpatch uses `--no-signoff` for the uncommitted deliverable.
+Suggested commit subject:
+`hw/rx: Measure RX113 inverter delays for dead-time compensation`.
+
+# Issue 49: RX113 MTU advanced output — stage 2b4 TGCR delivery
+
+## Stage 2b4 TGCR delivery (historical)
 
 **Stage 2b and Issue #49 remain incomplete.** This continuation implements
 item 1 of `.issue49-runtime/issue-49-stage2b4.md`: TGCR brushless gating

@@ -10,6 +10,7 @@ slow_qtests = {
   'npcm7xx_watchdog_timer-test': 120,
   'qmp-cmd-test' : 120,
   'qom-test' : 900,
+  'rx113-mtu-test': 180,
   'stm32l4x5_usart-test' : 600,
   'test-hmp' : 240,
   'pxe-test': 610,
