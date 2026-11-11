@@ -13,6 +13,7 @@
 #include "hw/rx/rx113_port.h"
 #include "hw/rx/rx113_elc.h"
 #include "hw/rx/rx113_mtu.h"
+#include "hw/rx/rx113_poe.h"
 #include "migration/vmstate.h"
 
 #define PDR  0x000
@@ -279,7 +280,7 @@ static void port_update(RX113PortState *s, bool notify)
                     int signal = mtioc_signal(name, pfs & PSEL);
 
                     if (signal >= 0) {
-                        drive = (s->mtioc_oe >> signal) & 1;
+                        drive = ((s->mtioc_oe & ~s->poe_cutoff) >> signal) & 1;
                         output = drive;
                         level = (s->mtioc >> signal) & 1;
                     }
@@ -333,6 +334,9 @@ static void port_update(RX113PortState *s, bool notify)
     if (notify && s->elc) {
         rx113_elc_port_input(s->elc, old_b, s->levels[11]);
     }
+    if (s->poe) {
+        rx113_poe_port_changed(s->poe);
+    }
     qemu_set_irq(s->cacref, cacref);
     for (unsigned i = 0; i < 3; i++) {
         qemu_set_irq(s->mtu_feedback[i], (feedback >> i) & 1);
@@ -340,6 +344,77 @@ static void port_update(RX113PortState *s, bool notify)
     }
     for (unsigned i = 0; i < 8; i++) {
         qemu_set_irq(s->irq[i], (irq_levels >> i) & 1);
+    }
+}
+
+/* Table 19.1: POE inputs all use PSEL=7. */
+static int poe_signal(unsigned name)
+{
+    switch (name) {
+    case 0xc4: case 0xa3: case 0x11:
+        return 0;
+    case 0xb5: case 0x10:
+        return 1;
+    case 0xa6: case 0x04: case 0x56:
+        return 2;
+    case 0xb3: case 0xe0: case 0x02: case 0xd4:
+        return 3;
+    case 0x17: case 0x30: case 0xe3: case 0xd3:
+        return 4;
+    default:
+        return -1;
+    }
+}
+
+uint8_t rx113_port_poe_inputs(RX113PortState *s)
+{
+    uint8_t levels = 0x1f;
+
+    for (unsigned pin = 0; pin < RX113_PORT_PINS; pin++) {
+        unsigned port = pin / 8, bit = pin % 8;
+        int signal = poe_signal(pin_name(pin));
+
+        if (signal >= 0 && (port_pins(s, port) & (1 << bit)) &&
+            (s->regs[PMR + port] & (1 << bit)) &&
+            (s->regs[PFS + pin] & (ASEL | PSEL)) == 7 &&
+            !(s->levels[port] & (1 << bit))) {
+            levels &= ~(1 << signal);
+        }
+    }
+    return levels;
+}
+
+/* D-019: any bonded alternate at the active level, independent of PFS. */
+bool rx113_port_mtioc_active(RX113PortState *s, unsigned signal, bool level)
+{
+    for (unsigned pin = 0; pin < RX113_PORT_PINS; pin++) {
+        unsigned port = pin / 8, bit = pin % 8;
+
+        if (!(port_pins(s, port) & (1 << bit))) {
+            continue;
+        }
+        bool pad_level = s->levels[port] & (1 << bit);
+
+        /* ASEL disables PIDR, but not the PFS-independent POE comparator. */
+        if (s->regs[PFS + pin] & ASEL) {
+            pad_level = (s->external_mask[port] & s->external[port]) &
+                        (1 << bit);
+        }
+        for (unsigned psel = 1; psel <= 3; psel++) {
+            if (mtioc_signal(pin_name(pin), psel) == signal &&
+                pad_level == level) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+void rx113_port_set_poe(RX113PortState *s, uint16_t mask)
+{
+    if (s->poe_cutoff != mask) {
+        s->poe_cutoff = mask;
+        port_update(s, true);
     }
 }
 
@@ -464,6 +539,10 @@ static void port_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
                              s->regs[PFS + port * 8 + bit] & PSEL) >= 0) {
                 unsupported &= ~(1 << bit);
             }
+            if (poe_signal(port * 16 + bit) >= 0 &&
+                (s->regs[PFS + port * 8 + bit] & (PSEL | ASEL)) == 7) {
+                unsupported &= ~(1 << bit);
+            }
             if (cacref_pin(port * 16 + bit) &&
                 (s->regs[PFS + port * 8 + bit] & (PSEL | ASEL)) == 7) {
                 unsupported &= ~(1 << bit);
@@ -515,6 +594,7 @@ static void port_reset_hold(Object *obj, ResetType type)
     /* 18.3, 19.2: all control registers zero except PWPR.B0WI. */
     memset(s->regs, 0, sizeof(s->regs));
     s->regs[PWPR] = B0WI;
+    s->poe_cutoff = 0;
     /* External board drivers survive an MCU reset. */
     port_update(s, false);
 }
@@ -527,7 +607,7 @@ static int port_post_load(void *opaque, int version_id)
 
 static const VMStateDescription vmstate_port = {
     .name = TYPE_RX113_PORT,
-    .version_id = 3,
+    .version_id = 4,
     .minimum_version_id = 1,
     .post_load = port_post_load,
     .fields = (const VMStateField[]) {
@@ -536,6 +616,7 @@ static const VMStateDescription vmstate_port = {
         VMSTATE_UINT8_ARRAY(external_mask, RX113PortState, RX113_PORT_COUNT),
         VMSTATE_BOOL_V(ctsu_fixed, RX113PortState, 2),
         VMSTATE_BOOL_V(ctsu_level, RX113PortState, 2),
+        VMSTATE_UINT16_V(poe_cutoff, RX113PortState, 4),
         VMSTATE_UINT16_V(mtioc, RX113PortState, 3),
         VMSTATE_UINT16_V(mtioc_oe, RX113PortState, 3),
         VMSTATE_END_OF_LIST()

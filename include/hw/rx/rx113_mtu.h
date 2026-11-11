@@ -18,4 +18,6 @@ OBJECT_DECLARE_SIMPLE_TYPE(RX113MTUState, RX113_MTU)
 void rx113_mtu_set_elc_events(DeviceState *dev, uint32_t mask);
 void rx113_mtu_set_clock(DeviceState *dev, uint64_t hz, bool stopped);
 
+uint8_t rx113_mtu_poe_polarity(DeviceState *dev);
+
 #endif

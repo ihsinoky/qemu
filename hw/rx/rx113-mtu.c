@@ -276,6 +276,27 @@ static bool mtu_brushless(RX113MTUState *s, unsigned arm, bool on)
            (arms[feedback] & (1 << arm)) && (!chopping || on);
 }
 
+/* Tables 20.30-37: active levels in POE pair order, P then N. */
+uint8_t rx113_mtu_poe_polarity(DeviceState *dev)
+{
+    RX113MTUState *s = RX113_MTU(dev);
+    uint8_t levels = 0;
+
+    for (unsigned i = 0; i < 6; i++) {
+        unsigned bit = s->tder ? i % 2 : 0;
+        unsigned polarity = s->tocr1 & 4 ?
+            (s->tocr2 >> (2 * (i / 2) + bit)) & 1 :
+            (s->tocr1 >> bit) & 1;
+
+        /* No dead time: the negative phase is the inverse of P. */
+        if (!s->tder && (i & 1)) {
+            polarity ^= 1;
+        }
+        levels |= polarity << i;
+    }
+    return levels;
+}
+
 static void mtu_output_update(RX113MTUState *s)
 {
     if (mtu_reset_pwm(s)) {

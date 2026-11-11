@@ -2970,6 +2970,574 @@ static void test_pad_package64(void)
     qtest_quit(qts);
 }
 
+#define POE 0x88900
+#define PORT_PATH "/machine/mcu/port"
+
+static void poe_input(QTestState *qts, unsigned name, bool level)
+{
+    qtest_set_irq_in(qts, PORT_PATH, "pin",
+                     (name >> 4) * 8 + (name & 7), level);
+}
+
+static void poe_output0(QTestState *qts)
+{
+    select_pad(qts, 0x14, 3);
+    set_io(qts, 0, 0, 5); /* Initially high, clear on compare. */
+    qtest_writew(qts, BASE + tgr[0][0], 9);
+    qtest_writeb(qts, POE + 0xb, 1);
+    assert_pad(qts, 0x14, true, true);
+}
+
+static void test_poe_software(void)
+{
+    QTestState *qts = mtu_init();
+
+    poe_output0(qts);
+    /* GPIO stays driven even if its PFS names MTIOC0A. */
+    qtest_writeb(qts, PORT_BASE + 0x20 + 14, 8);
+    qtest_writeb(qts, PORT_BASE + 14, 8);
+    qtest_writeb(qts, POE + 0xa, 2);
+    assert_pad(qts, 0x14, false, false);
+    assert_pad(qts, 0xe3, true, true);
+    qtest_writeb(qts, POE + 0xa, 0); /* No preceding read. */
+    assert_pad(qts, 0x14, false, false);
+    g_assert_cmpuint(qtest_readb(qts, POE + 0xa), ==, 2);
+    start_channel(qts, 0, true);
+    qtest_clock_step(qts, 313);
+    g_assert_cmpuint(qtest_readw(qts, BASE + count[0]), ==, 10);
+    qtest_writeb(qts, POE + 0xa, 0);
+    assert_pad(qts, 0x14, true, false); /* Waveform continued during cutoff. */
+    qtest_writeb(qts, POE + 0xb, 15); /* Write-once selection stays 1. */
+    g_assert_cmpuint(qtest_readb(qts, POE + 0xb), ==, 1);
+    qtest_system_reset(qts);
+    g_assert_cmpuint(qtest_readb(qts, POE + 0xb), ==, 0);
+    qtest_quit(qts);
+}
+
+static void test_poe_pin(gconstpointer data)
+{
+    unsigned mode = GPOINTER_TO_UINT(data);
+    static const unsigned div[] = { 1, 8, 16, 128 };
+    QTestState *qts = mtu_init();
+    unsigned cycles = mode ? div[mode] * 16 : 1;
+    int64_t span = DIV_ROUND_UP(cycles * 125, 4);
+
+    poe_output0(qts);
+    poe_input(qts, 0x30, true);
+    select_pad(qts, 0x30, 7);
+    qtest_writew(qts, POE + 8, 0x300 | mode);
+    qtest_clock_step(qts, div[mode] * 125);
+    poe_input(qts, 0x30, false);
+    qtest_clock_step(qts, span - 1);
+    assert_pad(qts, 0x14, true, true);
+    g_assert_cmpuint(qtest_readb(qts, IR(171)), ==, 0);
+    qtest_clock_step(qts, 1);
+    assert_pad(qts, 0x14, false, false);
+    g_assert_cmphex(qtest_readw(qts, POE + 8), ==, 0x1300 | mode);
+    g_assert_cmpuint(qtest_readb(qts, IR(171)), ==, 1);
+    qtest_writew(qts, POE + 8, 0x300 | mode);
+    if (mode) {
+        assert_pad(qts, 0x14, false, false);
+        poe_input(qts, 0x30, true);
+        qtest_writew(qts, POE + 8, 0x300 | mode);
+        assert_pad(qts, 0x14, false, false); /* High not yet sampled. */
+        qtest_clock_step(qts, div[mode] * 125 / 4);
+        qtest_writew(qts, POE + 8, 0x300 | mode);
+    }
+    assert_pad(qts, 0x14, true, true);
+    g_assert_cmpuint(qtest_readb(qts, IR(171)), ==, 0);
+    qtest_quit(qts);
+}
+
+static void test_poe_comparator(void)
+{
+    static const unsigned b[] = { 0x17, 0xb3, 0xb7, 0xc5, 0x22 };
+    static const unsigned d[] = { 0x16, 0xb6, 0xc4, 0x23 };
+    QTestState *qts = mtu_init();
+
+    /* All alternate pads are GPIO outputs, high; internal outputs also high. */
+    for (unsigned port = 0; port < 19; port++) {
+        qtest_writeb(qts, PORT_BASE + 0x20 + port, 0xff);
+        qtest_writeb(qts, PORT_BASE + port, 0xff);
+    }
+    set_io(qts, 3, 1, 5);
+    set_io(qts, 3, 3, 5);
+    qtest_writeb(qts, BASE + 0xa, 9);
+    qtest_writeb(qts, POE + 0xc, 0x40);
+    qtest_writew(qts, POE + 2, 0x300);
+    qtest_clock_step(qts, 125);
+    g_assert_cmphex(qtest_readw(qts, POE + 2), ==, 0x300);
+    /* D-019's distinguishing case: internal inactive-high, GPIO P22/P23 low. */
+    qtest_writeb(qts, PORT_BASE + 0x22, 0xf3);
+    qtest_clock_step(qts, 31);
+    g_assert_cmphex(qtest_readw(qts, POE + 2), ==, 0x300);
+    qtest_clock_step(qts, 1);
+    g_assert_cmphex(qtest_readw(qts, POE + 2), ==, 0x8300);
+    g_assert_cmpuint(qtest_readb(qts, IR(170)), ==, 1);
+    assert_pad(qts, 0x22, true, false);
+    assert_pad(qts, 0x23, true, false);
+    qtest_writew(qts, POE + 2, 0x300);
+    g_assert_cmphex(qtest_readw(qts, POE + 2), ==, 0x8300);
+    qtest_writeb(qts, PORT_BASE + 0x22, 0xfb); /* One input still active. */
+    qtest_writew(qts, POE + 2, 0x300);
+    g_assert_cmphex(qtest_readw(qts, POE + 2), ==, 0x8300);
+    qtest_writeb(qts, PORT_BASE + 0x22, 0xff);
+    qtest_writew(qts, POE + 2, 0x300);
+    g_assert_cmphex(qtest_readw(qts, POE + 2), ==, 0x300);
+    /* A latched comparator fault cuts off selected MTU pads only. */
+    qtest_writeb(qts, PORT_BASE + 0x22, 0xf3);
+    qtest_clock_step(qts, 63);
+    g_assert_cmphex(qtest_readw(qts, POE + 2), ==, 0x8300);
+    poe_input(qts, 0x22, false);
+    poe_input(qts, 0x23, false);
+    select_pad(qts, 0x22, 1);
+    select_pad(qts, 0x23, 1);
+    assert_pad(qts, 0x22, false, false);
+    assert_pad(qts, 0x23, false, false);
+    poe_input(qts, 0x22, true);
+    poe_input(qts, 0x23, true);
+    qtest_writew(qts, POE + 2, 0x300);
+    assert_pad(qts, 0x22, true, true);
+    assert_pad(qts, 0x23, true, true);
+    qtest_writeb(qts, PORT_BASE + 0x62, 0);
+    qtest_writeb(qts, PORT_BASE + 0x22, 0xff);
+    /* Every alternate can supply its function's active level. */
+    for (unsigned i = 0; i < G_N_ELEMENTS(b); i++) {
+        for (unsigned j = 0; j < G_N_ELEMENTS(d); j++) {
+            unsigned bp = b[i] >> 4, dp = d[j] >> 4;
+            unsigned bv = qtest_readb(qts, PORT_BASE + 0x20 + bp);
+            unsigned dv;
+
+            qtest_writeb(qts, PORT_BASE + 0x20 + bp, bv & ~(1 << (b[i] & 7)));
+            dv = qtest_readb(qts, PORT_BASE + 0x20 + dp);
+            qtest_writeb(qts, PORT_BASE + 0x20 + dp, dv & ~(1 << (d[j] & 7)));
+            qtest_clock_step(qts, 63);
+            g_assert_cmphex(qtest_readw(qts, POE + 2), ==, 0x8300);
+            qtest_writeb(qts, PORT_BASE + 0x20 + dp, dv);
+            qtest_writeb(qts, PORT_BASE + 0x20 + bp, bv);
+            qtest_writew(qts, POE + 2, 0x300);
+            g_assert_cmphex(qtest_readw(qts, POE + 2), ==, 0x300);
+        }
+    }
+    qtest_quit(qts);
+}
+
+static void test_poe_oscillator(gconstpointer data)
+{
+    bool enable_clear = GPOINTER_TO_UINT(data);
+    QTestState *qts = mtu_init();
+    QDict *rsp;
+
+    poe_output0(qts);
+    qtest_writew(qts, POE + 0xe, 0x200);
+    qtest_writeb(qts, 0x80040, 0x81);
+    qtest_set_irq_in(qts, "/machine/mcu/system", "main-clock-failed", 0, 1);
+    qtest_clock_step(qts, 999999);
+    g_assert_cmpuint(qtest_readb(qts, 0x80041), ==, 0);
+    qtest_clock_step(qts, 1);
+    g_assert_cmpuint(qtest_readb(qts, 0x80041), ==, 1);
+    g_assert_cmphex(qtest_readw(qts, POE + 0xe), ==, 0x1200);
+    assert_pad(qts, 0x14, false, false);
+    g_assert_cmpuint(qtest_readb(qts, IR(170)), ==, 0);
+    rsp = qtest_qmp(qts, "{'execute':'qom-get','arguments':"
+                    "{'path':'/machine/mcu/system','property':'ostdi-request'}}");
+    g_assert_true(qdict_get_bool(rsp, "return"));
+    qobject_unref(rsp);
+    qtest_writew(qts, POE + 0xe, 0x200);
+    g_assert_cmphex(qtest_readw(qts, POE + 0xe), ==, 0x1200);
+    qtest_clock_step(qts, 312);
+    qtest_writew(qts, POE + 0xe, 0x200);
+    g_assert_cmphex(qtest_readw(qts, POE + 0xe), ==, 0x1200);
+    qtest_clock_step(qts, 1);
+    if (enable_clear) {
+        /* D-018: retain OSTSTF, clear OSTSTE, restore pad, reject re-set. */
+        qtest_writew(qts, POE + 0xe, 0x1000);
+        g_assert_cmphex(qtest_readw(qts, POE + 0xe), ==, 0x1000);
+        assert_pad(qts, 0x14, true, true);
+        qtest_writew(qts, POE + 0xe, 0x1200);
+        g_assert_cmphex(qtest_readw(qts, POE + 0xe), ==, 0x1000);
+    } else {
+        qtest_writew(qts, POE + 0xe, 0x200);
+        g_assert_cmphex(qtest_readw(qts, POE + 0xe), ==, 0x200);
+        assert_pad(qts, 0x14, true, true);
+    }
+    qtest_set_irq_in(qts, "/machine/mcu/system", "main-clock-failed", 0, 0);
+    qtest_writeb(qts, 0x80040, 0);
+    /* OSTDF locks OSTDE. */
+    g_assert_cmpuint(qtest_readb(qts, 0x80040), ==, 0x80);
+    qtest_writeb(qts, 0x80041, 0);
+    g_assert_cmpuint(qtest_readb(qts, 0x80041), ==, 0);
+    qtest_system_reset(qts);
+    qtest_writew(qts, POE + 0xe, 0x200);
+    g_assert_cmphex(qtest_readw(qts, POE + 0xe), ==, 0x200);
+    qtest_quit(qts);
+}
+
+static void test_poe_routes(void)
+{
+    static const struct { unsigned pin, input; } routes[] = {
+        { 0xc4, 0 }, { 0xa3, 0 }, { 0x11, 0 },
+        { 0xb5, 1 }, { 0x10, 1 },
+        { 0xa6, 2 }, { 0x04, 2 }, { 0x56, 2 },
+        { 0xb3, 3 }, { 0xe0, 3 }, { 0x02, 3 }, { 0xd4, 3 },
+        { 0x17, 4 }, { 0x30, 4 }, { 0xe3, 4 }, { 0xd3, 4 },
+    };
+    QTestState *qts = mtu_init();
+
+    poe_output0(qts);
+    select_pad(qts, 0x22, 1);
+    set_io(qts, 3, 1, 5);
+    qtest_writeb(qts, BASE + 0xa, 1);
+    qtest_writeb(qts, POE + 0xc, 0x40);
+    qtest_writew(qts, POE, 0x100);
+    qtest_writew(qts, POE + 8, 0x300);
+    for (unsigned i = 0; i < G_N_ELEMENTS(routes); i++) {
+        unsigned pin = routes[i].pin, input = routes[i].input;
+        unsigned addr = POE + (input == 4 ? 8 : 0);
+        unsigned flag = 1 << (input == 4 ? 12 : 12 + input);
+        unsigned enable = input == 4 ? 0x300 : 0x100;
+        unsigned irq = input == 4 ? 171 : 170;
+        unsigned pad = input == 4 ? 0x14 : 0x22;
+
+        poe_input(qts, pin, true);
+        select_pad(qts, pin, 7);
+        qtest_clock_step(qts, 125);
+        poe_input(qts, pin, false);
+        qtest_clock_step(qts, 125);
+        g_assert_cmphex(qtest_readw(qts, addr), ==, enable | flag);
+        assert_pad(qts, pad, false, false);
+        g_assert_cmpuint(qtest_readb(qts, IR(irq)), ==, 1);
+        qtest_writew(qts, addr, enable);
+        assert_pad(qts, pad, true, true);
+        g_assert_cmpuint(qtest_readb(qts, IR(irq)), ==, 0);
+        /* PFS qualification: a low GPIO cannot request POE. */
+        unsigned pmr = PORT_BASE + 0x60 + (pin >> 4);
+
+        qtest_writeb(qts, pmr, qtest_readb(qts, pmr) & ~(1 << (pin & 7)));
+        qtest_clock_step(qts, 125);
+        g_assert_cmphex(qtest_readw(qts, addr), ==, enable);
+    }
+    qtest_quit(qts);
+}
+
+static void test_poe_groups(void)
+{
+    static const unsigned positive[] = { 0x22, 0x24, 0x30 };
+    static const unsigned negative[] = { 0x23, 0x25, 0x31 };
+
+    for (unsigned group = 0; group < 3; group++) {
+        QTestState *qts = mtu_init();
+
+        for (unsigned ch = 0; ch < 5; ch++) {
+            if (ch == 1 || ch == 2) {
+                continue;
+            }
+            for (unsigned gr = 0; gr < 4; gr++) {
+                select_pad(qts, output_pad[ch][gr],
+                           ch == 0 && gr == 0 ? 3 : 1);
+                set_io(qts, ch, gr, 5);
+            }
+        }
+        qtest_writeb(qts, BASE + 0xa, 0x3f);
+        qtest_writeb(qts, POE + 0xb, 15);
+        qtest_writeb(qts, POE + 0xc, 0x40 >> group);
+        qtest_writeb(qts, POE + 0xa, 3);
+        for (unsigned i = 0; i < 4; i++) {
+            assert_pad(qts, output_pad[0][i], false, false);
+        }
+        for (unsigned i = 0; i < 3; i++) {
+            assert_pad(qts, positive[i], i != group, i != group);
+            assert_pad(qts, negative[i], i != group, i != group);
+        }
+        qtest_readb(qts, POE + 0xa);
+        qtest_writeb(qts, POE + 0xa, 0);
+        for (unsigned i = 0; i < 3; i++) {
+            assert_pad(qts, positive[i], true, true);
+            assert_pad(qts, negative[i], true, true);
+        }
+        qtest_quit(qts);
+    }
+}
+
+static void test_poe_clock_glitch(void)
+{
+    QTestState *qts = mtu_init();
+
+    poe_output0(qts);
+    poe_input(qts, 0x30, true);
+    select_pad(qts, 0x30, 7);
+    /* Independent byte-wide write-once fields. */
+    qtest_writeb(qts, POE + 8, 1);
+    qtest_writeb(qts, POE + 9, 3);
+    g_assert_cmphex(qtest_readw(qts, POE + 8), ==, 0x301);
+    qtest_clock_step(qts, 250);
+    poe_input(qts, 0x30, false);
+    qtest_clock_step(qts, 15 * 250);
+    assert_pad(qts, 0x14, true, true);
+    poe_input(qts, 0x30, true);
+    qtest_clock_step(qts, 250); /* A sampled high resets the low streak. */
+    poe_input(qts, 0x30, false);
+    qtest_clock_step(qts, 15 * 250);
+    assert_pad(qts, 0x14, true, true);
+    /* Halve PCLKB; MTU module stop does not stop POE sampling. */
+    qtest_writel(qts, SCKCR, 0x100);
+    qtest_writel(qts, MSTPCRA, 0xffffffff);
+    qtest_clock_step(qts, 499);
+    assert_pad(qts, 0x14, true, true);
+    qtest_clock_step(qts, 1);
+    assert_pad(qts, 0x14, false, false);
+    g_assert_cmphex(qtest_readw(qts, POE + 8), ==, 0x1301);
+    qtest_quit(qts);
+}
+
+static void test_poe_migration(gconstpointer data)
+{
+    bool oscillator = GPOINTER_TO_UINT(data);
+    QTestState *src = mtu_init(), *dst;
+    g_autofree char *dir = g_dir_make_tmp("rx113-poe-XXXXXX", NULL);
+    g_autofree char *file = g_strdup_printf("%s/state", dir);
+    g_autofree char *uri = g_strdup_printf("file:%s", file);
+    int64_t now;
+
+    g_assert_nonnull(dir);
+    poe_output0(src);
+    if (oscillator) {
+        qtest_writew(src, POE + 0xe, 0x200);
+        qtest_writeb(src, 0x80040, 0x81);
+        qtest_set_irq_in(src, "/machine/mcu/system", "main-clock-failed", 0, 1);
+        now = qtest_clock_step(src, 500000);
+    } else {
+        poe_input(src, 0x30, false);
+        select_pad(src, 0x30, 7);
+        qtest_writew(src, POE + 8, 0x301);
+        now = qtest_clock_step(src, 8 * 250 + 15);
+        qtest_writeb(src, POE + 0xa, 2);
+        qtest_readb(src, POE + 0xa); /* Save read-before-clear qualification. */
+    }
+    qtest_qmp_assert_success(src, "{'execute':'migrate',"
+                            "'arguments':{'uri':%s}}", uri);
+    migration_wait(src);
+    dst = qtest_init("-M rx113-r5f51138 -incoming defer");
+    qtest_clock_set(dst, now);
+    qtest_qmp_assert_success(dst, "{'execute':'migrate-incoming',"
+                            "'arguments':{'uri':%s}}", uri);
+    migration_wait(dst);
+    if (oscillator) {
+        qtest_clock_step(dst, 499999);
+        assert_pad(dst, 0x14, true, true);
+        qtest_clock_step(dst, 1);
+        assert_pad(dst, 0x14, false, false);
+        g_assert_cmphex(qtest_readw(dst, POE + 0xe), ==, 0x1200);
+        qtest_clock_step(dst, 313);
+        qtest_writew(dst, POE + 0xe, 0x1000);
+        assert_pad(dst, 0x14, true, true);
+        qtest_writew(dst, POE + 0xe, 0x1200);
+        g_assert_cmphex(qtest_readw(dst, POE + 0xe), ==, 0x1000);
+    } else {
+        assert_pad(dst, 0x14, false, false);
+        qtest_writeb(dst, POE + 0xa, 0);
+        assert_pad(dst, 0x14, true, true);
+        qtest_clock_step(dst, 8 * 250 - 16);
+        assert_pad(dst, 0x14, true, true);
+        qtest_clock_step(dst, 1);
+        assert_pad(dst, 0x14, false, false);
+        g_assert_cmphex(qtest_readw(dst, POE + 8), ==, 0x1301);
+        poe_input(dst, 0x30, true);
+        qtest_clock_step(dst, 250);
+        qtest_writew(dst, POE + 8, 0x301);
+        assert_pad(dst, 0x14, true, true);
+    }
+    qtest_quit(dst);
+    qtest_quit(src);
+    unlink(file);
+    rmdir(dir);
+}
+
+static void test_poe_package64(void)
+{
+    QTestState *qts = qtest_init("-M rx113-r5f51138 "
+                               "-global rx113-port.package-pins=64");
+
+    for (unsigned port = 0; port < 19; port++) {
+        qtest_writeb(qts, PORT_BASE + 0x20 + port, 0xff);
+        qtest_writeb(qts, PORT_BASE + port, 0xff);
+    }
+    qtest_writeb(qts, POE + 0xc, 0x40);
+    qtest_writew(qts, POE + 2, 0x300);
+    /* P22/P23 and the P11 POE0 route are unbonded in this package. */
+    poe_input(qts, 0x22, false);
+    poe_input(qts, 0x23, false);
+    poe_input(qts, 0x11, false);
+    select_pad(qts, 0x11, 7);
+    qtest_clock_step(qts, 10000);
+    g_assert_cmphex(qtest_readw(qts, POE + 2), ==, 0x300);
+    g_assert_cmphex(qtest_readw(qts, POE), ==, 0);
+    qtest_writeb(qts, PORT_BASE + 0x21, 0x3f); /* Bonded P16/P17. */
+    qtest_clock_step(qts, 10000);
+    g_assert_cmphex(qtest_readw(qts, POE + 2), ==, 0x8300);
+    qtest_quit(qts);
+}
+
+static void test_poe_system(void)
+{
+    QTestState *qts = mtu_init();
+
+    qtest_writeb(qts, 0x800a2, 0);
+    qtest_writeb(qts, 0x80032, 0);
+    qtest_clock_step(qts, 500);
+    qtest_writew(qts, 0x80026, 0x200); /* 16 MHz main oscillator. */
+    qtest_writew(qts, 0x803fe, 0xa500);
+    qtest_writeb(qts, 0x80040, 0x81);
+    g_assert_cmpuint(qtest_readb(qts, 0x80040), ==, 0);
+    qtest_writew(qts, 0x803fe, 0xa503);
+    /* Detection without POE/NMI notification. */
+    qtest_writeb(qts, 0x80040, 0x80);
+    qtest_writeb(qts, 0x80034, 1);
+    g_assert_cmpuint(qtest_readb(qts, 0x80034), ==, 0);
+    qtest_set_irq_in(qts, "/machine/mcu/system", "main-clock-failed", 0, 1);
+    qtest_clock_step(qts, 1000000);
+    g_assert_cmpuint(qtest_readb(qts, 0x80041), ==, 1);
+    g_assert_cmpuint(qtest_readw(qts, POE + 0xe), ==, 0);
+    qtest_writew(qts, BASE + count[0], 0);
+    start_channel(qts, 0, true);
+    qtest_clock_step(qts, 1000);
+    g_assert_cmpuint(qtest_readw(qts, BASE + count[0]), ==, 4);
+    qtest_writeb(qts, 0x80041, 0); /* Cannot clear while CKSEL is main. */
+    g_assert_cmpuint(qtest_readb(qts, 0x80041), ==, 1);
+    qtest_writew(qts, 0x80026, 0x100);
+    qtest_set_irq_in(qts, "/machine/mcu/system", "main-clock-failed", 0, 0);
+    qtest_writeb(qts, 0x80041, 0);
+    g_assert_cmpuint(qtest_readb(qts, 0x80041), ==, 0);
+    qtest_writeb(qts, 0x80040, 0x81);
+    qtest_set_irq_in(qts, "/machine/mcu/system", "main-clock-failed", 0, 1);
+    qtest_clock_step(qts, 500000);
+    qtest_set_irq_in(qts, "/machine/mcu/system", "main-clock-failed", 0, 0);
+    qtest_clock_step(qts, 1000000);
+    g_assert_cmpuint(qtest_readb(qts, 0x80041), ==, 0);
+    qtest_quit(qts);
+}
+
+static void test_poe_compare_pairs(void)
+{
+    static const unsigned pads[3][2] = {
+        { 0x22, 0x23 }, { 0x24, 0x25 }, { 0x30, 0x31 },
+    };
+    QTestState *qts = mtu_init();
+
+    for (unsigned port = 0; port < 19; port++) {
+        qtest_writeb(qts, PORT_BASE + 0x20 + port, 0xff);
+        qtest_writeb(qts, PORT_BASE + port, 0xff);
+    }
+    qtest_writeb(qts, POE + 0xc, 0x70);
+    qtest_writew(qts, POE + 2, 0x300);
+    for (unsigned pair = 0; pair < 3; pair++) {
+        unsigned port = pads[pair][0] >> 4;
+        unsigned a = 1 << (pads[pair][0] & 7);
+        unsigned b = 1 << (pads[pair][1] & 7);
+
+        qtest_writeb(qts, PORT_BASE + 0x20 + port, 0xff & ~a);
+        qtest_clock_step(qts, 125);
+        g_assert_cmphex(qtest_readw(qts, POE + 2), ==, 0x300);
+        qtest_writeb(qts, PORT_BASE + 0x20 + port, 0xff & ~a & ~b);
+        qtest_clock_step(qts, 125);
+        g_assert_cmphex(qtest_readw(qts, POE + 2), ==, 0x8300);
+        qtest_writeb(qts, PORT_BASE + 0x20 + port, 0xff);
+        qtest_writew(qts, POE + 2, 0x300);
+        g_assert_cmphex(qtest_readw(qts, POE + 2), ==, 0x300);
+    }
+    /* ASEL must not hide a fault from the PFS-independent comparator. */
+    poe_input(qts, 0xe2, true);
+    select_pad(qts, 0xe2, 0x80);
+    qtest_writeb(qts, PORT_BASE + 0x22, 0xdf); /* MTIOC4C active. */
+    qtest_clock_step(qts, 125);
+    g_assert_cmphex(qtest_readw(qts, POE + 2), ==, 0x300);
+    poe_input(qts, 0xe2, false); /* MTIOC4A alternate analog pad active. */
+    qtest_clock_step(qts, 125);
+    g_assert_cmphex(qtest_readw(qts, POE + 2), ==, 0x8300);
+    qtest_writeb(qts, PORT_BASE + 0x22, 0xff);
+    poe_input(qts, 0xe2, true);
+    qtest_writew(qts, POE + 2, 0x300);
+    /* Global active-high polarity: all GPIO pads low are inactive. */
+    qtest_writeb(qts, PORT_BASE + 0x6e, 0);
+    qtest_writeb(qts, PORT_BASE + 0x140 + 14 * 8 + 2, 0);
+    for (unsigned port = 0; port < 19; port++) {
+        qtest_writeb(qts, PORT_BASE + 0x20 + port, 0);
+    }
+    qtest_writeb(qts, BASE + 0xe, 3);
+    qtest_clock_step(qts, 125);
+    g_assert_cmphex(qtest_readw(qts, POE + 2), ==, 0x300);
+    qtest_writeb(qts, PORT_BASE + 0x22, 12);
+    qtest_clock_step(qts, 125);
+    g_assert_cmphex(qtest_readw(qts, POE + 2), ==, 0x8300);
+    qtest_writeb(qts, PORT_BASE + 0x22, 0);
+    qtest_writew(qts, POE + 2, 0x300);
+    g_assert_cmphex(qtest_readw(qts, POE + 2), ==, 0x300);
+    qtest_quit(qts);
+    /* TOCS selects each pair's own TOCR2 polarity, not TOCR1 OLSP/N. */
+    for (unsigned pair = 0; pair < 3; pair++) {
+        qts = mtu_init();
+        for (unsigned port = 0; port < 19; port++) {
+            qtest_writeb(qts, PORT_BASE + port, 0xff);
+        }
+        qtest_writeb(qts, BASE + 0xe, 4);
+        qtest_writeb(qts, BASE + 0xf, 3 << (pair * 2));
+        qtest_writeb(qts, POE + 0xc, 0x40 >> pair);
+        qtest_writew(qts, POE + 2, 0x300);
+        qtest_clock_step(qts, 125);
+        g_assert_cmphex(qtest_readw(qts, POE + 2), ==, 0x300);
+        unsigned port = pads[pair][0] >> 4;
+        unsigned mask = (1 << (pads[pair][0] & 7)) |
+                        (1 << (pads[pair][1] & 7));
+
+        qtest_writeb(qts, PORT_BASE + 0x20 + port, mask);
+        qtest_clock_step(qts, 125);
+        g_assert_cmphex(qtest_readw(qts, POE + 2), ==, 0x8300);
+        qtest_quit(qts);
+    }
+}
+
+static void test_poe_registers(void)
+{
+    static const struct { unsigned addr, size, value; } regs[] = {
+        { 0x88900, 2, 0x1ff }, { 0x88902, 2, 0x300 },
+        { 0x88908, 2, 0x303 }, { 0x8890a, 1, 3 },
+        { 0x8890b, 1, 15 }, { 0x8890c, 1, 0x70 },
+        { 0x8890e, 2, 0x200 },
+    };
+    QTestState *qts = mtu_init();
+
+    for (unsigned i = 0; i < G_N_ELEMENTS(regs); i++) {
+        if (regs[i].size == 1) {
+            qtest_writeb(qts, regs[i].addr, 0xff);
+            g_assert_cmphex(qtest_readb(qts, regs[i].addr), ==, regs[i].value);
+        } else {
+            qtest_writew(qts, regs[i].addr, 0xffff);
+            g_assert_cmphex(qtest_readw(qts, regs[i].addr), ==, regs[i].value);
+        }
+    }
+    qtest_writew(qts, POE + 4, 0xffff);
+    qtest_writew(qts, POE + 6, 0xffff);
+    qtest_writeb(qts, POE + 0xd, 0xff);
+    g_assert_cmpuint(qtest_readw(qts, POE + 4), ==, 0);
+    g_assert_cmpuint(qtest_readw(qts, POE + 6), ==, 0);
+    g_assert_cmpuint(qtest_readb(qts, POE + 0xd), ==, 0);
+    qtest_writew(qts, POE, 0);
+    qtest_writew(qts, POE + 2, 0);
+    qtest_writew(qts, POE + 8, 0);
+    qtest_writeb(qts, POE + 0xb, 0);
+    qtest_writeb(qts, POE + 0xc, 0);
+    g_assert_cmphex(qtest_readw(qts, POE), ==, 0xff);
+    g_assert_cmphex(qtest_readw(qts, POE + 2), ==, 0x200);
+    g_assert_cmphex(qtest_readw(qts, POE + 8), ==, 0x203);
+    g_assert_cmphex(qtest_readb(qts, POE + 0xb), ==, 15);
+    g_assert_cmphex(qtest_readb(qts, POE + 0xc), ==, 0x70);
+    qtest_system_reset(qts);
+    for (unsigned i = 0; i < 16; i++) {
+        g_assert_cmpuint(qtest_readb(qts, POE + i), ==, 0);
+    }
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -3079,5 +3647,27 @@ int main(int argc, char **argv)
                         GINT_TO_POINTER(0), test_migration);
     qtest_add_data_func("/rx113-mtu/migration-stopped",
                         GINT_TO_POINTER(1), test_migration);
+    qtest_add_func("/rx113-mtu/poe-software", test_poe_software);
+    qtest_add_func("/rx113-mtu/poe-comparator", test_poe_comparator);
+    for (unsigned i = 0; i < 4; i++) {
+        g_autofree char *name = g_strdup_printf("/rx113-mtu/poe-pin-%u", i);
+
+        qtest_add_data_func(name, GUINT_TO_POINTER(i), test_poe_pin);
+    }
+    qtest_add_data_func("/rx113-mtu/poe-ostste-release", GUINT_TO_POINTER(1),
+                        test_poe_oscillator);
+    qtest_add_data_func("/rx113-mtu/poe-oststf-release", GUINT_TO_POINTER(0),
+                        test_poe_oscillator);
+    qtest_add_func("/rx113-mtu/poe-routes", test_poe_routes);
+    qtest_add_func("/rx113-mtu/poe-groups", test_poe_groups);
+    qtest_add_func("/rx113-mtu/poe-clock-glitch", test_poe_clock_glitch);
+    qtest_add_data_func("/rx113-mtu/poe-migration-sampling",
+                        GUINT_TO_POINTER(0), test_poe_migration);
+    qtest_add_data_func("/rx113-mtu/poe-migration-oscillator",
+                        GUINT_TO_POINTER(1), test_poe_migration);
+    qtest_add_func("/rx113-mtu/poe-package64", test_poe_package64);
+    qtest_add_func("/rx113-mtu/poe-system", test_poe_system);
+    qtest_add_func("/rx113-mtu/poe-compare-pairs", test_poe_compare_pairs);
+    qtest_add_func("/rx113-mtu/poe-registers", test_poe_registers);
     return g_test_run();
 }

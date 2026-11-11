@@ -18,6 +18,7 @@
 #include "hw/rx/rx113_port.h"
 #include "hw/rx/rx113_iwdt.h"
 #include "hw/rx/rx113_mtu.h"
+#include "hw/rx/rx113_poe.h"
 #include "hw/rx/rx113_s12ad.h"
 #include "hw/rx/rx113_dac.h"
 #include "hw/rx/rx113_dtc.h"
@@ -152,6 +153,10 @@ struct RX113SystemState {
     uint64_t main_clock_hz;
     bool rtc_enabled;
     int64_t iwdt_ready_ns;
+    uint8_t ostdcr, ostdsr;
+    bool ostdf_seen, main_failed, ostdi_request;
+    QEMUTimer *failure_timer;
+    qemu_irq ostdi;
 };
 
 /* Table 5.1 addresses and Table 14.3 ERI/RXI/TXI/TEI vector bases. */
@@ -191,7 +196,7 @@ static void rx113_system_update_clocks(RX113SystemState *s)
         source = RX113_HOCO_HZ;
         break;
     case 2:
-        source = s->main_clock_hz;
+        source = s->ostdsr ? RX113_LOCO_HZ : s->main_clock_hz;
         break;
     case 3:
         source = RX113_SUB_HZ;
@@ -204,7 +209,9 @@ static void rx113_system_update_clocks(RX113SystemState *s)
             qemu_log_mask(LOG_GUEST_ERROR, "rx113: prohibited PLL setting\n");
             goto gates;
         }
-        source = (s->main_clock_hz >> plidiv) * (stc == 0x0b ? 6 : 8);
+        /* Table 43.21: nominal PLL free-running frequency is 8 MHz. */
+        source = s->ostdsr ? 8000000 :
+                 (s->main_clock_hz >> plidiv) * (stc == 0x0b ? 6 : 8);
         break;
     }
     default:
@@ -248,7 +255,8 @@ gates:
     if (s->mcu->cac) {
         static const unsigned system_source[] = { 3, 2, 0, 1 };
         uint64_t hz[6] = {
-            (s->oscovfsr & 1) ? s->main_clock_hz : 0,
+            (s->oscovfsr & 1) ?
+                (s->ostdsr ? RX113_LOCO_HZ : s->main_clock_hz) : 0,
             (!(s->regs[SYS_SOSCCR] & 1) || s->rtc_enabled) ?
                 RX113_SUB_HZ : 0,
             (s->oscovfsr & 8) ? RX113_HOCO_HZ : 0,
@@ -278,6 +286,7 @@ gates:
                         s->regs[SYS_MSTPCRA] & (1U << 18));
     rx113_s12ad_set_clock(s->mcu->s12ad, pclkb, pclkd,
                           s->regs[SYS_MSTPCRA] & (1U << 17));
+    rx113_poe_set_clock(s->mcu->poe, pclkb);
     rx113_mtu_set_clock(s->mcu->mtu, pclkb,
                         s->regs[SYS_MSTPCRA] & (1U << 9));
     for (i = 0; i < 2; i++) {
@@ -366,11 +375,56 @@ static void rx113_system_update_oscillators(void *opaque)
     rx113_system_update_clocks(s);
 }
 
+/* Table 43.59 supplies a maximum detection time of 1 ms. */
+static void rx113_system_detect_failure(void *opaque)
+{
+    RX113SystemState *s = opaque;
+
+    if (!(s->ostdcr & 0x80) || !s->main_failed || s->ostdsr) {
+        return;
+    }
+    s->ostdsr = 1;
+    s->ostdf_seen = false;
+    rx113_system_update_clocks(s);
+    if (s->ostdcr & 1) {
+        /* D-017: request at the ICU boundary; no CPU NMI delivery. */
+        s->ostdi_request = true;
+        qemu_set_irq(s->ostdi, 1);
+        rx113_poe_oscillator_stop(s->mcu->poe);
+    }
+}
+
+static void rx113_system_failure_input(void *opaque, int n, int level)
+{
+    RX113SystemState *s = opaque;
+
+    s->main_failed = level;
+    if (!level) {
+        timer_del(s->failure_timer);
+    } else if ((s->ostdcr & 0x80) && !s->ostdsr &&
+               !timer_pending(s->failure_timer)) {
+        timer_mod(s->failure_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1000000);
+    }
+}
+
+static bool rx113_system_ostdi_request(Object *obj, Error **errp)
+{
+    return RX113_SYSTEM(obj)->ostdi_request;
+}
+
 static uint64_t rx113_system_read(void *opaque, hwaddr addr, unsigned size)
 {
     RX113SystemState *s = opaque;
     unsigned i;
 
+    if (addr == 0x40 && size == 1) {
+        return s->ostdcr;
+    }
+    if (addr == 0x41 && size == 1) {
+        s->ostdf_seen |= s->ostdsr;
+        return s->ostdsr;
+    }
     if (addr == 0x35 && size == 1) {
         return rx113_iwdt_ilococr(s->mcu->iwdt);
     }
@@ -396,6 +450,28 @@ static void rx113_system_write(void *opaque, hwaddr addr, uint64_t value,
     RX113SystemState *s = opaque;
     unsigned i;
 
+    if ((addr == 0x40 || addr == 0x41) && size == 1) {
+        if (!(s->regs[SYS_PRCR] & 1)) {
+            return;
+        }
+        if (addr == 0x40) {
+            s->ostdcr = (value & 0x81) | (s->ostdsr ? 0x80 : 0);
+            if (s->ostdcr & 0x80) {
+                s->regs[SYS_LOCOCR] = 0;
+            }
+            rx113_system_failure_input(s, 0, s->main_failed);
+        } else if (!(value & 1) && s->ostdf_seen && !(s->ostdcr & 1) &&
+                   (s->regs[SYS_SCKCR3] & 0x700) != 0x200 &&
+                   (s->regs[SYS_SCKCR3] & 0x700) != 0x400) {
+            s->ostdsr = 0;
+            s->ostdf_seen = false;
+            s->ostdi_request = false;
+            qemu_set_irq(s->ostdi, 0);
+            rx113_system_failure_input(s, 0, s->main_failed);
+        }
+        rx113_system_update_clocks(s);
+        return;
+    }
     if (addr == 0x35 && size == 1) {
         if ((s->regs[SYS_PRCR] & 1) && !(value & 1)) {
             if (!rx113_iwdt_clock_hz(s->mcu->iwdt)) {
@@ -425,6 +501,10 @@ static void rx113_system_write(void *opaque, hwaddr addr, uint64_t value,
             }
         } else if (s->regs[SYS_PRCR] & system_regs[i].protect) {
             uint32_t mask = system_regs[i].mask;
+
+            if (i == SYS_LOCOCR && (s->ostdcr & 0x80)) {
+                value = 0;
+            }
 
             s->regs[i] = (value & mask) | (system_regs[i].reset & ~mask);
             rx113_system_update_oscillators(s);
@@ -477,6 +557,10 @@ static void rx113_system_reset_hold(Object *obj, ResetType type)
     unsigned i;
 
     timer_del(s->osc_timer);
+    timer_del(s->failure_timer);
+    s->ostdcr = s->ostdsr = 0;
+    s->ostdf_seen = s->ostdi_request = false;
+    qemu_set_irq(s->ostdi, 0);
     s->oscovfsr = 0;
     s->iwdt_ready_ns = 0;
     for (i = 0; i < OSC_COUNT; i++) {
@@ -520,6 +604,13 @@ static void rx113_system_init(Object *obj)
     RX113SystemState *s = RX113_SYSTEM(obj);
 
     qdev_init_gpio_out_named(DEVICE(obj), &s->subclock, "subclock", 1);
+    qdev_init_gpio_out_named(DEVICE(obj), &s->ostdi, "ostdi", 1);
+    qdev_init_gpio_in_named(DEVICE(obj), rx113_system_failure_input,
+                           "main-clock-failed", 1);
+    object_property_add_bool(obj, "ostdi-request", rx113_system_ostdi_request,
+                             NULL);
+    s->failure_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                    rx113_system_detect_failure, s);
     qdev_init_gpio_in_named(DEVICE(obj), rx113_system_rtc_enable,
                            "rtc-enable", 1);
     s->osc_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
@@ -537,6 +628,7 @@ static void rx113_system_finalize(Object *obj)
     RX113SystemState *s = RX113_SYSTEM(obj);
 
     timer_free(s->osc_timer);
+    timer_free(s->failure_timer);
 }
 
 static int rx113_system_post_load(void *opaque, int version_id)
@@ -563,12 +655,13 @@ static int rx113_system_post_load(void *opaque, int version_id)
         }
     }
     qemu_set_irq(s->subclock, !(s->regs[SYS_SOSCCR] & 1));
+    qemu_set_irq(s->ostdi, s->ostdi_request);
     return 0;
 }
 
 static const VMStateDescription vmstate_rx113_system = {
     .name = TYPE_RX113_SYSTEM,
-    .version_id = 6,
+    .version_id = 7,
     .minimum_version_id = 1,
     .post_load = rx113_system_post_load,
     .fields = (const VMStateField[]) {
@@ -577,6 +670,12 @@ static const VMStateDescription vmstate_rx113_system = {
         VMSTATE_UINT32_V(regs[SYS_MSTPCRA], RX113SystemState, 3),
         VMSTATE_UINT32_V(regs[SYS_MSTPCRC], RX113SystemState, 4),
         VMSTATE_UINT32_V(regs[SYS_MSTPCRD], RX113SystemState, 6),
+        VMSTATE_UINT8_V(ostdcr, RX113SystemState, 7),
+        VMSTATE_UINT8_V(ostdsr, RX113SystemState, 7),
+        VMSTATE_BOOL_V(ostdf_seen, RX113SystemState, 7),
+        VMSTATE_BOOL_V(main_failed, RX113SystemState, 7),
+        VMSTATE_BOOL_V(ostdi_request, RX113SystemState, 7),
+        VMSTATE_TIMER_PTR_V(failure_timer, RX113SystemState, 7),
         VMSTATE_BOOL_V(rtc_enabled, RX113SystemState, 5),
         VMSTATE_INT64_V(iwdt_ready_ns, RX113SystemState, 5),
         VMSTATE_UINT8_V(oscovfsr, RX113SystemState, 2),
@@ -952,6 +1051,7 @@ static void rx113_realize(DeviceState *dev, Error **errp)
 {
     RX113State *s = RX113_MCU(dev);
     RX113Class *rxc = RX113_MCU_GET_CLASS(dev);
+    DeviceState *port;
 
     memory_region_init_ram(&s->iram, OBJECT(dev), "iram",
                            rxc->ram_size, &error_abort);
@@ -1012,7 +1112,22 @@ static void rx113_realize(DeviceState *dev, Error **errp)
         sysbus_connect_irq(SYS_BUS_DEVICE(s->cac), i,
                            qdev_get_gpio_in(DEVICE(&s->icu), 32 + i));
     }
-    register_s12ad(s, register_port(s));
+    port = register_port(s);
+
+    s->poe = qdev_new(TYPE_RX113_POE);
+    object_property_add_child(OBJECT(s), "poe", OBJECT(s->poe));
+    object_property_set_link(OBJECT(s->poe), "port", OBJECT(port),
+                             &error_abort);
+    object_property_set_link(OBJECT(s->poe), "mtu", OBJECT(s->mtu),
+                             &error_abort);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(s->poe), &error_abort);
+    sysbus_mmio_map(SYS_BUS_DEVICE(s->poe), 0, 0x00088900);
+    RX113_PORT(port)->poe = s->poe;
+    for (unsigned i = 0; i < 2; i++) {
+        sysbus_connect_irq(SYS_BUS_DEVICE(s->poe), i,
+                           qdev_get_gpio_in(DEVICE(&s->icu), 170 + i));
+    }
+    register_s12ad(s, port);
     s->dac = qdev_new(TYPE_RX113_DAC);
     object_property_add_child(OBJECT(s), "dac", OBJECT(s->dac));
     object_property_set_link(OBJECT(s->dac), "adc", OBJECT(s->s12ad),
