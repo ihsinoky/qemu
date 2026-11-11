@@ -83,17 +83,26 @@ static bool rx113_iwdt_window(RX113IWDTState *s)
 }
 
 /*
- * With no NMI consumer, repeated automatic errors have no external side
- * effects. Skip those cycles arithmetically, so long RTC clock steps do
- * not execute billions of unobservable watchdog callbacks. MMIO catches
- * up before exposing state or accepting a refresh. A connected output or
- * sleep gating always uses the count-edge timer.
+ * Repeated automatic errors are skipped arithmetically, so long clock
+ * steps do not execute billions of watchdog callbacks. MMIO catches up
+ * before exposing state or accepting a refresh. The skip is used even
+ * with the WUNI output connected (Issue #58): the catch-up also
+ * materializes the request level the skipped cycles would have
+ * produced -- raised when a boundary lands exactly on the target
+ * cycle, and collapsed into a single pulse when boundaries were left
+ * behind -- so an edge consumer such as the ICU latches the same
+ * flags it would have seen from per-cycle callbacks. A consumer that
+ * clears its latch without touching the IWDT sees a repeated request
+ * only at the next IWDT access; that delay is the price of the skip
+ * and is recorded in the Issue #58 report. Sleep gating always uses
+ * the count-edge timer.
  */
 static void rx113_iwdt_catch_up(RX113IWDTState *s)
 {
     uint64_t target, elapsed, until_error, phase;
     unsigned period = rx113_iwdt_period(s);
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    bool crossed, want_level;
 
     if (!s->lazy) {
         return;
@@ -102,7 +111,8 @@ static void rx113_iwdt_catch_up(RX113IWDTState *s)
              rx113_iwdt_divisor(s);
     elapsed = target - s->ticks;
     until_error = s->reload ? period + 1 : s->count + 1;
-    if (elapsed >= until_error) {
+    crossed = elapsed >= until_error;
+    if (crossed) {
         s->flags = UNDFF;
         phase = (elapsed - until_error) % (period + 1);
         s->reload = phase == 0;
@@ -116,6 +126,23 @@ static void rx113_iwdt_catch_up(RX113IWDTState *s)
         }
     }
     s->ticks = target;
+
+    /*
+     * The request is a one-cycle pulse per error (26.3.1.2: the
+     * counter reloads after counting one cycle). It reads as raised
+     * only while the target is the boundary cycle itself; a pulse
+     * materialized by an earlier catch-up has expired once time has
+     * advanced past it.
+     */
+    want_level = crossed && phase == 0;
+    if (want_level != s->wuni_level) {
+        s->wuni_level = want_level;
+        qemu_set_irq(s->wuni, want_level);
+    } else if (crossed && !want_level) {
+        /* Boundaries elapsed unobserved: deliver one collapsed pulse. */
+        qemu_set_irq(s->wuni, 1);
+        qemu_set_irq(s->wuni, 0);
+    }
 }
 
 static void rx113_iwdt_schedule(RX113IWDTState *s)
@@ -123,8 +150,7 @@ static void rx113_iwdt_schedule(RX113IWDTState *s)
     unsigned div = rx113_iwdt_divisor(s);
 
     s->lazy = s->automatic && !s->reset_output && !s->sleep_stop &&
-              s->active && !s->pending && !s->wuni_level && s->flags &&
-              !sysbus_is_irq_connected(SYS_BUS_DEVICE(s), 0);
+              s->active && !s->pending && !s->wuni_level && s->flags;
     if (s->lazy) {
         timer_del(s->timer);
         return;
@@ -155,8 +181,6 @@ static void rx113_iwdt_event(RX113IWDTState *s, uint16_t flag)
     } else {
         s->wuni_level = true;
         qemu_set_irq(s->wuni, 1);
-        qemu_log_mask(LOG_UNIMP, "rx113-iwdt: WUNI requested; "
-                      "RX ICU/CPU NMI delivery is unavailable\n");
     }
 }
 
