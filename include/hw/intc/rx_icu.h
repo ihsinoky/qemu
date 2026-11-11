@@ -65,10 +65,16 @@ struct RXICUState {
     uint8_t nmier;
     uint8_t nmiclr;
     uint8_t nmicr;
+    /* RX113 NMI block (opt-in via the nmi-rx113 property) */
+    bool nmi_rx113;
+    uint8_t nmiflte;
+    uint8_t nmifltc;
+    uint8_t nmi_in_level[3];
     int16_t req_irq;
     qemu_irq _irq;
     qemu_irq _fir;
     qemu_irq _swi;
+    qemu_irq _nmi;
 };
 
 #define TYPE_RX_ICU "rx-icu"

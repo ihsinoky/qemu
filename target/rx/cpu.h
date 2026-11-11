@@ -150,9 +150,11 @@ void rx_cpu_unpack_psw(CPURXState *env, uint32_t psw, int rte);
 
 #define CPU_INTERRUPT_SOFT CPU_INTERRUPT_TGT_INT_0
 #define CPU_INTERRUPT_FIR  CPU_INTERRUPT_TGT_INT_1
+#define CPU_INTERRUPT_NMI  CPU_INTERRUPT_TGT_INT_2
 
 #define RX_CPU_IRQ 0
 #define RX_CPU_FIR 1
+#define RX_CPU_NMI 2
 
 static inline uint32_t rx_cpu_pack_psw(CPURXState *env)
 {

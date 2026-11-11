@@ -287,3 +287,52 @@ only the OSTSTE-clear release path is removed. Whether the latch
 is consumed by a write that does not present the field (a low-byte
 write to ICSR3 touches only reserved bits) is not documented; the
 model follows the ICSR2 precedent of latching per presented field.
+
+## D-021: NMI delivery design (Issue #58)
+
+The OSTDI (D-017) and WUNI (Issue #27) requests were generated but
+connected nowhere; this issue delivers them to the CPU as
+non-maskable interrupts, closing the last generated-but-undelivered
+request in the model. Design points settled by the PMO under the
+issue instruction, following the manual (R01UH0448EJ0120
+14.2.10–14.2.15) wherever it speaks:
+
+- The shared ICU gains an opt-in bool property `nmi-rx113`
+  (default off). The RX62N NMI register block keeps its existing
+  decorative behaviour and bit layout; enabling the property
+  switches the block to the RX113 layout (NMISR mask 0x3B:
+  NMIST/OSTST/IWDTST/LVD1ST/LVD2ST) and real semantics. This
+  follows the D-007/D-008 opt-in pattern for shared models.
+- NMISR flags are NOT gated by NMIER (14.2.10 note); delivery is
+  gated instead: the ICU drives its NMI output while
+  `(NMISR & NMIER) != 0`. Source-side enable stays upstream
+  (SYSTEM's OSTDCR gate for OSTDI, the IWDT's OFS0 NMI-output
+  selection for WUNI).
+- The CPU hookup uses the generic `CPU_INTERRUPT_TGT_INT_2` bit
+  behind a new `RX_CPU_NMI` GPIO input. Acceptance bypasses
+  PSW.I/IPL, takes priority over FIR and maskable interrupts,
+  enters through the existing exception-30 path, and sets PSW
+  IPL to 15 on entry (2.2.2). No new CPU env state.
+- The NMI pin is P35, a fixed-function input with no PFS gate
+  whose level the manual reflects in PORT3.PIDR.B5; PORT drives
+  the pad level to the ICU at all times.
+- NMIFLTE/NMIFLTC are storage-only: the digital filter data path
+  (PCLKB sampling, 3-match) is not implemented, because the ICU
+  has no clock input to sample with. Recorded as a leftover in
+  the issue report, not silently dropped.
+- LVD1ST/LVD2ST decode in the register map but have no source
+  input: no LVD device exists in this machine. This is the one
+  place where a documented flag cannot be raised; it becomes
+  connectable if an LVD model is ever built.
+- The IWDT's lazy arithmetic skip (Issue #27) previously applied
+  only while its WUNI output was unconnected. It now applies
+  with the output connected as well, and the MMIO catch-up
+  materializes the one-cycle request level the skipped cycles
+  would have produced (raised on an exact-boundary target,
+  collapsed to a single pulse after jumps). A wake-up timer was
+  rejected: qtest clock warping fires timers deadline by
+  deadline, so per-boundary wakes iterate billions of times over
+  long steps -- the exact cost the skip exists to avoid. The
+  accepted deviation is that a repeated request inside a lazy
+  stretch surfaces at the next IWDT access instead of at its
+  underflow; see the issue report for the exact conditions.

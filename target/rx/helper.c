@@ -57,7 +57,19 @@ void rx_cpu_do_interrupt(CPUState *cs)
     save_psw = rx_cpu_pack_psw(env);
     env->psw_pm = env->psw_i = env->psw_u = 0;
 
-    if (cpu_test_interrupt(cs, CPU_INTERRUPT_FIR)) {
+    /*
+     * A pending non-maskable interrupt preempts FIR and maskable
+     * interrupts and enters through the exception path (vector 30)
+     * with the IPL raised to 15, as on hardware.
+     */
+    bool nmi = cpu_test_interrupt(cs, CPU_INTERRUPT_NMI);
+
+    if (nmi) {
+        cpu_reset_interrupt(cs, CPU_INTERRUPT_NMI);
+        cs->exception_index = 30;
+        env->psw_ipl = 15;
+    }
+    if (!nmi && cpu_test_interrupt(cs, CPU_INTERRUPT_FIR)) {
         env->bpc = env->pc;
         env->bpsw = save_psw;
         env->pc = env->fintv;
@@ -66,7 +78,7 @@ void rx_cpu_do_interrupt(CPUState *cs)
         qemu_set_irq(env->ack, env->ack_irq);
         qemu_plugin_vcpu_interrupt_cb(cs, last_pc);
         qemu_log_mask(CPU_LOG_INT, "fast interrupt raised\n");
-    } else if (cpu_test_interrupt(cs, CPU_INTERRUPT_HARD)) {
+    } else if (!nmi && cpu_test_interrupt(cs, CPU_INTERRUPT_HARD)) {
         env->isp -= 4;
         cpu_stl_le_data(env, env->isp, save_psw);
         env->isp -= 4;
@@ -128,6 +140,11 @@ bool rx_cpu_exec_interrupt(CPUState *cs, int interrupt_request)
 {
     CPURXState *env = cpu_env(cs);
     int accept = 0;
+    /* non-maskable interrupt: ignores PSW.I and the IPL */
+    if (interrupt_request & CPU_INTERRUPT_NMI) {
+        rx_cpu_do_interrupt(cs);
+        return true;
+    }
     /* hardware interrupt (Normal) */
     if ((interrupt_request & CPU_INTERRUPT_HARD) &&
         env->psw_i && (env->psw_ipl < env->req_ipl)) {

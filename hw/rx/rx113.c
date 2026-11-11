@@ -772,6 +772,7 @@ static void register_icu(RX113State *s)
     icu = SYS_BUS_DEVICE(&s->icu);
 
     qdev_prop_set_uint32(DEVICE(icu), "ipr-count", 256);
+    qdev_prop_set_bit(DEVICE(icu), "nmi-rx113", true);
     ipr_map = qlist_new();
     for (i = 0; i < NR_IRQS; i++) {
         qlist_append_int(ipr_map, ipr_table[i]);
@@ -787,7 +788,14 @@ static void register_icu(RX113State *s)
 
     sysbus_connect_irq(icu, 0, qdev_get_gpio_in(DEVICE(&s->cpu), RX_CPU_IRQ));
     sysbus_connect_irq(icu, 1, qdev_get_gpio_in(DEVICE(&s->cpu), RX_CPU_FIR));
+    sysbus_connect_irq(icu, 3, qdev_get_gpio_in(DEVICE(&s->cpu), RX_CPU_NMI));
     sysbus_mmio_map(icu, 0, RX113_ICU_BASE);
+    /* Issue #58: NMI sources (D-017 left both at the request stage). */
+    qdev_connect_gpio_out_named(
+        DEVICE(object_resolve_path_component(OBJECT(s), "system")),
+        "ostdi", 0, qdev_get_gpio_in_named(DEVICE(icu), "nmi-ostdi", 0));
+    sysbus_connect_irq(SYS_BUS_DEVICE(s->iwdt), 0,
+                       qdev_get_gpio_in_named(DEVICE(icu), "nmi-iwdt", 0));
 }
 
 static void register_dtc(RX113State *s)
@@ -923,6 +931,9 @@ static DeviceState *register_port(RX113State *s)
     }
     qdev_connect_gpio_out_named(dev, "cacref", 0,
                                qdev_get_gpio_in_named(s->cac, "cacref", 0));
+    qdev_connect_gpio_out_named(dev, "nmi", 0,
+                                qdev_get_gpio_in_named(DEVICE(&s->icu),
+                                                       "nmi-pin", 0));
     for (unsigned i = 0; i < 3; i++) {
         qdev_connect_gpio_out_named(dev, "mtu-feedback", i,
                                    qdev_get_gpio_in_named(s->mtu,
