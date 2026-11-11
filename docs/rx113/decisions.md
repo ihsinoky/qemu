@@ -182,3 +182,37 @@ matches the Issue #35 delivery model (destination-number order) and is
 deterministic. It is an emulation convention for an undocumented
 configuration, not a claim about hardware behaviour. Decided by the
 PMO at the Issue #47 audit stop.
+
+## D-015: Complementary-PWM duty interrupt sources
+
+The manual does not uniquely determine which counter supplies the
+complementary-mode duty interrupt requests (TGIB3, TGIA4, TGIB4), nor
+whether waveform-suppressed matches request interrupts. Emulation
+policy, chosen by the PO at the Issue #49 stage 2b5 audit stop from
+the PMO's options: a duty request is raised only when the owning
+channel's own counter matches its active compare value — TGIB3 only
+on MTU3.TCNT matches, TGIA4/TGIB4 only on MTU4.TCNT matches. Pending
+temporary-bank values never request. A match whose waveform turn-on
+is suppressed by the duty arbitration still requests, because the
+active-value match occurred. Buffered C/D compares selected by
+MTU3.BFA/BFB follow the same per-channel rule. The crest (TGIA3) and
+trough (TCIV4) paths, TITCR skipping and the reset-synchronized PWM
+suppression of section 20.6.15 are unchanged. This is an emulation
+convention, not a claim about hardware behaviour.
+
+## D-016: CCE synchronous clear does not transfer the temporary bank
+
+In complementary mode 1, TWCR.CCE clears MTU3.TCNT, MTU4.TCNT and
+TCNTS at the TGRA3 match (20.3.8(o)), while the temporary bank
+transfers at the end of Tb1 (20.3.8(b)), a boundary the clear can
+prevent from ever being reached. The manual does not specify the
+interaction. Emulation policy, chosen by the PO at the Issue #49
+stage 2b6 audit stop from the PMO's options: compose the two
+documented rules literally — CCE performs only the counter clear,
+and the temporary bank transfers only at the documented natural
+boundary. With CCE active the bank can therefore remain pending
+indefinitely; no early transfer and no hidden completion mechanism
+is invented. Pending transactions keep their existing snapshot
+ordering. This follows the implement-by-default principle (D-006)
+and is an emulation convention, not a claim about hardware
+behaviour.
