@@ -438,6 +438,8 @@ static void port_update(RX113PortState *s, bool notify)
         rx113_poe_port_changed(s->poe);
     }
     qemu_set_irq(s->cacref, cacref);
+    /* P35 is the NMI pin: input-only, always connected (18.3.8). */
+    qemu_set_irq(s->nmi, (s->levels[3] >> 5) & 1);
     for (unsigned i = 0; i < 3; i++) {
         qemu_set_irq(s->mtu_feedback[i], (feedback >> i) & 1);
         qemu_set_irq(s->mtic5[i], (mtic5 >> i) & 1);
@@ -811,6 +813,7 @@ static void port_init(Object *obj)
                           sizeof(s->regs));
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
     qdev_init_gpio_out_named(dev, &s->cacref, "cacref", 1);
+    qdev_init_gpio_out_named(dev, &s->nmi, "nmi", 1);
     qdev_init_gpio_out_named(dev, s->mtu_feedback, "mtu-feedback", 3);
     qdev_init_gpio_out_named(dev, s->mtic5, "mtic5", 3);
     qdev_init_gpio_in_named(dev, port_mtioc_input, "mtioc",
