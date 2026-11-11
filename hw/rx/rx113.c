@@ -93,7 +93,8 @@ enum {
     SYS_MSTPCRB, SYS_SCKCR, SYS_SCKCR3, SYS_PLLCR, SYS_PLLCR2,
     SYS_UPLLCR, SYS_UPLLCR2, SYS_MOSCCR, SYS_SOSCCR, SYS_LOCOCR,
     SYS_HOCOCR, SYS_MOSCWTCR, SYS_HOCOWTCR, SYS_PRCR, SYS_MOFCR,
-    SYS_MSTPCRA, SYS_MSTPCRC, SYS_MSTPCRD, SYS_REG_COUNT,
+    SYS_MSTPCRA, SYS_MSTPCRC, SYS_MSTPCRD,
+    SYS_LCDSCLKCR, SYS_LCDSCLKCR2, SYS_REG_COUNT,
 };
 
 static const struct {
@@ -123,6 +124,9 @@ static const struct {
     /* §9.2.17-18: LOCO-based oscillator wait settings. */
     [SYS_MOSCWTCR] = { 0xa2, 1, 4, 0x1f, 2 },
     [SYS_HOCOWTCR] = { 0xa5, 1, 5, 0x1f, 4 },
+    /* §9.2.15-16: LCD source clock selection and stop; PRC0. */
+    [SYS_LCDSCLKCR] = { 0x50, 1, 0, 0x7, 1 },
+    [SYS_LCDSCLKCR2] = { 0x51, 1, 1, 0x1, 1 },
     /* §12.1.1: key not retained, reset protection enabled. */
     [SYS_PRCR] = { 0x3fe, 2, 0, 0xf, 0 },
     /* §9.2.20: main oscillator source/drive control; PRC1. */
@@ -276,6 +280,45 @@ gates:
     }
     rx113_ctsu_set_clock(s->mcu->ctsu, pclkb,
                          s->regs[SYS_MSTPCRD] & (1U << 10));
+    {
+        /* §9.2.15-16, §34.2.3: LCD source clock for the LCDC. */
+        uint64_t lcd_hz = 0;
+        unsigned lcd_source = RX113_LCD_SOURCE_MAIN;
+        unsigned sel = s->regs[SYS_LCDSCLKCR] & 7;
+
+        switch (sel) {
+        case 0: /* LOCO */
+            lcd_hz = (s->regs[SYS_LOCOCR] & 1) ? 0 : RX113_LOCO_HZ;
+            break;
+        case 1: /* HOCO */
+            lcd_hz = (s->oscovfsr & 8) ? RX113_HOCO_HZ : 0;
+            break;
+        case 2: /* Main clock oscillator */
+            lcd_hz = (s->oscovfsr & 1) ?
+                     (s->ostdsr ? RX113_LOCO_HZ : s->main_clock_hz) : 0;
+            break;
+        case 3: /* Sub-clock oscillator */
+            lcd_source = RX113_LCD_SOURCE_SUB;
+            lcd_hz = (!(s->regs[SYS_SOSCCR] & 1) || s->rtc_enabled) ?
+                     RX113_SUB_HZ : 0;
+            break;
+        case 4: /* IWDT-dedicated on-chip oscillator */
+            lcd_source = RX113_LCD_SOURCE_IWDT;
+            lcd_hz = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) >=
+                     s->iwdt_ready_ns ?
+                     rx113_iwdt_clock_hz(s->mcu->iwdt) : 0;
+            break;
+        default:
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "rx113: prohibited LCD clock source\n");
+            break;
+        }
+        if (s->regs[SYS_LCDSCLKCR2] & 1) {
+            lcd_hz = 0; /* LCDSCLKSTP stops the source clock output. */
+        }
+        rx113_lcdc_set_clock(s->mcu->lcdc, lcd_hz, lcd_source,
+                             s->regs[SYS_MSTPCRD] & (1U << 11));
+    }
     rx113_doc_set_stopped(s->mcu->doc,
                           s->regs[SYS_MSTPCRB] & (1U << 6));
     rx113_elc_set_clock(s->mcu->elc, pclkb,
@@ -636,6 +679,10 @@ static int rx113_system_post_load(void *opaque, int version_id)
     RX113SystemState *s = opaque;
     unsigned i;
 
+    if (version_id < 8) {
+        s->regs[SYS_LCDSCLKCR] = system_regs[SYS_LCDSCLKCR].reset;
+        s->regs[SYS_LCDSCLKCR2] = system_regs[SYS_LCDSCLKCR2].reset;
+    }
     if (version_id < 6) {
         s->regs[SYS_MSTPCRD] = system_regs[SYS_MSTPCRD].reset;
     }
@@ -661,7 +708,7 @@ static int rx113_system_post_load(void *opaque, int version_id)
 
 static const VMStateDescription vmstate_rx113_system = {
     .name = TYPE_RX113_SYSTEM,
-    .version_id = 7,
+    .version_id = 8,
     .minimum_version_id = 1,
     .post_load = rx113_system_post_load,
     .fields = (const VMStateField[]) {
@@ -670,6 +717,8 @@ static const VMStateDescription vmstate_rx113_system = {
         VMSTATE_UINT32_V(regs[SYS_MSTPCRA], RX113SystemState, 3),
         VMSTATE_UINT32_V(regs[SYS_MSTPCRC], RX113SystemState, 4),
         VMSTATE_UINT32_V(regs[SYS_MSTPCRD], RX113SystemState, 6),
+        VMSTATE_UINT32_V(regs[SYS_LCDSCLKCR], RX113SystemState, 8),
+        VMSTATE_UINT32_V(regs[SYS_LCDSCLKCR2], RX113SystemState, 8),
         VMSTATE_UINT8_V(ostdcr, RX113SystemState, 7),
         VMSTATE_UINT8_V(ostdsr, RX113SystemState, 7),
         VMSTATE_BOOL_V(ostdf_seen, RX113SystemState, 7),
@@ -885,6 +934,7 @@ static DeviceState *register_lcdc(RX113State *s)
     object_property_add_child(OBJECT(s), "lcdc", OBJECT(dev));
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_abort);
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, RX113_LCDC_BASE);
+    s->lcdc = dev;
     return dev;
 }
 

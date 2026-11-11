@@ -412,6 +412,9 @@ static void test_lcdc_blink(void)
     QTestState *qts = rtc_init();
     const char *lcdc = "/machine/mcu/lcdc";
 
+    /* The LCDC is module-stopped at reset (Issue 61); release it. */
+    qtest_writew(qts, 0x803fe, 0xa503);
+    qtest_writel(qts, 0x8001c, 0xfffff7ff);
     qtest_writeb(qts, LCDM1, LCDM1_LCDON | LCDM1_BLON);
     qtest_writeb(qts, RCR2, RCR2_START);
     g_assert_false(qtest_qom_get_bool(qts, lcdc, "blink-phase"));
@@ -544,6 +547,9 @@ static void test_radj_periodic_deadline(void)
     int64_t deadline = 2 * SEC - 32 * SEC / 32768;
 
     set_time(qts, t0, RCR2_HR24 | RCR2_AADJE | RCR2_AADJP);
+    /* The LCDC is module-stopped at reset (Issue 61); release it. */
+    qtest_writew(qts, 0x803fe, 0xa503);
+    qtest_writel(qts, 0x8001c, 0xfffff7ff);
     qtest_writeb(qts, LCDM1, LCDM1_LCDON | LCDM1_BLON);
     qtest_writeb(qts, RADJ, 0x60);
     enable_irq(qts, VEC_PRD);
