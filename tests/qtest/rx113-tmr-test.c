@@ -136,6 +136,80 @@ static void test_toggle(void)
     qtest_quit(qts);
 }
 
+/*
+ * 16-bit count mode (22.5.1(2), Issue #51 F-003): TMO0 follows the
+ * 16-bit compare match, TMO1 the lower 8-bit compare match.
+ */
+static void test_cascade_output(void)
+{
+    QTestState *qts = tmr_init();
+    unsigned base = TMR_BASE;
+
+    select_pad(qts, 0x22, 5); /* P22 = TMO0 */
+    select_pad(qts, 0x26, 5); /* P26 = TMO1 */
+    qtest_writeb(qts, base + TCR, 0x08); /* clear on compare A (16-bit) */
+    qtest_writeb(qts, base + TCORA, 0x01); /* combined TCORA = 0x0180 */
+    qtest_writeb(qts, base + TCORA + 1, 0x80);
+    qtest_writeb(qts, base + TCORB, 0xff);
+    qtest_writeb(qts, base + TCORB + 1, 0x40);
+    qtest_writeb(qts, base + TCSR, 0x03); /* TMO0: toggle on A */
+    qtest_writeb(qts, base + TCSR + 1, 0x03); /* TMO1: toggle on A */
+    assert_pad(qts, 0x22, true, false);
+    assert_pad(qts, 0x26, true, false);
+    qtest_writeb(qts, base + TCCR + 1, 0x0b); /* TMR1: internal /8 */
+    qtest_writeb(qts, base + TCCR, 0x1b); /* TMR0: cascading /8 */
+
+    qtest_clock_step(qts, 32000); /* count 128: low-byte A match */
+    assert_pad(qts, 0x22, true, false);
+    assert_pad(qts, 0x26, true, true);
+    qtest_clock_step(qts, 32000); /* count 256: no A match */
+    assert_pad(qts, 0x22, true, false);
+    assert_pad(qts, 0x26, true, true);
+    qtest_clock_step(qts, 32000); /* count 384: both match, counter clears */
+    assert_pad(qts, 0x22, true, true);
+    assert_pad(qts, 0x26, true, false);
+    qtest_clock_step(qts, 32000); /* count 128 again: low-byte A match */
+    assert_pad(qts, 0x22, true, true);
+    assert_pad(qts, 0x26, true, true);
+    qtest_quit(qts);
+}
+
+/*
+ * Independent channels of one unit running concurrently: channel 0
+ * rescheduling must not disturb channel 1's pending events.
+ */
+static void test_independent_channels(void)
+{
+    QTestState *qts = tmr_init();
+    unsigned base = TMR_BASE;
+
+    select_pad(qts, 0x22, 5); /* P22 = TMO0 */
+    select_pad(qts, 0x26, 5); /* P26 = TMO1 */
+    qtest_writeb(qts, base + TCR, 0x08); /* ch0: clear on compare A */
+    qtest_writeb(qts, base + TCR + 1, 0x08); /* ch1: clear on compare A */
+    qtest_writeb(qts, base + TCORA, 100);
+    qtest_writeb(qts, base + TCORA + 1, 30);
+    qtest_writeb(qts, base + TCORB, 0xff);
+    qtest_writeb(qts, base + TCORB + 1, 0xff);
+    qtest_writeb(qts, base + TCSR, 0x03); /* toggle on A */
+    qtest_writeb(qts, base + TCSR + 1, 0x03);
+    qtest_writeb(qts, base + TCCR, 0x0b); /* internal /8 */
+    qtest_writeb(qts, base + TCCR + 1, 0x0b);
+
+    qtest_clock_step(qts, 7500); /* 30 ticks: ch1 match */
+    assert_pad(qts, 0x22, true, false);
+    assert_pad(qts, 0x26, true, true);
+    qtest_clock_step(qts, 7500); /* 60 ticks: ch1 match */
+    assert_pad(qts, 0x26, true, false);
+    qtest_clock_step(qts, 10000); /* 100 ticks: ch0 match, ch1 at 90 */
+    assert_pad(qts, 0x22, true, true);
+    assert_pad(qts, 0x26, true, true);
+    qtest_clock_step(qts, 5000); /* 120 ticks: ch1 match survives ch0 */
+    assert_pad(qts, 0x22, true, true);
+    assert_pad(qts, 0x26, true, false);
+    qtest_quit(qts);
+}
+
 /* Both selects zero negates the output enable; module stop drops it too. */
 static void test_hiz_and_stop(void)
 {
@@ -288,5 +362,8 @@ int main(int argc, char **argv)
     qtest_add_func("/rx113-tmr/second-unit", test_second_unit);
     qtest_add_func("/rx113-tmr/rtcout", test_rtcout);
     qtest_add_func("/rx113-tmr/migration", test_migration);
+    qtest_add_func("/rx113-tmr/cascade-output", test_cascade_output);
+    qtest_add_func("/rx113-tmr/independent-channels",
+                   test_independent_channels);
     return g_test_run();
 }

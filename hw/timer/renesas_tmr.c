@@ -174,6 +174,25 @@ static void tmr_schedule(RTMRState *s, int ch)
     ticks = MIN(MIN(a, b), overflow);
     s->clock_event[ch] = (a == ticks ? 1 : 0) |
                          (b == ticks ? 2 : 0) | (overflow == ticks ? 4 : 0);
+    if (wide && ch == 0) {
+        /*
+         * Issue #51 (F-003): in 16-bit count mode the lower channel
+         * still compare-matches its own TCORA/TCORB against the low
+         * byte; manual 22.5.1(2) drives TMO1 from those matches.
+         * Channel 1 has no timer of its own in wide mode, so its
+         * pending events ride on channel 0's schedule.
+         */
+        uint32_t la = (s->tcora[1] - (count & 0xff)) & 0xff;
+        uint32_t lb = (s->tcorb[1] - (count & 0xff)) & 0xff;
+
+        la = la ? la : 0x100;
+        lb = lb ? lb : 0x100;
+        if (MIN(la, lb) < ticks) {
+            ticks = MIN(la, lb);
+            s->clock_event[0] = 0;
+        }
+        s->clock_event[1] = (la == ticks ? 1 : 0) | (lb == ticks ? 2 : 0);
+    }
     timer_mod(&s->timer[ch], qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
               renesas_timer_delay(ticks, s->input_freq, div, s->phase[ch]));
 }
@@ -181,6 +200,11 @@ static void tmr_schedule(RTMRState *s, int ch)
 static void tmr_match(RTMRState *s, int ch, unsigned events)
 {
     unsigned clear = FIELD_EX8(s->tcr[ch], TCR, CCLR);
+
+    if (ch == 1 && tmr_wide(s)) {
+        /* Manual 22.5.1(1): TMR1.TCR.CCLR is ignored in wide mode. */
+        clear = 0;
+    }
 
     for (unsigned i = 0; i < 3; i++) {
         if (events & (1 << i)) {
@@ -218,6 +242,10 @@ static void tmr_clock_event(RTMRState *s, int ch)
 
     tmr_sync(s);
     tmr_match(s, ch, events);
+    if (tmr_wide(s) && ch == 0 && s->clock_event[1]) {
+        /* Lower-channel matches scheduled alongside channel 0. */
+        tmr_match(s, 1, s->clock_event[1]);
+    }
     if (!tmr_wide(s) && ch == 0 && (events & 1) &&
         FIELD_EX8(s->tccr[1], TCCR, CSS) == CSS_CASCADING) {
         unsigned cascaded = 0;

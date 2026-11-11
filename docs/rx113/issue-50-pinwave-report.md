@@ -69,6 +69,13 @@ destination). All pass; full rx qtest regression is green
   raises (channel 0 from the wide compares, channel 1 from the
   cascaded low-byte events). Unverified; a candidate for the
   Issue #51-style external cross-check.
+  **Erratum (2026-11-11, Issue #51 F-003):** the premise above was
+  wrong on both counts. Manual 22.5.1(2) does state the behaviour
+  (TMO0 follows the 16-bit match, TMO1 the lower 8-bit match), and
+  the clock-managed path in fact raised no channel-1 events at all
+  in 16-bit count mode, so TMO1 never toggled and CMIA1/CMIB1 never
+  fired. Fixed by the Issue #51 cascade-TMO change; this reading is
+  superseded by findings F-003.
 - When compare A and B coincide on the same tick, B is applied after
   A (the order the event bits are processed in `tmr_match()`).
 - External clock / cascade-input modes keep their existing limits
