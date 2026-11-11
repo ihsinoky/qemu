@@ -39,6 +39,7 @@ struct RX113State {
     DeviceState *cac;
     DeviceState *ctsu;
     DeviceState *usb;
+    DeviceState *lcdc;
     RTMRState tmr[2];
     RCMTState cmt[2];
     RSCIState sci[8];
