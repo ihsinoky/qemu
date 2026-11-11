@@ -232,3 +232,17 @@ with WUNI, and this limitation is stated in the report. Full NMI
 delivery (shared ICU/CPU work, estimated 2-4 days with RX62N
 regression review) remains a separate cross-cutting theme and is
 not folded into Issue #49.
+
+## D-018: OSTSTE write-once is composed with the documented release
+
+Section 21.2.7 marks ICSR3.OSTSTE as modifiable only once after a
+reset, while section 21.3.5 documents clearing OSTSTE as a release
+path from the oscillator-stop high-impedance state; the manual
+states no precedence. Emulation policy, chosen by the PO at the
+Issue #49 stage 3b audit stop from the PMO's options: compose both
+statements with the smallest deviation. Setting OSTSTE (0 to 1) is
+allowed once after a reset. Clearing OSTSTE (1 to 0) is always
+accepted as the documented release operation. After a clear,
+OSTSTE cannot be set again until a reset. The OSTSTF flag-clear
+release path is unaffected. This is an emulation convention for a
+manual inconsistency, not a claim about hardware behaviour.
