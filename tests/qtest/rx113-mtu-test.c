@@ -3157,10 +3157,24 @@ static void test_poe_oscillator(gconstpointer data)
         qtest_writew(qts, POE + 0xe, 0x200);
         g_assert_cmphex(qtest_readw(qts, POE + 0xe), ==, 0x200);
         assert_pad(qts, 0x14, true, true);
-        /* OSTSTE stayed armed: a second stop trips the output again. */
-        qtest_clock_step(qts, 1000000);
+        /*
+         * OSTSTE stayed armed: after the documented recovery (clock
+         * restored, OSTDF cleared), a second stop trips the output
+         * again without any new ICSR3 write.
+         */
+        qtest_set_irq_in(qts, "/machine/mcu/system", "main-clock-failed",
+                         0, 0);
+        qtest_writeb(qts, 0x80040, 0);
+        qtest_writeb(qts, 0x80041, 0);
+        g_assert_cmpuint(qtest_readb(qts, 0x80041), ==, 0);
+        qtest_writeb(qts, 0x80040, 0x81);
+        qtest_set_irq_in(qts, "/machine/mcu/system", "main-clock-failed",
+                         0, 1);
+        qtest_clock_step(qts, 1000001);
+        g_assert_cmpuint(qtest_readb(qts, 0x80041), ==, 1);
         g_assert_cmphex(qtest_readw(qts, POE + 0xe), ==, 0x1200);
         assert_pad(qts, 0x14, false, false);
+        qtest_clock_step(qts, 1000); /* let the stop-cycle window pass */
         qtest_writew(qts, POE + 0xe, 0x200);
         g_assert_cmphex(qtest_readw(qts, POE + 0xe), ==, 0x200);
         assert_pad(qts, 0x14, true, true);
