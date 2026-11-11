@@ -336,3 +336,39 @@ issue instruction, following the manual (R01UH0448EJ0120
   accepted deviation is that a repeated request inside a lazy
   stretch surfaces at the next IWDT access instead of at its
   underflow; see the issue report for the exact conditions.
+
+## D-022: LCDC frame timing model (Issue #61)
+
+Issue #14 modelled the LCDC registers and the logical segment state
+but left the frame timing, the LCD source clock selection and the
+module stop unimplemented. This issue models them, under the
+instruction's requirements, on these PMO-settled points:
+
+- The SYSTEM register file gains LCDSCLKCR/LCDSCLKCR2 (9.2.15-16,
+  PRC0-protected, appended to the table so the migration layout is
+  preserved; SYSTEM VMState version 8). The clock update computes
+  the selected source frequency with the same availability rules as
+  the CAC sources and delivers it to the LCDC; LCDSCLKSTP is folded
+  into the delivered frequency (0 Hz), while MSTPCRD bit 11 is
+  delivered separately as the module-stop flag, which gates the
+  LCDC's MMIO (reads 0, writes dropped, state held, section 11.4)
+  like the other gated peripherals.
+- The scan position is a count of half-LCDCL steps, projected
+  lazily from the virtual clock on observation (no timer). The
+  scan runs while LCDM1.SCOC = 1: section 34.5 starts the common
+  select scan at SCOC, and LCDON only gates whether the display
+  data is applied. Reconfigurations materialize the position
+  under the old settings first.
+- The drive phase follows Figures 34.15 to 34.17: waveform A
+  inverts every half LCDCL period, waveform B every full period.
+  Bias/boost voltages stay analog and unmodelled; the phase and
+  the scan slice are exposed through the fork-local QOM surface
+  alongside `frame-frequency`.
+- The LCDC0 divider tables are per source kind (34.2.3), so the
+  delivery carries the source kind next to the frequency. A code
+  outside the selected table is a prohibited setting: guest-error
+  log and no LCD clock.
+- Consequence for existing tests: the LCDC is module-stopped at
+  reset like every other gated peripheral, so the qtest and the
+  functional guest program now release MSTPCRD bit 11 before use,
+  matching the CTSU precedent and real guest software flow.
