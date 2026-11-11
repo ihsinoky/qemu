@@ -75,7 +75,8 @@ static void rx_restore_state_to_opc(CPUState *cs,
 
 static bool rx_cpu_has_work(CPUState *cs)
 {
-    return cpu_test_interrupt(cs, CPU_INTERRUPT_HARD | CPU_INTERRUPT_FIR);
+    return cpu_test_interrupt(cs, CPU_INTERRUPT_HARD | CPU_INTERRUPT_FIR |
+                              CPU_INTERRUPT_NMI);
 }
 
 static int rx_cpu_mmu_index(CPUState *cs, bool ifunc)
@@ -168,7 +169,17 @@ static void rx_cpu_set_irq(void *opaque, int no, int request)
     static const int mask[] = {
         [RX_CPU_IRQ] = CPU_INTERRUPT_HARD,
         [RX_CPU_FIR] = CPU_INTERRUPT_FIR,
+        [RX_CPU_NMI] = CPU_INTERRUPT_NMI,
     };
+    if (no == RX_CPU_NMI) {
+        /* Level input from the ICU; the level carries no vector/IPL. */
+        if (request) {
+            cpu_interrupt(cs, CPU_INTERRUPT_NMI);
+        } else {
+            cpu_reset_interrupt(cs, CPU_INTERRUPT_NMI);
+        }
+        return;
+    }
     if (irq) {
         cpu->env.req_irq = irq;
         cpu->env.req_ipl = (request >> 8) & 0x0f;
@@ -202,7 +213,7 @@ static void rx_cpu_init(Object *obj)
 {
     RXCPU *cpu = RX_CPU(obj);
 
-    qdev_init_gpio_in(DEVICE(cpu), rx_cpu_set_irq, 2);
+    qdev_init_gpio_in(DEVICE(cpu), rx_cpu_set_irq, 3);
 }
 
 #include "hw/core/sysemu-cpu-ops.h"
