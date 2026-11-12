@@ -1056,9 +1056,269 @@ static void test_migration(void)
     rmdir(dir);
 }
 
+/*
+ * Production adapter tests (Issue #72): a real usb-storage device
+ * is attached to the adapter's bus; no fixture completions are
+ * used. The guest-side register flow mirrors the fixture host
+ * tests, with clock-stepped polling in place of completions.
+ */
+static QTestState *adapter_init(const char *args)
+{
+    QTestState *qts = qtest_init(args);
+
+    qtest_writew(qts, 0x803fe, 0xa503);
+    qtest_writeb(qts, 0x80032, 0);
+    qtest_clock_step(qts, 2048000);
+    qtest_writew(qts, 0x8002c, 0x0b11);
+    qtest_writeb(qts, 0x8002e, 0);
+    qtest_clock_step(qts, 50000);
+    g_assert_cmphex(qtest_readb(qts, 0x8003c) & 0x21, ==, 0x21);
+    qtest_writel(qts, MSTPCRB, RUN_B);
+    wr(qts, 0, 0x401);
+    return qts;
+}
+
+static char *adapter_image(void)
+{
+    char *name = g_strdup("rx113-usb-img-XXXXXX");
+    int fd = g_mkstemp(name);
+
+    g_assert_cmpint(fd, >=, 0);
+    g_assert_cmpint(ftruncate(fd, 1 << 20), ==, 0);
+    close(fd);
+    return name;
+}
+
+/* Poll a register mask while stepping whole 1 ms frames. */
+static void adapter_wait(QTestState *qts, unsigned a, uint16_t mask,
+                         uint16_t want)
+{
+    for (unsigned i = 0; i < 500; i++) {
+        if ((rd(qts, a) & mask) == want) {
+            return;
+        }
+        qtest_clock_step(qts, 1000000);
+    }
+    g_assert_cmphex(rd(qts, a) & mask, ==, want);
+}
+
+static void adapter_host_start(QTestState *qts)
+{
+    wr(qts, 0, 0x461); /* Host mode with pull-downs. */
+    adapter_wait(qts, 0x42, 0x800, 0x800); /* ATTCH from the real device. */
+    wr(qts, 8, 0x40); /* Bus reset: the adapter resets the device. */
+    qtest_clock_step(qts, 1000000);
+    wr(qts, 8, 0x10); /* UACT: SOF starts. */
+    qtest_clock_step(qts, 2000000);
+}
+
+static void adapter_setup(QTestState *qts, uint16_t req, uint16_t val,
+                          uint16_t len)
+{
+    wr(qts, 0x54, req);
+    wr(qts, 0x56, val);
+    wr(qts, 0x58, 0);
+    wr(qts, 0x5a, len);
+    wr(qts, 0x60, 0x4000); /* SUREQ */
+    adapter_wait(qts, 0x60, 0x4000, 0); /* SIGN */
+    g_assert_cmphex(rd(qts, 0x42) & 0x30, ==, 0x10);
+    wr(qts, 0x42, 0xffef);
+}
+
+/* Read the data stage of a control IN transfer from the DCP FIFO. */
+static void adapter_control_in_data(QTestState *qts, uint8_t *out,
+                                    unsigned len)
+{
+    wr(qts, 0x5c, 0x80); /* DCPCFG: receiving, NAK on the short packet. */
+    wr(qts, 0x46, 0xfffe); /* Clear BRDY before arming. */
+    wr(qts, 0x60, 0x81); /* PID=BUF */
+    wr(qts, 0x20, 0x8400); /* CFIFOSEL: pipe 0, RCNT, word access. */
+    adapter_wait(qts, 0x22, 0x2000, 0x2000); /* FRDY */
+    g_assert_cmpuint(rd(qts, 0x22) & 0x1ff, ==, len);
+    for (unsigned i = 0; i < len; i++) {
+        out[i] = qtest_readb(qts, USB + 0x14);
+    }
+    wr(qts, 0x22, 0x4000); /* BCLR */
+}
+
+/* The OUT status stage of a control IN transfer (a ZLP). */
+static void adapter_control_in_status(QTestState *qts)
+{
+    wr(qts, 0x5c, 0x10); /* DCPCFG: transmitting. */
+    wr(qts, 0x20, 0x20);
+    wr(qts, 0x4a, 0xfffe); /* Clear BEMP before arming. */
+    wr(qts, 0x60, 0x81); /* PID=BUF */
+    wr(qts, 0x22, 0x8000); /* BVAL: commit the zero-length packet. */
+    adapter_wait(qts, 0x4a, 1, 1); /* BEMP: the ZLP was sent. */
+    wr(qts, 0x4a, 0xfffe);
+}
+
+/* The IN status stage of a no-data control OUT transfer (a ZLP). */
+static void adapter_control_out_status(QTestState *qts)
+{
+    wr(qts, 0x5c, 0x80);
+    wr(qts, 0x60, 0x81); /* PID=BUF */
+    /* The status ZLP ends the transfer: the DCP falls back to NAK. */
+    adapter_wait(qts, 0x60, 3, 0);
+    wr(qts, 0x20, 0x8400);
+    g_assert_cmphex(rd(qts, 0x22) & 0x1ff, ==, 0);
+    wr(qts, 0x22, 0x4000); /* BCLR */
+}
+
+static void adapter_get_descriptor(QTestState *qts, uint8_t *desc,
+                                   uint16_t vendor)
+{
+    adapter_setup(qts, 0x0680, 0x100, 18);
+    adapter_control_in_data(qts, desc, 18);
+    adapter_control_in_status(qts);
+    g_assert_cmpuint(desc[0], ==, 18);
+    g_assert_cmpuint(desc[1], ==, 1);
+    g_assert_cmphex(desc[8] | (desc[9] << 8), ==, vendor);
+    g_assert_cmphex(desc[10] | (desc[11] << 8), ==, 0x0001);
+}
+
+/*
+ * port=1 pins the device to the root port; without it QEMU
+ * chains an automatic hub onto a one-port bus.
+ */
+static QTestState *adapter_storage_init(const char *image)
+{
+    g_autofree char *args = g_strdup_printf(
+        "-M rx113-r5f51138 -drive if=none,id=msd0,file=%s,format=raw "
+        "-device usb-storage,drive=msd0,bus=usb-bus.0,port=1", image);
+
+    return adapter_init(args);
+}
+
+static void test_adapter_enumerate(void)
+{
+    g_autofree char *image = adapter_image();
+    QTestState *qts = adapter_storage_init(image);
+    uint8_t desc[18];
+
+    adapter_host_start(qts);
+    adapter_get_descriptor(qts, desc, 0x46f4);
+    /* SET_ADDRESS 5, then reach the device at its new address. */
+    adapter_setup(qts, 0x0500, 5, 0);
+    adapter_control_out_status(qts);
+    wr(qts, 0xda, 0x80); /* DEVADD5: full speed. */
+    wr(qts, 0x5e, 0x5040); /* DCPMAXP: DEVSEL=5, MPS=64. */
+    adapter_get_descriptor(qts, desc, 0x46f4);
+    /* SET_CONFIGURATION 1. */
+    adapter_setup(qts, 0x0900, 1, 0);
+    adapter_control_out_status(qts);
+    qtest_quit(qts);
+    unlink(image);
+}
+
+static void test_adapter_storage(void)
+{
+    static const uint8_t cbw[31] = {
+        0x55, 0x53, 0x42, 0x43, 0x01, 0x00, 0x00, 0x00,
+        0x24, 0x00, 0x00, 0x00, 0x80, 0x00, 0x06, 0x12,
+        0x00, 0x00, 0x00, 0x24, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    };
+    g_autofree char *image = adapter_image();
+    QTestState *qts = adapter_storage_init(image);
+    uint8_t desc[18];
+    uint8_t data[36];
+
+    adapter_host_start(qts);
+    adapter_get_descriptor(qts, desc, 0x46f4);
+    adapter_setup(qts, 0x0500, 5, 0);
+    adapter_control_out_status(qts);
+    wr(qts, 0xda, 0x80);
+    wr(qts, 0x5e, 0x5040);
+    adapter_setup(qts, 0x0900, 1, 0);
+    adapter_control_out_status(qts);
+
+    /* Bulk pipes at address 5: pipe 1 IN ep1, pipe 2 OUT ep2. */
+    pipe_config(qts, 1, 0x4001, 0x5040);
+    pipe_config(qts, 2, 0x4012, 0x5040);
+
+    /* CBW (INQUIRY) out on pipe 2. */
+    wr(qts, 0x20, 0x402); /* CFIFOSEL: pipe 2, word access. */
+    wr(qts, 0x72, 1); /* PIPE2CTR: PID=BUF */
+    for (unsigned i = 0; i < 30; i += 2) {
+        qtest_writew(qts, USB + 0x14, cbw[i] | (cbw[i + 1] << 8));
+    }
+    qtest_writeb(qts, USB + 0x14, cbw[30]);
+    wr(qts, 0x22, 0x8000); /* BVAL */
+    adapter_wait(qts, 0x4a, 4, 4); /* BEMP pipe 2 */
+    wr(qts, 0x4a, 0xfffb);
+
+    /*
+     * Arm the IN pipe only now: the BOT device STALLs an IN
+     * token while it still expects a CBW.
+     */
+    wr(qts, 0x70, 1); /* PIPE1CTR: PID=BUF */
+
+    /* INQUIRY data in on pipe 1. */
+    wr(qts, 0x20, 0x8401);
+    adapter_wait(qts, 0x22, 0x2000, 0x2000);
+    g_assert_cmpuint(rd(qts, 0x22) & 0x1ff, ==, 36);
+    for (unsigned i = 0; i < 36; i++) {
+        data[i] = qtest_readb(qts, USB + 0x14);
+    }
+    wr(qts, 0x22, 0x4000); /* BCLR */
+    g_assert_cmpuint(data[0], ==, 0); /* Direct-access device. */
+    g_assert_true(memcmp(data + 8, "QEMU    ", 8) == 0);
+
+    /* CSW in on pipe 1: signature and success status. */
+    adapter_wait(qts, 0x22, 0x2000, 0x2000);
+    g_assert_cmpuint(rd(qts, 0x22) & 0x1ff, ==, 13);
+    for (unsigned i = 0; i < 13; i++) {
+        data[i] = qtest_readb(qts, USB + 0x14);
+    }
+    wr(qts, 0x22, 0x4000);
+    g_assert_cmphex(data[0] | (data[1] << 8) | (data[2] << 16) |
+                    ((uint32_t)data[3] << 24), ==, 0x53425355);
+    g_assert_cmpuint(data[12], ==, 0);
+    qtest_quit(qts);
+    unlink(image);
+}
+
+static void test_adapter_nak(void)
+{
+    QTestState *qts = adapter_init(
+        "-M rx113-r5f51138 -device usb-kbd,bus=usb-bus.0,port=1");
+    uint8_t desc[18];
+
+    adapter_host_start(qts);
+    adapter_get_descriptor(qts, desc, 0x0627);
+    adapter_setup(qts, 0x0900, 1, 0); /* SET_CONFIGURATION 1 */
+    adapter_control_out_status(qts);
+
+    /* Interrupt IN pipe 6, endpoint 1, every second frame. */
+    pipe_config(qts, 6, 0x8001, 8);
+    wr(qts, 0x6e, 1); /* PIPEPERI: IITV=1 */
+    wr(qts, 0x7a, 1); /* PIPE6CTR: PID=BUF */
+    /*
+     * No key is pressed: the device NAKs every poll. A host NAK
+     * is a silent retry (section 27.3.3.2): no status bit, no
+     * error escalation, the pipe stays armed and the polling
+     * simply continues. (This build has no sendkey command, so
+     * a real key report cannot be injected; liveness is proven
+     * by a control transfer afterwards instead.)
+     */
+    for (unsigned i = 0; i < 5; i++) {
+        qtest_clock_step(qts, 1000000);
+    }
+    g_assert_cmphex(rd(qts, 0x46) & 0x40, ==, 0); /* No BRDY. */
+    g_assert_cmphex(rd(qts, 0x48) & 0x40, ==, 0); /* No NRDY. */
+    g_assert_cmphex(rd(qts, 0x42) & 0x20, ==, 0); /* No SERR. */
+    g_assert_cmphex(rd(qts, 0x7a) & 3, ==, 1); /* The pipe stays armed. */
+    adapter_get_descriptor(qts, desc, 0x0627); /* The link is alive. */
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
+    qtest_add_func("/rx113-usb/adapter-enumerate", test_adapter_enumerate);
+    qtest_add_func("/rx113-usb/adapter-storage", test_adapter_storage);
+    qtest_add_func("/rx113-usb/adapter-nak", test_adapter_nak);
     qtest_add_func("/rx113-usb/queued-zlp", test_queued_zlp);
     qtest_add_func("/rx113-usb/wakeup", test_wakeup);
     qtest_add_func("/rx113-usb/periodic-host", test_periodic_host);
