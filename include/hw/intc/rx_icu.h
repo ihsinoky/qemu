@@ -70,6 +70,18 @@ struct RXICUState {
     uint8_t nmiflte;
     uint8_t nmifltc;
     uint8_t nmi_in_level[3];
+    /* RX113 digital filters (section 14.4.7), same opt-in. */
+    uint8_t irqflte;
+    uint16_t irqfltc;
+    uint64_t icu_hz;
+    QEMUTimer *filter_timer;
+    uint8_t irq_filt_raw[8];
+    uint8_t irq_filt_out[8];
+    uint8_t irq_filt_count[8];
+    int64_t irq_filt_next[8];
+    uint8_t nmi_filt_raw;
+    uint8_t nmi_filt_count;
+    int64_t nmi_filt_next;
     int16_t req_irq;
     qemu_irq _irq;
     qemu_irq _fir;
@@ -79,5 +91,8 @@ struct RXICUState {
 
 #define TYPE_RX_ICU "rx-icu"
 OBJECT_DECLARE_SIMPLE_TYPE(RXICUState, RX_ICU)
+
+/* Deliver the ICU clock (ICLK); drives the digital filter timing. */
+void rx_icu_set_clock(DeviceState *dev, uint64_t hz);
 
 #endif /* HW_INTC_RX_ICU_H */

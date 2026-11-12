@@ -26,6 +26,7 @@
 #include "hw/rx/rx113_doc.h"
 #include "hw/rx/rx113_cac.h"
 #include "hw/rx/rx113_ctsu.h"
+#include "hw/intc/rx_icu.h"
 #include "hw/misc/unimp.h"
 #include "hw/core/sysbus.h"
 #include "hw/core/irq.h"
@@ -110,7 +111,7 @@ static const struct {
     [SYS_MSTPCRC] = { 0x18, 4, 0x7ffffffe, 0x8c180001, 2 },
     [SYS_MSTPCRD] = { 0x1c, 4, 0xffffffff, 0x8c00, 2 },
     /* §9.2.1-6: clock selections; PRC0 protects these registers. */
-    [SYS_SCKCR] = { 0x20, 4, 0x33000303, 0xff000f0f, 1 },
+    [SYS_SCKCR] = { 0x20, 4, 0x33000303, 0x0f0f0f0f, 1 },
     [SYS_SCKCR3] = { 0x26, 2, 0, 0x700, 1 },
     [SYS_PLLCR] = { 0x28, 2, 0x0f00, 0x3f03, 1 },
     [SYS_PLLCR2] = { 0x2a, 1, 1, 1, 1 },
@@ -186,9 +187,11 @@ static const struct {
 static void rx113_system_update_clocks(RX113SystemState *s)
 {
     uint64_t source = 0, pclkb = s->mcu->cmt[0].input_freq;
+    uint64_t iclk = s->mcu->cmt[0].input_freq;
     uint64_t pclkd = 0;
     unsigned adiv = extract32(s->regs[SYS_SCKCR], 0, 4);
     unsigned div = extract32(s->regs[SYS_SCKCR], 8, 4);
+    unsigned ick = extract32(s->regs[SYS_SCKCR], 16, 4);
     unsigned select = extract32(s->regs[SYS_SCKCR3], 8, 3);
     unsigned i;
 
@@ -227,6 +230,11 @@ static void rx113_system_update_clocks(RX113SystemState *s)
         goto gates;
     }
     pclkb = source >> div;
+    if (ick > 6) {
+        qemu_log_mask(LOG_GUEST_ERROR, "rx113: prohibited ICLK divider\n");
+        goto gates;
+    }
+    iclk = source >> ick;
     if (adiv <= 6) {
         pclkd = source >> adiv;
     } else {
@@ -280,6 +288,8 @@ gates:
     }
     rx113_ctsu_set_clock(s->mcu->ctsu, pclkb,
                          s->regs[SYS_MSTPCRD] & (1U << 10));
+    /* Section 14.4.7: the ICU digital filters sample on ICLK. */
+    rx_icu_set_clock(DEVICE(&s->mcu->icu), iclk);
     {
         /* §9.2.15-16, §34.2.3: LCD source clock for the LCDC. */
         uint64_t lcd_hz = 0;
