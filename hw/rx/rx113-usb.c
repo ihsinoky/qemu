@@ -174,6 +174,7 @@ struct RX113USBState {
     bool usbip_reset_done;
     bool usbip_pullup;
     bool usbip_vbus_driven;
+    bool usbip_ctrl_finished;
     QTAILQ_HEAD(, RX113UsbipUrb) usbip_urbs;
     uint16_t regs[0x100 / 2];
     RX113USBPipe pipe[10];
@@ -1792,6 +1793,9 @@ static void usbip_urb_finish(RX113USBState *s, RX113UsbipUrb *urb,
     uint32_t actual = 0;
 
     QTAILQ_REMOVE(&s->usbip_urbs, urb, entry);
+    if (urb->control) {
+        s->usbip_ctrl_finished = true;
+    }
     if (c) {
         if (urb->in && status == 0) {
             actual = MIN((uint32_t)urb->data->len, urb->want);
@@ -2060,6 +2064,7 @@ static void rx113_usbip_drive(RX113USBState *s)
     {
         RX113UsbipUrb *next;
 
+        s->usbip_ctrl_finished = false;
         QTAILQ_FOREACH_SAFE(urb, &s->usbip_urbs, entry, next) {
             RX113UsbipUrb *prev;
             bool head = true;
@@ -2078,6 +2083,18 @@ static void rx113_usbip_drive(RX113USBState *s)
                 continue;
             }
             if (urb->control) {
+                if (s->usbip_ctrl_finished) {
+                    /*
+                     * A control transfer finished earlier in this
+                     * drive call.  Do not inject the next SETUP until
+                     * a later drive (frame tick, submit, SYSCFG
+                     * write): on a real bus the next SETUP arrives at
+                     * least a frame after the status stage, and the
+                     * firmware must be able to observe CTSQ returning
+                     * to idle in between (Issue #79).
+                     */
+                    continue;
+                }
                 usbip_drive_control(s, urb);
             } else {
                 usbip_drive_pipe(s, urb);
