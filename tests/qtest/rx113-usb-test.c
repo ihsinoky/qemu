@@ -1451,10 +1451,12 @@ static void usbip_import(QTestState *qts, UsbipClient *c)
 
     memcpy(req + 8, "1-1", 3);
     usbip_send(c, req, sizeof(req));
-    g_assert_true(usbip_fill(qts, c, 8 + 56, 20000));
+    /* OP_REP_IMPORT carries the full 312-byte device record. */
+    g_assert_true(usbip_fill(qts, c, 8 + 312, 20000));
     g_assert_cmphex(c->buf[2] << 8 | c->buf[3], ==, 0x0003);
     g_assert_cmphex(usbip_get32(c->buf + 4), ==, 0);
-    usbip_consume(c, 8 + 56);
+    g_assert_cmpstr((const char *)c->buf + 8 + 256, ==, "1-1");
+    usbip_consume(c, 8 + 312);
     adapter_wait(qts, 0x40, 0x80, 0x80); /* VBSTS follows the import. */
 }
 

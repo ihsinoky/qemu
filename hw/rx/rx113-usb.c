@@ -2094,25 +2094,23 @@ static void rx113_usbip_frame(RX113USBState *s)
     rx113_usbip_drive(s);
 }
 
-static void usbip_rep_device(GByteArray *out, bool with_path)
+static void usbip_rep_device(GByteArray *out)
 {
     static const char path[] = "/sys/devices/rx113-usb/1-1";
     uint8_t rec[312];
 
     memset(rec, 0, sizeof(rec));
-    if (with_path) {
-        memcpy(rec, path, strlen(path));
-        memcpy(rec + 256, USBIP_BUSID, strlen(USBIP_BUSID));
-    } else {
-        memcpy(rec, USBIP_BUSID, strlen(USBIP_BUSID));
-    }
+    memcpy(rec, path, strlen(path));
+    memcpy(rec + 256, USBIP_BUSID, strlen(USBIP_BUSID));
     /* busnum, devnum, speed (full) follow the bus id. */
     rec[288 + 3] = 1;
     rec[288 + 7] = 1;
     rec[288 + 11] = 2;
-    /* The import reply is the same record from the bus id on. */
-    g_byte_array_append(out, rec + (with_path ? 0 : 256),
-                        with_path ? 312 : 56);
+    /*
+     * Both replies carry the whole packed usbip_usb_device
+     * (usbip_protocol.rst, OP_REP_IMPORT table): 312 bytes.
+     */
+    g_byte_array_append(out, rec, sizeof(rec));
 }
 
 static void usbip_handle_submit(RX113USBState *s, RX113UsbipConn *c,
@@ -2215,7 +2213,7 @@ static bool usbip_parse(RX113USBState *s, RX113UsbipConn *c)
                 usbip_put16(out, USBIP_OP_REP_LIST);
                 usbip_put32(out, 0);
                 usbip_put32(out, 1);
-                usbip_rep_device(out, true);
+                usbip_rep_device(out);
                 g_byte_array_remove_range(c->rx, 0, 8);
                 usbip_queue_tx(s, c, out->data, out->len);
                 usbip_flush(s, c);
@@ -2236,7 +2234,7 @@ static bool usbip_parse(RX113USBState *s, RX113UsbipConn *c)
                 usbip_put16(out, USBIP_OP_REP_IMPORT);
                 usbip_put32(out, status);
                 if (!status) {
-                    usbip_rep_device(out, false);
+                    usbip_rep_device(out);
                 }
                 g_byte_array_remove_range(c->rx, 0, 40);
                 usbip_queue_tx(s, c, out->data, out->len);
