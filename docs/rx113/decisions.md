@@ -494,3 +494,32 @@ Stage 2 (RXD sampling) adds:
   Changing a select field or ICLK re-anchors an in-flight
   sequence. Sample counts in flight are not migrated; a load
   restarts a pending sequence from the migrated levels.
+
+## D-027: USB0 production host adapter design (Issue #72)
+
+- The adapter lives inside the rx113-usb device: it creates a
+  USBBus with one root port and bridges at the SIE boundary.
+  Pending host packets are submitted as USBPackets on the
+  core's own frame tick, at most one per pipe per frame;
+  results return through the same completion entry the D-013
+  fixture uses. Guest-visible core behavior is unchanged, and
+  with no device attached the fixture behavior is bit-identical.
+- Attach/detach drive the core's existing line inputs by
+  device speed; while the guest asserts the bus reset, the
+  attached device is reset once per assertion.
+- Addresses resolve through QEMU's `usb_find_device()`:
+  DEVSEL is the device address (DEVADDn is indexed by it).
+  Addresses with no reset device leave packets pending.
+  Hubs - including the one QEMU chains automatically onto a
+  one-free-port bus - are traversed by that lookup; hub
+  enumeration itself is guest firmware's work.
+- Function mode gets no adapter in this issue and stays
+  fixture-driven: there is no gadget-side bus in QEMU to bridge
+  to. Premise corrected by the PO on 2026-11-12: the firmware
+  this model serves is predominantly device-side, so the
+  function adapter is the main remaining theme, split out as
+  Issue #74 with its own topology decision (a USB/IP bridge to
+  host-PC tools is the leading candidate).
+- Adapter state is not migrated; an in-flight packet is
+  abandoned on detach, reset or migration (generation
+  counter) and left for the guest to retry.
