@@ -585,3 +585,17 @@ Stage 2 (RXD sampling) adds:
 - Revisit only if target firmware is found to service WUNI
   without touching IWDT registers; the fix routes and their
   clock-warp constraints stay recorded in Issue #60.
+
+## D-030: The USB/IP bridge paces control transfers to bus timing (Issue #79)
+
+`rx113_usbip_drive()` must not inject a control transfer's SETUP in
+the same drive call that finished the previous control transfer:
+within one call, after a control URB finishes, further control URBs
+wait for the next drive (frame tick, submit, or SYSCFG write).
+Firmware is entitled to observe CTSQ returning to idle between
+transfers, as it always can on a real bus (>= 1 frame between the
+status stage and the next SETUP); a bridge that completes and
+re-arms control transfers inside one evaluation can alias that
+observation away and deadlock polling firmware. Rule of thumb from
+this defect: the bridge must stay at or slower than real bus timing
+in every respect firmware can observe.
