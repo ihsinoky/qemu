@@ -20,6 +20,7 @@ config RX113_MCU
     select RENESAS_SCI
     select UNIMP
     select SPLIT_IRQ
+    select USB
 
 config RX113
     bool

@@ -13,6 +13,7 @@
 #include "qemu/timer.h"
 #include "hw/core/irq.h"
 #include "hw/rx/rx113_usb.h"
+#include "hw/usb/usb.h"
 #include "migration/vmstate.h"
 
 #define SYSCFG     0x00
@@ -116,10 +117,26 @@ typedef struct RX113USBPipe {
     bool tx_ready[2];
 } RX113USBPipe;
 
+/* One in-flight adapter transfer per pipe (Issue #72). */
+typedef struct RX113USBChan {
+    USBPacket packet;
+    uint8_t buf[256];
+    bool busy;
+    bool in;
+    bool setup;
+    uint32_t gen;
+} RX113USBChan;
+
 struct RX113USBState {
     SysBusDevice parent_obj;
     MemoryRegion iomem;
     qemu_irq irq[4]; /* USBI, USBR, D0FIFO, D1FIFO */
+    /* Production host adapter (Issue #72): a real USB bus. */
+    USBBus bus;
+    USBPort port;
+    RX113USBChan chan[10];
+    uint32_t adapter_gen;
+    bool adapter_reset_done;
     uint16_t regs[0x100 / 2];
     RX113USBPipe pipe[10];
     uint64_t uclk;
@@ -153,6 +170,7 @@ static bool usb_active(RX113USBState *s)
 
 static void usb_update_bus(RX113USBState *s);
 static void usb_device_state(RX113USBState *s, unsigned state);
+static void rx113_usb_adapter_reset_check(RX113USBState *s, bool reset);
 
 static bool usb_tx(RX113USBState *s, unsigned n)
 {
@@ -260,7 +278,7 @@ static void usb_vbus(void *opaque, int line, int level)
 }
 
 /* External levels are retained even while the module is stopped/reset. */
-static void usb_attach(void *opaque)
+static void usb_attach_check(void *opaque)
 {
     RX113USBState *s = opaque;
 
@@ -279,6 +297,7 @@ static void usb_attach(void *opaque)
 }
 
 static void usb_frame_pipes(RX113USBState *s);
+static void rx113_usb_adapter_frame(RX113USBState *s);
 
 static void usb_frame(void *opaque)
 {
@@ -290,6 +309,7 @@ static void usb_frame(void *opaque)
     }
     R(s, INTSTS0) |= 0x2000;
     usb_frame_pipes(s);
+    rx113_usb_adapter_frame(s);
     timer_mod(s->frame_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
               (R(s, SYSCFG) & DCFM ? 1000000 : s->sof_period));
     usb_update_irq(s);
@@ -355,6 +375,7 @@ static void usb_update_bus(RX113USBState *s)
         timer_mod(s->attach_timer,
                   qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 2500);
     }
+    rx113_usb_adapter_reset_check(s, reset);
 }
 
 static void usb_line(void *opaque, int pin, int level)
@@ -1280,6 +1301,216 @@ static void usb_sie_completion(Object *obj, const char *str, Error **errp)
     usb_update_irq(s);
 }
 
+/*
+ * Production host adapter (Issue #72, D-027). The core above is a
+ * transaction-level SIE model whose transfers complete only from
+ * explicit inputs; the adapter owns a real USBBus with one root
+ * port, submits the core's pending host packets to the attached
+ * device as USBPackets - at most one per pipe per frame, from
+ * the core's own frame tick - and returns the bus result through
+ * usb_sie_completion(), the same entry the fixture properties
+ * use. Packets for addresses with no attached device stay
+ * pending, so fixture completion keeps working for them, and
+ * with no device attached nothing changes at all.
+ */
+static void rx113_usb_adapter_finish(RX113USBState *s, unsigned n)
+{
+    RX113USBChan *c = &s->chan[n];
+    USBPacket *pkt = &c->packet;
+    g_autofree char *str = NULL;
+    Error *err = NULL;
+    const char *word;
+
+    c->busy = false;
+    if (c->gen != s->adapter_gen) {
+        return; /* The device vanished mid-transfer. */
+    }
+    word = pkt->status == USB_RET_SUCCESS ? NULL :
+           pkt->status == USB_RET_NAK ? "nak" :
+           pkt->status == USB_RET_STALL ? "stall" : "error";
+    if (c->setup) {
+        str = g_strdup_printf("%s:0", word ? word : "ack");
+    } else if (c->in && !word) {
+        GString *hex = g_string_new(NULL);
+
+        for (unsigned i = 0; i < pkt->actual_length; i++) {
+            g_string_append_printf(hex, "%02x", c->buf[i]);
+        }
+        str = g_strdup_printf("rx:%u:%s", n, hex->str);
+        g_string_free(hex, true);
+    } else {
+        str = g_strdup_printf("%s:%u", word ? word : "ack", n);
+    }
+    usb_sie_completion(OBJECT(s), str, &err);
+    if (err) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "rx113-usb: adapter completion %s rejected: %s\n",
+                      str, error_get_pretty(err));
+        error_free(err);
+    }
+}
+
+static void rx113_usb_adapter_submit(RX113USBState *s, unsigned n)
+{
+    RX113USBPipe *p = &s->pipe[n];
+    RX113USBChan *c = &s->chan[n];
+    USBDevice *dev;
+    USBEndpoint *ep;
+    unsigned addr, epnum = 0, mps;
+    int pid;
+    bool in, setup = false;
+
+    if (!s->port.dev || c->busy) {
+        return;
+    }
+    if (!n && (R(s, DCPCTR) & 0x4000)) {
+        /* A setup transaction is pending (SUREQ). */
+        setup = true;
+        in = false;
+        addr = (R(s, DCPMAXP) >> 12) & 0xf;
+        pid = USB_TOKEN_SETUP;
+        mps = 8;
+    } else if (usb_sie_is_tx(s, n)) {
+        if (!p->valid[p->sie]) {
+            return;
+        }
+        in = false;
+        addr = n ? (p->maxp >> 12) & 0xf : (R(s, DCPMAXP) >> 12) & 0xf;
+        epnum = n ? p->cfg & 0xf : 0;
+        pid = USB_TOKEN_OUT;
+        mps = p->length[p->sie];
+    } else {
+        /* A receiving pipe: submit an IN token when it is armed. */
+        if (p->valid[p->sie] || (R(s, CTR(n)) & 3) != 1) {
+            return;
+        }
+        if (n && (!(p->cfg & 0xc000) ||
+                  ((n >= 6 || usb_iso(p)) && (!p->expected || p->seen)))) {
+            return;
+        }
+        in = true;
+        addr = n ? (p->maxp >> 12) & 0xf : (R(s, DCPMAXP) >> 12) & 0xf;
+        epnum = n ? p->cfg & 0xf : 0;
+        pid = USB_TOKEN_IN;
+        mps = n ? p->maxp & 0x1ff : R(s, DCPMAXP) & 0x7f;
+    }
+    dev = usb_find_device(&s->port, addr);
+    if (!dev) {
+        return; /* No reset device at this address: leave it pending. */
+    }
+    ep = usb_ep_get(dev, pid, epnum);
+    if (!ep) {
+        return;
+    }
+    c->busy = true;
+    c->in = in;
+    c->setup = setup;
+    c->gen = s->adapter_gen;
+    usb_packet_setup(&c->packet, pid, ep, 0, 0, false, false);
+    if (setup) {
+        for (unsigned i = 0; i < 4; i++) {
+            stw_le_p(c->buf + 2 * i, R(s, 0x54 + 2 * i));
+        }
+        usb_packet_addbuf(&c->packet, c->buf, 8);
+    } else if (in) {
+        usb_packet_addbuf(&c->packet, c->buf, mps);
+    } else {
+        memcpy(c->buf, p->data[p->sie], p->length[p->sie]);
+        usb_packet_addbuf(&c->packet, c->buf, p->length[p->sie]);
+    }
+    usb_handle_packet(dev, &c->packet);
+    if (c->packet.status != USB_RET_ASYNC) {
+        rx113_usb_adapter_finish(s, n);
+    }
+}
+
+static void rx113_usb_adapter_frame(RX113USBState *s)
+{
+    if (!(R(s, SYSCFG) & DCFM) || !usb_active(s) || !s->port.dev) {
+        return;
+    }
+    for (unsigned n = 0; n < 10; n++) {
+        rx113_usb_adapter_submit(s, n);
+    }
+}
+
+/*
+ * While the guest drives the bus reset (SE0), reset the attached
+ * device once, as a real reset pulse would. Called from
+ * usb_update_bus() because the frame timer does not run then.
+ */
+static void rx113_usb_adapter_reset_check(RX113USBState *s, bool reset)
+{
+    if (!reset || !s->port.dev) {
+        s->adapter_reset_done = false;
+        return;
+    }
+    if (!s->adapter_reset_done) {
+        usb_device_reset(s->port.dev);
+        s->adapter_reset_done = true;
+    }
+}
+
+static void rx113_usb_port_attach(USBPort *port)
+{
+    RX113USBState *s = port->opaque;
+    USBDevice *dev = port->dev;
+
+    if (!dev || !dev->attached) {
+        return;
+    }
+    /* Full-speed devices pull D+ up, low-speed devices D-. */
+    if (dev->speed == USB_SPEED_LOW) {
+        usb_line(s, 1, 1);
+    } else {
+        usb_line(s, 0, 1);
+    }
+}
+
+static void rx113_usb_port_detach(USBPort *port)
+{
+    RX113USBState *s = port->opaque;
+
+    s->adapter_gen++;
+    for (unsigned n = 0; n < 10; n++) {
+        s->chan[n].busy = false;
+    }
+    usb_line(s, 0, 0);
+    usb_line(s, 1, 0);
+}
+
+static void rx113_usb_port_complete(USBPort *port, USBPacket *p)
+{
+    RX113USBState *s = port->opaque;
+
+    for (unsigned n = 0; n < 10; n++) {
+        if (&s->chan[n].packet == p && s->chan[n].busy) {
+            rx113_usb_adapter_finish(s, n);
+            return;
+        }
+    }
+}
+
+static void rx113_usb_port_wakeup(USBPort *port)
+{
+}
+
+static void rx113_usb_bus_wakeup_endpoint(USBBus *bus, USBEndpoint *ep,
+                                          unsigned int stream)
+{
+}
+
+static USBPortOps rx113_usb_port_ops = {
+    .attach = rx113_usb_port_attach,
+    .detach = rx113_usb_port_detach,
+    .wakeup = rx113_usb_port_wakeup,
+    .complete = rx113_usb_port_complete,
+};
+
+static USBBusOps rx113_usb_bus_ops = {
+    .wakeup_endpoint = rx113_usb_bus_wakeup_endpoint,
+};
+
 /* Explicit SOF reception starts the function's documented interpolation. */
 static void usb_sie_sof(Object *obj, const char *str, Error **errp)
 {
@@ -1451,6 +1682,11 @@ static void rx113_usb_reset_hold(Object *obj, ResetType type)
 {
     RX113USBState *s = RX113_USB(obj);
 
+    s->adapter_gen++;
+    s->adapter_reset_done = false;
+    for (unsigned n = 0; n < 10; n++) {
+        s->chan[n].busy = false;
+    }
     s->control_data = s->auto_address = false;
     s->pending_stage = s->address = 0;
     s->sof_received = false;
@@ -1521,6 +1757,10 @@ static int rx113_usb_post_load(void *opaque, int version_id)
             }
         }
     }
+    s->adapter_gen++;
+    for (unsigned n = 0; n < 10; n++) {
+        s->chan[n].busy = false;
+    }
     usb_update_irq(s);
     return 0;
 }
@@ -1564,7 +1804,7 @@ static void rx113_usb_init(Object *obj)
     RX113USBState *s = RX113_USB(obj);
 
     s->stopped = true;
-    s->attach_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, usb_attach, s);
+    s->attach_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, usb_attach_check, s);
     s->frame_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, usb_frame, s);
     s->wake_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, usb_wake, s);
     memory_region_init_io(&s->iomem, obj, &rx113_usb_ops, s,
@@ -1585,6 +1825,12 @@ static void rx113_usb_init(Object *obj)
     object_property_add_str(obj, "sie-token", NULL, usb_sie_token);
     object_property_add_str(obj, "bus-event", NULL, usb_bus_event);
     object_property_add_str(obj, "sie-tx", usb_sie_tx, NULL);
+    usb_bus_new(&s->bus, sizeof(s->bus), &rx113_usb_bus_ops, DEVICE(obj));
+    usb_register_port(&s->bus, &s->port, s, 0, &rx113_usb_port_ops,
+                      USB_SPEED_MASK_LOW | USB_SPEED_MASK_FULL);
+    for (unsigned n = 0; n < 10; n++) {
+        usb_packet_init(&s->chan[n].packet);
+    }
 }
 
 static void rx113_usb_finalize(Object *obj)
