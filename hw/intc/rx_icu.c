@@ -26,6 +26,7 @@
 #include "qemu/osdep.h"
 #include "qemu/log.h"
 #include "qemu/error-report.h"
+#include "qemu/timer.h"
 #include "qapi/error.h"
 #include "hw/core/irq.h"
 #include "hw/core/registerfields.h"
@@ -61,9 +62,11 @@ REG8(NMICLR, 0x582)
   FIELD(NMICLR, OSTCLR, 2, 1)
 REG8(NMICR, 0x583)
   FIELD(NMICR, NMIMD, 3, 1)
+REG8(IRQFLTE0, 0x510)
+REG16(IRQFLTC0, 0x514)
 REG8(NMIFLTE, 0x590)
   FIELD(NMIFLTE, NFLTEN, 0, 1)
-REG8(NMIFLTC, 0x591)
+REG8(NMIFLTC, 0x594)
   FIELD(NMIFLTC, NFCLKSEL, 0, 2)
 
 /* RX113 NMISR/NMIER/NMICLR share one bit layout (manual 14.2.10-14.2.12). */
@@ -75,31 +78,59 @@ enum {
     RXICU_NMI_IWDT = 2,
 };
 
+static void rxicu_filter_feed_nmi(RXICUState *icu, int level);
+static void rxicu_filter_feed_irq(RXICUState *icu, unsigned pin, int level);
+
 static void rxicu_nmi_update(RXICUState *icu)
 {
     qemu_set_irq(icu->_nmi,
                  (icu->nmisr & icu->nmier & RX113_NMI_BITS) != 0);
 }
 
-static void rxicu_nmi_input(RXICUState *icu, int src, int level)
+static bool rxicu_nmi_filter_on(RXICUState *icu)
 {
-    bool prev = icu->nmi_in_level[src] != 0;
+    return icu->nmi_rx113 && (icu->nmiflte & R_NMIFLTE_NFLTEN_MASK);
+}
+
+/* Edge detection on the (possibly filtered) NMI pin level. */
+static void rxicu_nmi_pin_detect(RXICUState *icu, int level)
+{
+    bool prev = icu->nmi_in_level[RXICU_NMI_PIN] != 0;
     bool edge;
 
+    icu->nmi_in_level[RXICU_NMI_PIN] = level != 0;
+    /* NMICR.NMIMD: 0 = falling edge, 1 = rising edge. */
+    edge = (icu->nmicr & R_NMICR_NMIMD_MASK) ? (!prev && level != 0)
+                                             : (prev && level == 0);
+    if (edge) {
+        icu->nmisr |= R_NMISR_NMIST_MASK;
+        rxicu_nmi_update(icu);
+    }
+}
+
+static void rxicu_nmi_input(RXICUState *icu, int src, int level)
+{
+    bool prev, edge;
+
+    if (src == RXICU_NMI_PIN && icu->nmi_rx113) {
+        if (rxicu_nmi_filter_on(icu)) {
+            rxicu_filter_feed_nmi(icu, level);
+        } else {
+            icu->nmi_filt_raw = level != 0;
+            icu->nmi_filt_count = 0;
+            icu->nmi_filt_next = -1;
+            rxicu_nmi_pin_detect(icu, level);
+        }
+        return;
+    }
+    prev = icu->nmi_in_level[src] != 0;
     icu->nmi_in_level[src] = level != 0;
     if (!icu->nmi_rx113) {
         return;
     }
-    if (src == RXICU_NMI_PIN) {
-        /* NMICR.NMIMD: 0 = falling edge, 1 = rising edge. */
-        edge = (icu->nmicr & R_NMICR_NMIMD_MASK) ? (!prev && level != 0)
-                                                 : (prev && level == 0);
-    } else {
-        edge = !prev && level != 0;
-    }
+    edge = !prev && level != 0;
     if (edge) {
-        icu->nmisr |= src == RXICU_NMI_PIN ? R_NMISR_NMIST_MASK :
-                      src == RXICU_NMI_OST ? 0x02 : 0x08;
+        icu->nmisr |= src == RXICU_NMI_OST ? 0x02 : 0x08;
         rxicu_nmi_update(icu);
     }
 }
@@ -163,16 +194,10 @@ static void rxicu_request(RXICUState *icu, int n_IRQ)
     }
 }
 
-static void rxicu_set_irq(void *opaque, int n_IRQ, int level)
+static void rxicu_deliver_irq(RXICUState *icu, int n_IRQ, int level)
 {
-    RXICUState *icu = opaque;
     struct IRQSource *src;
     int issue;
-
-    if (n_IRQ >= NR_IRQS) {
-        error_report("%s: IRQ %d out of range", __func__, n_IRQ);
-        return;
-    }
 
     src = &icu->src[n_IRQ];
 
@@ -211,6 +236,220 @@ static void rxicu_set_irq(void *opaque, int n_IRQ, int level)
         icu->ir[n_IRQ] = 1;
         rxicu_request(icu, n_IRQ);
     }
+}
+
+static void rxicu_set_irq(void *opaque, int n_IRQ, int level)
+{
+    RXICUState *icu = opaque;
+
+    if (n_IRQ >= NR_IRQS) {
+        error_report("%s: IRQ %d out of range", __func__, n_IRQ);
+        return;
+    }
+    if (n_IRQ >= 64 && n_IRQ < 72 && icu->nmi_rx113) {
+        unsigned pin = n_IRQ - 64;
+
+        if (icu->irqflte & (1 << pin)) {
+            rxicu_filter_feed_irq(icu, pin, level);
+            return;
+        }
+        /* Passthrough: keep the filter state in sync. */
+        icu->irq_filt_raw[pin] = level != 0;
+        icu->irq_filt_out[pin] = level != 0;
+        icu->irq_filt_count[pin] = 0;
+        icu->irq_filt_next[pin] = -1;
+    }
+    rxicu_deliver_irq(icu, n_IRQ, level);
+}
+
+/*
+ * Section 14.4.7 digital filters. A filtered output level changes
+ * only after the input has been sampled at the new level three
+ * times in a row; the sampling phase is anchored at the moment
+ * the input diverges from the output. One timer serves all
+ * channels, armed at the earliest pending sample.
+ */
+static int64_t rxicu_filter_period(RXICUState *icu, unsigned sel)
+{
+    static const unsigned div[] = { 1, 8, 32, 64 };
+
+    if (icu->icu_hz == 0) {
+        return 0;
+    }
+    return (int64_t)(NANOSECONDS_PER_SECOND * div[sel & 3] / icu->icu_hz);
+}
+
+static bool rxicu_irq_filter_on(RXICUState *icu, unsigned pin)
+{
+    return icu->nmi_rx113 && (icu->irqflte & (1 << pin));
+}
+
+static void rxicu_filter_arm(RXICUState *icu)
+{
+    int64_t best = -1;
+
+    if (rxicu_nmi_filter_on(icu) && icu->nmi_filt_next >= 0) {
+        best = icu->nmi_filt_next;
+    }
+    for (unsigned i = 0; i < 8; i++) {
+        if (rxicu_irq_filter_on(icu, i) && icu->irq_filt_next[i] >= 0 &&
+            (best < 0 || icu->irq_filt_next[i] < best)) {
+            best = icu->irq_filt_next[i];
+        }
+    }
+    if (best >= 0) {
+        timer_mod(icu->filter_timer, best);
+    } else {
+        timer_del(icu->filter_timer);
+    }
+}
+
+/* Restart an in-flight sample sequence under current settings. */
+static void rxicu_filter_kick(RXICUState *icu, uint8_t raw, uint8_t out,
+                                uint8_t *count, int64_t *next,
+                                int64_t period)
+{
+    *count = 0;
+    if (raw != out && period > 0) {
+        *next = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + period;
+    } else {
+        *next = -1;
+    }
+}
+
+static void rxicu_filter_feed_nmi(RXICUState *icu, int level)
+{
+    uint8_t out = icu->nmi_in_level[RXICU_NMI_PIN];
+
+    icu->nmi_filt_raw = level != 0;
+    if (icu->nmi_filt_raw == out) {
+        icu->nmi_filt_count = 0;
+        icu->nmi_filt_next = -1;
+    } else if (icu->nmi_filt_next < 0) {
+        rxicu_filter_kick(icu, icu->nmi_filt_raw, out,
+                          &icu->nmi_filt_count, &icu->nmi_filt_next,
+                          rxicu_filter_period(icu, icu->nmifltc & 3));
+    }
+    rxicu_filter_arm(icu);
+}
+
+static void rxicu_filter_feed_irq(RXICUState *icu, unsigned pin, int level)
+{
+    icu->irq_filt_raw[pin] = level != 0;
+    if (icu->irq_filt_raw[pin] == icu->irq_filt_out[pin]) {
+        icu->irq_filt_count[pin] = 0;
+        icu->irq_filt_next[pin] = -1;
+    } else if (icu->irq_filt_next[pin] < 0) {
+        rxicu_filter_kick(icu, icu->irq_filt_raw[pin],
+                          icu->irq_filt_out[pin],
+                          &icu->irq_filt_count[pin],
+                          &icu->irq_filt_next[pin],
+                          rxicu_filter_period(icu,
+                                              (icu->irqfltc >> (2 * pin))
+                                              & 3));
+    }
+    rxicu_filter_arm(icu);
+}
+
+/* Take every due sample of one channel; return true on a flip. */
+static bool rxicu_filter_sample(int64_t now, uint8_t raw, uint8_t out,
+                                uint8_t *count, int64_t *next,
+                                int64_t period)
+{
+    if (period <= 0) {
+        return false;
+    }
+    while (*next >= 0 && *next <= now) {
+        if (raw == out) {
+            *count = 0;
+            *next = -1;
+            return false;
+        }
+        (*count)++;
+        if (*count >= 3) {
+            *count = 0;
+            *next = -1;
+            return true;
+        }
+        *next += period;
+    }
+    return false;
+}
+
+static void rxicu_filter_timer(void *opaque)
+{
+    RXICUState *icu = opaque;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    if (rxicu_nmi_filter_on(icu) &&
+        rxicu_filter_sample(now, icu->nmi_filt_raw,
+                            icu->nmi_in_level[RXICU_NMI_PIN],
+                            &icu->nmi_filt_count, &icu->nmi_filt_next,
+                            rxicu_filter_period(icu, icu->nmifltc & 3))) {
+        rxicu_nmi_pin_detect(icu, icu->nmi_filt_raw);
+    }
+    for (unsigned i = 0; i < 8; i++) {
+        if (rxicu_irq_filter_on(icu, i) &&
+            rxicu_filter_sample(now, icu->irq_filt_raw[i],
+                                icu->irq_filt_out[i],
+                                &icu->irq_filt_count[i],
+                                &icu->irq_filt_next[i],
+                                rxicu_filter_period(icu,
+                                                    (icu->irqfltc >> (2 * i))
+                                                    & 3))) {
+            icu->irq_filt_out[i] = icu->irq_filt_raw[i];
+            rxicu_deliver_irq(icu, 64 + i, icu->irq_filt_out[i]);
+        }
+    }
+    rxicu_filter_arm(icu);
+}
+
+/* NFLTEN fell: the output follows the input at once. */
+static void rxicu_filter_sync_nmi(RXICUState *icu)
+{
+    icu->nmi_filt_count = 0;
+    icu->nmi_filt_next = -1;
+    rxicu_nmi_pin_detect(icu, icu->nmi_filt_raw);
+}
+
+/* FLTENi fell: the output follows the input at once. */
+static void rxicu_filter_sync_irq(RXICUState *icu, unsigned pin)
+{
+    icu->irq_filt_count[pin] = 0;
+    icu->irq_filt_next[pin] = -1;
+    if (icu->irq_filt_out[pin] != icu->irq_filt_raw[pin]) {
+        icu->irq_filt_out[pin] = icu->irq_filt_raw[pin];
+        rxicu_deliver_irq(icu, 64 + pin, icu->irq_filt_out[pin]);
+    }
+}
+
+void rx_icu_set_clock(DeviceState *dev, uint64_t hz)
+{
+    RXICUState *icu = RX_ICU(dev);
+
+    if (!icu->nmi_rx113 || icu->icu_hz == hz) {
+        return;
+    }
+    icu->icu_hz = hz;
+    /* Re-anchor any in-flight sequence under the new period. */
+    if (rxicu_nmi_filter_on(icu)) {
+        rxicu_filter_kick(icu, icu->nmi_filt_raw,
+                          icu->nmi_in_level[RXICU_NMI_PIN],
+                          &icu->nmi_filt_count, &icu->nmi_filt_next,
+                          rxicu_filter_period(icu, icu->nmifltc & 3));
+    }
+    for (unsigned i = 0; i < 8; i++) {
+        if (rxicu_irq_filter_on(icu, i)) {
+            rxicu_filter_kick(icu, icu->irq_filt_raw[i],
+                              icu->irq_filt_out[i],
+                              &icu->irq_filt_count[i],
+                              &icu->irq_filt_next[i],
+                              rxicu_filter_period(icu,
+                                                  (icu->irqfltc >> (2 * i))
+                                                  & 3));
+        }
+    }
+    rxicu_filter_arm(icu);
 }
 
 static void rxicu_ack_irq(void *opaque, int no, int level)
@@ -252,8 +491,9 @@ static uint64_t icu_read(void *opaque, hwaddr addr, unsigned size)
     RXICUState *icu = opaque;
     int reg = addr & 0xff;
 
-    if ((addr != A_FIR && size != 1) ||
-        (addr == A_FIR && size != 2)) {
+    if ((addr != A_FIR && addr != A_IRQFLTC0 && size != 1) ||
+        (addr == A_FIR && size != 2) ||
+        (addr == A_IRQFLTC0 && size > 2)) {
         qemu_log_mask(LOG_GUEST_ERROR, "rx_icu: Invalid read size 0x%"
                                        HWADDR_PRIX "\n",
                       addr);
@@ -283,8 +523,26 @@ static uint64_t icu_read(void *opaque, hwaddr addr, unsigned size)
     case A_DMRSR + 8:
     case A_DMRSR + 12:
         return icu->dmasr[reg >> 2];
-    case A_IRQCR ... A_IRQCR + 0x1f:
+    case A_IRQCR ... A_IRQCR + 7:
         return icu->src[64 + reg].sense << R_IRQCR_IRQMD_SHIFT;
+    case A_IRQFLTE0:
+        if (icu->nmi_rx113) {
+            return icu->irqflte;
+        }
+        qemu_log_mask(LOG_UNIMP, "rx_icu: Register 0x%" HWADDR_PRIX " "
+                                 "not implemented.\n", addr);
+        return UINT64_MAX;
+    case A_IRQFLTC0:
+    case A_IRQFLTC0 + 1:
+        if (icu->nmi_rx113) {
+            if (size == 2) {
+                return icu->irqfltc;
+            }
+            return (icu->irqfltc >> (8 * (addr - A_IRQFLTC0))) & 0xff;
+        }
+        qemu_log_mask(LOG_UNIMP, "rx_icu: Register 0x%" HWADDR_PRIX " "
+                                 "not implemented.\n", addr);
+        return UINT64_MAX;
     case A_NMISR:
         return icu->nmi_rx113 ? icu->nmisr & RX113_NMI_BITS : 0;
     case A_NMICLR:
@@ -321,8 +579,9 @@ static void icu_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
     RXICUState *icu = opaque;
     int reg = addr & 0xff;
 
-    if ((addr != A_FIR && size != 1) ||
-        (addr == A_FIR && size != 2)) {
+    if ((addr != A_FIR && addr != A_IRQFLTC0 && size != 1) ||
+        (addr == A_FIR && size != 2) ||
+        (addr == A_IRQFLTC0 && size > 2)) {
         qemu_log_mask(LOG_GUEST_ERROR, "rx_icu: Invalid write size at "
                                        "0x%" HWADDR_PRIX "\n",
                       addr);
@@ -365,8 +624,56 @@ static void icu_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
         icu->dmasr[reg >> 2] = val;
         qemu_log_mask(LOG_UNIMP, "rx_icu: DMAC not implemented\n");
         break;
-    case A_IRQCR ... A_IRQCR + 0x1f:
+    case A_IRQCR ... A_IRQCR + 7:
         icu->src[64 + reg].sense = val >> R_IRQCR_IRQMD_SHIFT;
+        break;
+    case A_IRQFLTE0:
+        if (icu->nmi_rx113) {
+            uint8_t old = icu->irqflte;
+
+            icu->irqflte = val & 0xff;
+            for (unsigned i = 0; i < 8; i++) {
+                if ((old & (1 << i)) && !(icu->irqflte & (1 << i))) {
+                    rxicu_filter_sync_irq(icu, i);
+                } else if (!(old & (1 << i)) && (icu->irqflte & (1 << i))) {
+                    icu->irq_filt_count[i] = 0;
+                    icu->irq_filt_next[i] = -1;
+                }
+            }
+            rxicu_filter_arm(icu);
+        } else {
+            qemu_log_mask(LOG_UNIMP, "rx_icu: Register 0x%" HWADDR_PRIX " "
+                                     "not implemented.\n", addr);
+        }
+        break;
+    case A_IRQFLTC0:
+    case A_IRQFLTC0 + 1:
+        if (icu->nmi_rx113) {
+            if (size == 2) {
+                icu->irqfltc = val & 0xffff;
+            } else {
+                unsigned shift = 8 * (addr - A_IRQFLTC0);
+
+                icu->irqfltc = (icu->irqfltc & ~(0xff << shift)) |
+                               ((val & 0xff) << shift);
+            }
+            for (unsigned i = 0; i < 8; i++) {
+                if (rxicu_irq_filter_on(icu, i) &&
+                    icu->irq_filt_next[i] >= 0) {
+                    rxicu_filter_kick(icu, icu->irq_filt_raw[i],
+                                      icu->irq_filt_out[i],
+                                      &icu->irq_filt_count[i],
+                                      &icu->irq_filt_next[i],
+                                      rxicu_filter_period(icu,
+                                                          (icu->irqfltc
+                                                           >> (2 * i)) & 3));
+                }
+            }
+            rxicu_filter_arm(icu);
+        } else {
+            qemu_log_mask(LOG_UNIMP, "rx_icu: Register 0x%" HWADDR_PRIX " "
+                                     "not implemented.\n", addr);
+        }
         break;
     case A_NMISR:
         if (!icu->nmi_rx113) {
@@ -399,7 +706,16 @@ static void icu_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
         break;
     case A_NMIFLTE:
         if (icu->nmi_rx113) {
+            bool was = rxicu_nmi_filter_on(icu);
+
             icu->nmiflte = val & R_NMIFLTE_NFLTEN_MASK;
+            if (was && !rxicu_nmi_filter_on(icu)) {
+                rxicu_filter_sync_nmi(icu);
+            } else if (!was && rxicu_nmi_filter_on(icu)) {
+                icu->nmi_filt_count = 0;
+                icu->nmi_filt_next = -1;
+            }
+            rxicu_filter_arm(icu);
         } else {
             qemu_log_mask(LOG_UNIMP, "rx_icu: Register 0x%" HWADDR_PRIX " "
                                      "not implemented.\n", addr);
@@ -408,6 +724,15 @@ static void icu_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
     case A_NMIFLTC:
         if (icu->nmi_rx113) {
             icu->nmifltc = val & R_NMIFLTC_NFCLKSEL_MASK;
+            if (rxicu_nmi_filter_on(icu) && icu->nmi_filt_next >= 0) {
+                rxicu_filter_kick(icu, icu->nmi_filt_raw,
+                                  icu->nmi_in_level[RXICU_NMI_PIN],
+                                  &icu->nmi_filt_count,
+                                  &icu->nmi_filt_next,
+                                  rxicu_filter_period(icu,
+                                                      icu->nmifltc & 3));
+                rxicu_filter_arm(icu);
+            }
         } else {
             qemu_log_mask(LOG_UNIMP, "rx_icu: Register 0x%" HWADDR_PRIX " "
                                      "not implemented.\n", addr);
@@ -472,6 +797,13 @@ static void rxicu_init(Object *obj)
                           icu, "rx-icu", 0x600);
     sysbus_init_mmio(d, &icu->memory);
 
+    icu->filter_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                     rxicu_filter_timer, icu);
+    icu->nmi_filt_next = -1;
+    for (unsigned i = 0; i < 8; i++) {
+        icu->irq_filt_next[i] = -1;
+    }
+
     qdev_init_gpio_in(DEVICE(d), rxicu_set_irq, NR_IRQS);
     qdev_init_gpio_in_named(DEVICE(d), rxicu_ack_irq, "ack", 1);
     qdev_init_gpio_in_named(DEVICE(d), rxicu_nmi_pin, "nmi-pin", 1);
@@ -497,13 +829,42 @@ static int rxicu_post_load(void *opaque, int version_id)
     if (icu->nmi_rx113) {
         rxicu_nmi_update(icu);
     }
+    if (version_id >= 4) {
+        /* In-flight sample sequences restart after a load. */
+        for (unsigned i = 0; i < 8; i++) {
+            icu->irq_filt_count[i] = 0;
+            icu->irq_filt_next[i] = -1;
+            if (rxicu_irq_filter_on(icu, i)) {
+                icu->src[64 + i].level = icu->irq_filt_out[i];
+                if (icu->irq_filt_raw[i] != icu->irq_filt_out[i]) {
+                    rxicu_filter_kick(icu, icu->irq_filt_raw[i],
+                                      icu->irq_filt_out[i],
+                                      &icu->irq_filt_count[i],
+                                      &icu->irq_filt_next[i],
+                                      rxicu_filter_period(icu,
+                                                          (icu->irqfltc
+                                                           >> (2 * i)) & 3));
+                }
+            }
+        }
+        icu->nmi_filt_count = 0;
+        icu->nmi_filt_next = -1;
+        if (rxicu_nmi_filter_on(icu) &&
+            icu->nmi_filt_raw != icu->nmi_in_level[RXICU_NMI_PIN]) {
+            rxicu_filter_kick(icu, icu->nmi_filt_raw,
+                              icu->nmi_in_level[RXICU_NMI_PIN],
+                              &icu->nmi_filt_count, &icu->nmi_filt_next,
+                              rxicu_filter_period(icu, icu->nmifltc & 3));
+        }
+        rxicu_filter_arm(icu);
+    }
     return 0;
 }
 
 static const VMStateDescription vmstate_rxicu = {
     .name = "rx-icu",
     /* Version 2 checks the configured count before loading IPR bytes. */
-    .version_id = 3,
+    .version_id = 4,
     .minimum_version_id = 2,
     .post_load = rxicu_post_load,
     .fields = (const VMStateField[]) {
@@ -522,6 +883,12 @@ static const VMStateDescription vmstate_rxicu = {
         VMSTATE_UINT8_V(nmiflte, RXICUState, 3),
         VMSTATE_UINT8_V(nmifltc, RXICUState, 3),
         VMSTATE_UINT8_ARRAY_V(nmi_in_level, RXICUState, 3, 3),
+        VMSTATE_UINT8_V(irqflte, RXICUState, 4),
+        VMSTATE_UINT16_V(irqfltc, RXICUState, 4),
+        VMSTATE_UINT64_V(icu_hz, RXICUState, 4),
+        VMSTATE_UINT8_ARRAY_V(irq_filt_raw, RXICUState, 8, 4),
+        VMSTATE_UINT8_ARRAY_V(irq_filt_out, RXICUState, 8, 4),
+        VMSTATE_UINT8_V(nmi_filt_raw, RXICUState, 4),
         VMSTATE_INT16(req_irq, RXICUState),
         VMSTATE_END_OF_LIST()
     }

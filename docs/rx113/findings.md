@@ -4,6 +4,28 @@ Empirical findings from external verification of emulation premises
 (Issue #51). Format per entry: conclusion, confidence, conditions,
 evidence, validity boundary, promoted-to. Newest first.
 
+## F-006: The RX113 MTU TSR has no match flags; the constant TSR read is conforming (2026-11-12)
+
+- **Conclusion:** There is nothing to store. Section 20.2.6 of
+  R01UH0448EJ0120 defines the RX113 (MTU2a) TSR as: bits 5 to 0
+  reserved ("read as undefined"), bit 6 reserved (read as 1), and
+  bit 7 the TCFD count-direction flag. No TGFA-TGFF compare-match
+  or capture flags exist in this variant, unlike other MTU
+  generations. The model's TSR read (0xff counting up, 0x7f
+  counting down) therefore conforms: TCFD tracks direction and
+  the reserved bits read as a permitted value.
+- **Confidence:** Proven (from the project manual itself).
+- **Evidence:** R01UH0448EJ0120 section 20.2.6, register diagram
+  and bit table (manual page 423).
+- **Validity boundary:** TCFD for MTU0 is also reserved (read as
+  1); the model returns the direction there too, which is inside
+  the "undefined" latitude. Guest software must not rely on the
+  reserved bits, so no behaviour change follows either way.
+- **Promoted-to:** Issue #70. Closes the "TSR flag storage" item
+  recorded as an out-of-scope gap in the Issue #68 report and
+  D-025; an erratum in the Issue #68 report points here. The
+  candidate theme does not exist and is not to be re-proposed.
+
 ## F-001: ICSR3.OSTSTE is write-once; the D-018 "clear always accepted" reading is probably wrong (2026-11-11)
 
 - **Conclusion:** On real hardware, POE2a's configuration registers —

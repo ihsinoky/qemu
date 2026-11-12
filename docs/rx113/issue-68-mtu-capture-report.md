@@ -55,6 +55,10 @@ rule is recorded as part of D-025.
   (reads return a constant); that is an MTU-wide pre-existing
   gap affecting compare matches and overflows equally, and is
   left for a separate theme rather than fixed for capture only.
+  *Erratum (2026-11-12, Issue #70): this item was wrong. The
+  RX113 TSR has no match flags at all (manual section 20.2.6);
+  the constant read is conforming. See findings entry F-006.*
+
 - Capture in PWM / complementary / reset-synchronized modes:
   gated to normal mode, mirroring the ELC operation precedent.
 

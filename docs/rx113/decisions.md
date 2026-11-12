@@ -474,3 +474,23 @@ Stage 2 (RXD sampling) adds:
   return a constant) and is deliberately not fixed here; capture
   raises its interrupt and ELC event through the same path as a
   compare match, like every other MTU event source.
+
+## D-026: ICU digital filter model (Issue #70)
+
+- The filters of section 14.4.7 (NMI pin via NMIFLTE/NMIFLTC,
+  IRQ0-7 via IRQFLTE0/IRQFLTC0) sample on ICLK, which SYSTEM
+  delivers to the ICU through rx_icu_set_clock(); the manual's
+  "PCLK" for the ICU is its own operating clock. Dividers are
+  1/8/32/64 per the select fields.
+- Sampling phase: the three-match rule is evaluated on a
+  sampling cadence anchored at the moment the input diverges
+  from the filtered output, not on a free-running phase the
+  guest could never observe anyway. A flip is therefore
+  delivered between two and three sampling periods after the
+  input settles, and any pulse shorter than three periods is
+  removed.
+- Disabling a filter passes the input through immediately
+  (figure 14.7); enabling starts from the current level.
+  Changing a select field or ICLK re-anchors an in-flight
+  sequence. Sample counts in flight are not migrated; a load
+  restarts a pending sequence from the migrated levels.
