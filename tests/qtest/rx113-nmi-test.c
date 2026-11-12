@@ -21,7 +21,11 @@
 #define NMICLR (ICU + 0x582)
 #define NMICR (ICU + 0x583)
 #define NMIFLTE (ICU + 0x590)
-#define NMIFLTC (ICU + 0x591)
+#define NMIFLTC (ICU + 0x594)
+#define IRQCR0 (ICU + 0x500)
+#define IRQFLTE0 (ICU + 0x510)
+#define IRQFLTC0 (ICU + 0x514)
+#define IR64 (ICU + 64)
 
 #define RAM_BOOT 0x1000
 #define RAM_MARK 0x1004
@@ -294,6 +298,118 @@ static void test_delivery_iwdt(void)
     qtest_quit(qts);
 }
 
+/* ICLK = HOCO 32 MHz / 8 = 4 MHz: one filter cycle is 250 ns. */
+static void filter_clock_init(QTestState *qts)
+{
+    qtest_writew(qts, 0x803fe, 0xa503); /* PRCR: unlock clock regs */
+    qtest_writew(qts, 0x80026, 0x100); /* SCKCR3: HOCO selected */
+    qtest_writel(qts, 0x80020, 0x00030000); /* SCKCR: ICK = /8 */
+}
+
+static void test_filter_registers(void)
+{
+    QTestState *qts = qtest_init("-M rx113-r5f51138");
+
+    g_assert_cmphex(qtest_readb(qts, IRQFLTE0), ==, 0);
+    g_assert_cmphex(qtest_readw(qts, IRQFLTC0), ==, 0);
+    qtest_writeb(qts, IRQFLTE0, 0xa5);
+    g_assert_cmphex(qtest_readb(qts, IRQFLTE0), ==, 0xa5);
+    qtest_writew(qts, IRQFLTC0, 0x1234);
+    g_assert_cmphex(qtest_readw(qts, IRQFLTC0), ==, 0x1234);
+    g_assert_cmphex(qtest_readb(qts, IRQFLTC0), ==, 0x34);
+    g_assert_cmphex(qtest_readb(qts, IRQFLTC0 + 1), ==, 0x12);
+    qtest_writeb(qts, IRQFLTC0 + 1, 0xab);
+    g_assert_cmphex(qtest_readw(qts, IRQFLTC0), ==, 0xab34);
+    /* NMIFLTC sits at 0x594 per the manual, not at 0x591. */
+    qtest_writeb(qts, NMIFLTC, 2);
+    g_assert_cmphex(qtest_readb(qts, NMIFLTC), ==, 2);
+    g_assert_cmphex(qtest_readb(qts, ICU + 0x591), ==, 0xff);
+    qtest_quit(qts);
+}
+
+static void test_filter_nmi(void)
+{
+    QTestState *qts = qtest_init("-M rx113-r5f51138");
+
+    filter_clock_init(qts);
+    qtest_set_irq_in(qts, "/machine/mcu/icu", "nmi-pin", 0, 1);
+    qtest_writeb(qts, NMIER, 0x01); /* NMIEN */
+    qtest_writeb(qts, NMIFLTC, 0); /* sampling clock = ICLK */
+    qtest_writeb(qts, NMIFLTE, 1); /* filter on */
+    /* A 400 ns low pulse is sampled once: removed. */
+    qtest_set_irq_in(qts, "/machine/mcu/icu", "nmi-pin", 0, 0);
+    qtest_clock_step(qts, 400);
+    qtest_set_irq_in(qts, "/machine/mcu/icu", "nmi-pin", 0, 1);
+    qtest_clock_step(qts, 1000);
+    g_assert_cmphex(qtest_readb(qts, NMISR) & 1, ==, 0);
+    /* A low level held past three samples reaches the detector. */
+    qtest_set_irq_in(qts, "/machine/mcu/icu", "nmi-pin", 0, 0);
+    qtest_clock_step(qts, 800);
+    g_assert_cmphex(qtest_readb(qts, NMISR) & 1, ==, 1);
+    qtest_set_irq_in(qts, "/machine/mcu/icu", "nmi-pin", 0, 1);
+    qtest_writeb(qts, NMICLR, 0x01);
+    g_assert_cmphex(qtest_readb(qts, NMISR), ==, 0);
+    qtest_quit(qts);
+}
+
+static void test_filter_nmi_divider(void)
+{
+    QTestState *qts = qtest_init("-M rx113-r5f51138");
+
+    filter_clock_init(qts);
+    qtest_set_irq_in(qts, "/machine/mcu/icu", "nmi-pin", 0, 1);
+    qtest_writeb(qts, NMIER, 0x01);
+    qtest_writeb(qts, NMIFLTC, 3); /* sampling clock = ICLK/64 = 16 us */
+    qtest_writeb(qts, NMIFLTE, 1);
+    /* 10 us is less than one sampling cycle now: removed. */
+    qtest_set_irq_in(qts, "/machine/mcu/icu", "nmi-pin", 0, 0);
+    qtest_clock_step(qts, 10000);
+    qtest_set_irq_in(qts, "/machine/mcu/icu", "nmi-pin", 0, 1);
+    qtest_clock_step(qts, 1000);
+    g_assert_cmphex(qtest_readb(qts, NMISR) & 1, ==, 0);
+    /* 60 us covers three samples (48 us): the edge lands. */
+    qtest_set_irq_in(qts, "/machine/mcu/icu", "nmi-pin", 0, 0);
+    qtest_clock_step(qts, 60000);
+    g_assert_cmphex(qtest_readb(qts, NMISR) & 1, ==, 1);
+    qtest_quit(qts);
+}
+
+static void test_filter_irq(void)
+{
+    QTestState *qts = qtest_init("-M rx113-r5f51138");
+
+    filter_clock_init(qts);
+    qtest_writeb(qts, IRQCR0, 0x04); /* IRQ0: falling edge */
+    qtest_set_irq_in(qts, "/machine/mcu/icu", NULL, 64, 1);
+    qtest_writew(qts, IRQFLTC0, 0); /* sampling clock = ICLK */
+    qtest_writeb(qts, IRQFLTE0, 0x01); /* filter on for IRQ0 */
+    /* A 400 ns low pulse is removed. */
+    qtest_set_irq_in(qts, "/machine/mcu/icu", NULL, 64, 0);
+    qtest_clock_step(qts, 400);
+    qtest_set_irq_in(qts, "/machine/mcu/icu", NULL, 64, 1);
+    qtest_clock_step(qts, 1000);
+    g_assert_cmphex(qtest_readb(qts, IR64), ==, 0);
+    /* A held low level lands the falling edge after three samples. */
+    qtest_set_irq_in(qts, "/machine/mcu/icu", NULL, 64, 0);
+    qtest_clock_step(qts, 800);
+    g_assert_cmphex(qtest_readb(qts, IR64), ==, 1);
+    qtest_set_irq_in(qts, "/machine/mcu/icu", NULL, 64, 1);
+    qtest_clock_step(qts, 800);
+    qtest_writeb(qts, IR64, 0);
+    g_assert_cmphex(qtest_readb(qts, IR64), ==, 0);
+    /* Level mode: IR follows the filtered level, with the delay. */
+    qtest_writeb(qts, IRQCR0, 0x00);
+    qtest_set_irq_in(qts, "/machine/mcu/icu", NULL, 64, 0);
+    qtest_clock_step(qts, 800);
+    g_assert_cmphex(qtest_readb(qts, IR64), ==, 0);
+    qtest_set_irq_in(qts, "/machine/mcu/icu", NULL, 64, 1);
+    qtest_clock_step(qts, 400);
+    g_assert_cmphex(qtest_readb(qts, IR64), ==, 0); /* one sample only */
+    qtest_clock_step(qts, 400);
+    g_assert_cmphex(qtest_readb(qts, IR64), ==, 1); /* flipped by now */
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     int ret;
@@ -312,6 +428,10 @@ int main(int argc, char **argv)
     qtest_add_func("/rx113-nmi/delivery-ost", test_delivery_ost);
     qtest_add_func("/rx113-nmi/delivery-ost-gated", test_delivery_ost_gated);
     qtest_add_func("/rx113-nmi/delivery-iwdt", test_delivery_iwdt);
+    qtest_add_func("/rx113-nmi/filter-registers", test_filter_registers);
+    qtest_add_func("/rx113-nmi/filter-nmi", test_filter_nmi);
+    qtest_add_func("/rx113-nmi/filter-nmi-divider", test_filter_nmi_divider);
+    qtest_add_func("/rx113-nmi/filter-irq", test_filter_irq);
 
     ret = g_test_run();
     unlink(flash_path);
