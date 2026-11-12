@@ -523,3 +523,41 @@ Stage 2 (RXD sampling) adds:
 - Adapter state is not migrated; an in-flight packet is
   abandoned on detach, reset or migration (generation
   counter) and left for the guest to retry.
+
+## D-028: USB0 function adapter topology (Issue #74)
+
+- The function adapter is a USB/IP server inside the rx113-usb
+  device (the D-027 placement argument applies a fortiori: the
+  endpoint-to-pipe map is core-internal state an external bridge
+  cannot see). It listens on a QIOChannel socket when the
+  `usbip-listen` property is set (e.g. "127.0.0.1:3240"); with
+  the property unset the server does not exist and guest-visible
+  behavior is bit-identical. The bound port is readable through
+  the `usbip-port` property (enables port 0 in tests).
+- One session at a time. OP_REQ_IMPORT drives VBUS; when the
+  guest raises DPRPU the bridge injects one bus reset and kicks
+  SOF interpolation so the frame tick runs - the sequence a real
+  host produces on attach. A pull-up drop re-arms the reset.
+  TCP disconnect, device reset and migration drop the session
+  and all pending URBs (adapter state is not migrated, as in
+  D-027).
+- URBs translate onto the D-013 SIE boundary: control transfers
+  run the setup/data/status stage machine (setup completion,
+  per-packet rx/ack completions, stage tokens, completion gated
+  on the firmware's CCPL exactly as the fixture scripts it);
+  bulk/interrupt URBs resolve their pipe by PIPECFG EPNUM plus
+  the DIR bit (set = SIE sends = host IN) and complete through
+  rx/ack completions. One URB per endpoint queue is driven at a
+  time, on the frame tick, on submit and on SYSCFG writes.
+- Recorded divergences: SET_ADDRESS is never delivered (vhci
+  completes it locally, as with real USB/IP devices; the model's
+  device state therefore skips the Address state on this path).
+  The protocol has no bus-reset signal mid-session, so host-side
+  port resets are invisible until a re-import. Isochronous URBs
+  are refused with -EOPNOTSUPP. The device record reports
+  zero VID/PID/descriptor class (the firmware's descriptors are
+  only exchanged during enumeration itself).
+- Stage 2 (real vhci under Linux/WSL plus the PO's own CDC/HID
+  communication tool, self-made) is a separate verification
+  step; the protocol-level behavior is pinned by qtest with an
+  in-test USB/IP client.

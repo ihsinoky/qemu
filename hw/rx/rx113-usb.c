@@ -12,9 +12,12 @@
 #include "qemu/bswap.h"
 #include "qemu/timer.h"
 #include "hw/core/irq.h"
+#include "hw/core/qdev-properties.h"
 #include "hw/rx/rx113_usb.h"
 #include "hw/usb/usb.h"
+#include "io/channel-socket.h"
 #include "migration/vmstate.h"
+#include "qemu/sockets.h"
 
 #define SYSCFG     0x00
 #define SYSSTS0    0x04
@@ -127,6 +130,31 @@ typedef struct RX113USBChan {
     uint32_t gen;
 } RX113USBChan;
 
+/* One pending USB/IP request block (Issue #74). */
+typedef struct RX113UsbipUrb {
+    uint32_t seqnum;
+    uint32_t devid;
+    unsigned ep;
+    bool in;
+    bool control;
+    uint8_t setup[8];
+    GByteArray *data; /* OUT payload, then IN accumulation */
+    uint32_t want;    /* requested IN length (device-to-host) */
+    unsigned state;   /* control-transfer drive state */
+    bool token_sent;
+    int pipe;         /* resolved pipe number, -1 until resolved */
+    QTAILQ_ENTRY(RX113UsbipUrb) entry;
+} RX113UsbipUrb;
+
+/* The single USB/IP client connection (Issue #74). */
+typedef struct RX113UsbipConn {
+    QIOChannel *chan;
+    guint watch;
+    GByteArray *rx;
+    GByteArray *tx;
+    bool imported;
+} RX113UsbipConn;
+
 struct RX113USBState {
     SysBusDevice parent_obj;
     MemoryRegion iomem;
@@ -137,6 +165,16 @@ struct RX113USBState {
     RX113USBChan chan[10];
     uint32_t adapter_gen;
     bool adapter_reset_done;
+    /* Production function adapter (Issue #74): a USB/IP server. */
+    char *usbip_listen;
+    uint16_t usbip_port;
+    QIOChannelSocket *usbip_sioc;
+    guint usbip_accept_watch;
+    RX113UsbipConn *usbip_conn;
+    bool usbip_reset_done;
+    bool usbip_pullup;
+    bool usbip_vbus_driven;
+    QTAILQ_HEAD(, RX113UsbipUrb) usbip_urbs;
     uint16_t regs[0x100 / 2];
     RX113USBPipe pipe[10];
     uint64_t uclk;
@@ -171,6 +209,8 @@ static bool usb_active(RX113USBState *s)
 static void usb_update_bus(RX113USBState *s);
 static void usb_device_state(RX113USBState *s, unsigned state);
 static void rx113_usb_adapter_reset_check(RX113USBState *s, bool reset);
+static void rx113_usbip_drive(RX113USBState *s);
+static void rx113_usbip_session_close(RX113USBState *s);
 
 static bool usb_tx(RX113USBState *s, unsigned n)
 {
@@ -298,6 +338,7 @@ static void usb_attach_check(void *opaque)
 
 static void usb_frame_pipes(RX113USBState *s);
 static void rx113_usb_adapter_frame(RX113USBState *s);
+static void rx113_usbip_frame(RX113USBState *s);
 
 static void usb_frame(void *opaque)
 {
@@ -310,6 +351,7 @@ static void usb_frame(void *opaque)
     R(s, INTSTS0) |= 0x2000;
     usb_frame_pipes(s);
     rx113_usb_adapter_frame(s);
+    rx113_usbip_frame(s);
     timer_mod(s->frame_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
               (R(s, SYSCFG) & DCFM ? 1000000 : s->sof_period));
     usb_update_irq(s);
@@ -855,6 +897,7 @@ static void rx113_usb_write(void *opaque, hwaddr addr, uint64_t value,
             }
         }
         R(s, SYSCFG) = value & 0x579;
+        rx113_usbip_drive(s);
         break;
     case DCPMAXP:
         R(s, DCPMAXP) = (R(s, DCPMAXP) & 0xf000 &
@@ -1599,6 +1642,764 @@ static void usb_bus_event(Object *obj, const char *str, Error **errp)
     usb_update_irq(s);
 }
 
+/*
+ * Production function adapter (Issue #74): a USB/IP server in the
+ * device. A host-PC client (Linux vhci, or WSL through usbipd-win)
+ * imports the emulated device and its URBs are translated onto the
+ * same SIE boundary the D-013 fixture uses: setup/rx/ack completions
+ * and control-stage tokens. SET_ADDRESS never reaches the server
+ * (vhci completes it locally); a bus reset is injected once the
+ * guest raises its pull-up after an import, and SOF interpolation
+ * is kicked so the frame tick runs. Isochronous URBs are refused.
+ */
+#define USBIP_VERSION      0x0111
+#define USBIP_OP_REQ_LIST  0x8005
+#define USBIP_OP_REP_LIST  0x0005
+#define USBIP_OP_REQ_IMPORT 0x8003
+#define USBIP_OP_REP_IMPORT 0x0003
+#define USBIP_CMD_SUBMIT   1
+#define USBIP_CMD_UNLINK   2
+#define USBIP_RET_SUBMIT   3
+#define USBIP_RET_UNLINK   4
+#define USBIP_BUSID        "1-1"
+#define USBIP_HDR_LEN      48
+
+static void usbip_put16(GByteArray *out, uint16_t v)
+{
+    g_byte_array_append(out, (const guint8 *)"\0\0", 2);
+    out->data[out->len - 2] = v >> 8;
+    out->data[out->len - 1] = v;
+}
+
+static void usbip_put32(GByteArray *out, uint32_t v)
+{
+    g_byte_array_append(out, (const guint8 *)"\0\0\0\0", 4);
+    out->data[out->len - 4] = v >> 24;
+    out->data[out->len - 3] = v >> 16;
+    out->data[out->len - 2] = v >> 8;
+    out->data[out->len - 1] = v;
+}
+
+static uint32_t usbip_get32(const uint8_t *p)
+{
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+           ((uint32_t)p[2] << 8) | p[3];
+}
+
+static void usbip_conn_watch_update(RX113USBState *s, RX113UsbipConn *c);
+static gboolean usbip_conn_cb(QIOChannel *chan, GIOCondition cond,
+                              void *opaque);
+
+static void usbip_queue_tx(RX113USBState *s, RX113UsbipConn *c,
+                           const uint8_t *data, size_t len)
+{
+    g_byte_array_append(c->tx, data, len);
+    usbip_conn_watch_update(s, c);
+}
+
+static void usbip_flush(RX113USBState *s, RX113UsbipConn *c)
+{
+    while (c->tx->len) {
+        Error *err = NULL;
+        ssize_t written = qio_channel_write(c->chan,
+                                            (const char *)c->tx->data,
+                                            c->tx->len, &err);
+
+        if (written > 0) {
+            g_byte_array_remove_range(c->tx, 0, written);
+        }
+        if (err) {
+            error_free(err);
+        }
+        if (written <= 0) {
+            break; /* would block or failed: retry on G_IO_OUT */
+        }
+    }
+    usbip_conn_watch_update(s, c);
+}
+
+static void usbip_conn_watch_update(RX113USBState *s, RX113UsbipConn *c)
+{
+    GIOCondition cond = G_IO_IN | G_IO_HUP | G_IO_ERR;
+
+    if (c->tx->len) {
+        cond |= G_IO_OUT;
+    }
+    if (c->watch) {
+        g_source_remove(c->watch);
+    }
+    c->watch = qio_channel_add_watch(QIO_CHANNEL(c->chan), cond,
+                                     usbip_conn_cb, s, NULL);
+}
+
+static void rx113_usbip_session_close(RX113USBState *s)
+{
+    RX113UsbipConn *c = s->usbip_conn;
+    RX113UsbipUrb *urb, *next;
+
+    if (!c) {
+        return;
+    }
+    s->usbip_conn = NULL;
+    if (c->watch) {
+        g_source_remove(c->watch);
+    }
+    object_unref(OBJECT(c->chan));
+    g_byte_array_unref(c->rx);
+    g_byte_array_unref(c->tx);
+    g_free(c);
+    QTAILQ_FOREACH_SAFE(urb, &s->usbip_urbs, entry, next) {
+        QTAILQ_REMOVE(&s->usbip_urbs, urb, entry);
+        g_byte_array_unref(urb->data);
+        g_free(urb);
+    }
+    s->usbip_reset_done = false;
+    s->usbip_pullup = false;
+    if (s->usbip_vbus_driven) {
+        s->usbip_vbus_driven = false;
+        s->vbus = false;
+        usb_update_bus(s);
+        usb_update_irq(s);
+    }
+}
+
+/* Drive one SIE completion through the fixture entry, discarding errors. */
+static bool usbip_completion(RX113USBState *s, const char *fmt, ...)
+    G_GNUC_PRINTF(2, 3);
+
+static bool usbip_completion(RX113USBState *s, const char *fmt, ...)
+{
+    va_list ap;
+    g_autofree char *str = NULL;
+    Error *err = NULL;
+
+    va_start(ap, fmt);
+    str = g_strdup_vprintf(fmt, ap);
+    va_end(ap);
+    usb_sie_completion(OBJECT(s), str, &err);
+    if (err) {
+        error_free(err);
+        return false;
+    }
+    return true;
+}
+
+static void usbip_urb_finish(RX113USBState *s, RX113UsbipUrb *urb,
+                             int32_t status)
+{
+    RX113UsbipConn *c = s->usbip_conn;
+    g_autoptr(GByteArray) out = g_byte_array_new();
+    uint32_t actual = 0;
+
+    QTAILQ_REMOVE(&s->usbip_urbs, urb, entry);
+    if (c) {
+        if (urb->in && status == 0) {
+            actual = MIN((uint32_t)urb->data->len, urb->want);
+        }
+        usbip_put32(out, USBIP_RET_SUBMIT);
+        usbip_put32(out, urb->seqnum);
+        usbip_put32(out, urb->devid);
+        usbip_put32(out, urb->in ? 1 : 0);
+        usbip_put32(out, urb->ep);
+        usbip_put32(out, (uint32_t)status);
+        usbip_put32(out, actual);
+        usbip_put32(out, 0);
+        usbip_put32(out, 0xffffffff);
+        usbip_put32(out, 0);
+        usbip_put32(out, 0); /* pad the fixed 48-byte header */
+        usbip_put32(out, 0);
+        if (actual) {
+            g_byte_array_append(out, urb->data->data, actual);
+        }
+        usbip_queue_tx(s, c, out->data, out->len);
+        usbip_flush(s, c);
+    }
+    g_byte_array_unref(urb->data);
+    g_free(urb);
+}
+
+static int usbip_resolve_pipe(RX113USBState *s, RX113UsbipUrb *urb)
+{
+    if (urb->pipe >= 0) {
+        return urb->pipe;
+    }
+    for (unsigned n = 1; n < 10; n++) {
+        RX113USBPipe *p = &s->pipe[n];
+
+        /* DIR names the data direction at the SIE: set = SIE sends. */
+        if ((p->cfg & 15) == urb->ep && !!(p->cfg & DIR) == urb->in) {
+            urb->pipe = n;
+            return n;
+        }
+    }
+    return -1;
+}
+
+static bool usbip_pipe_stalled(RX113USBState *s, unsigned n)
+{
+    return (R(s, CTR(n)) & 3) >= 2;
+}
+
+static void usbip_drive_control(RX113USBState *s, RX113UsbipUrb *urb)
+{
+    RX113USBPipe *dcp = &s->pipe[0];
+    unsigned stage = R(s, INTSTS0) & 7;
+    unsigned maxp = R(s, DCPMAXP) & 0x7f;
+
+    if (!maxp) {
+        maxp = 64;
+    }
+    if (urb->state == 0) { /* setup not yet injected */
+        g_autofree char *hex = g_strdup_printf(
+            "%02x%02x%02x%02x%02x%02x%02x%02x",
+            urb->setup[0], urb->setup[1], urb->setup[2], urb->setup[3],
+            urb->setup[4], urb->setup[5], urb->setup[6], urb->setup[7]);
+
+        if (!usbip_completion(s, "setup:0:%s", hex)) {
+            usbip_urb_finish(s, urb, -EIO);
+            return;
+        }
+        urb->state = 1;
+        stage = R(s, INTSTS0) & 7;
+    }
+    if (urb->state == 1) { /* data stage */
+        if (usbip_pipe_stalled(s, 0)) {
+            usbip_urb_finish(s, urb, -EPIPE);
+            return;
+        }
+        if (urb->in && stage == 1) {
+            bool data_done = false;
+
+            while (usb_sie_is_tx(s, 0) && dcp->valid[dcp->sie]) {
+                unsigned plane = dcp->sie;
+                unsigned len = dcp->length[plane];
+
+                g_byte_array_append(urb->data, dcp->data[plane], len);
+                if (!usbip_completion(s, "ack:0")) {
+                    break;
+                }
+                if (len < maxp || urb->data->len >= urb->want) {
+                    data_done = true;
+                    break;
+                }
+            }
+            if (data_done && !urb->token_sent) {
+                Error *err = NULL;
+
+                usb_sie_token(OBJECT(s), "out", &err);
+                if (err) {
+                    error_free(err);
+                }
+                urb->token_sent = true;
+                urb->state = 2;
+            }
+            return;
+        }
+        if (!urb->in && stage == 3) {
+            if (R(s, INTSTS0) & 8) {
+                return; /* VALID not yet released by the firmware */
+            }
+            while (urb->data->len > 0) {
+                unsigned chunk = MIN((uint32_t)urb->data->len, maxp);
+                g_autofree char *hex = NULL;
+                GString *h = g_string_new(NULL);
+
+                for (unsigned i = 0; i < chunk; i++) {
+                    g_string_append_printf(h, "%02x", urb->data->data[i]);
+                }
+                hex = g_string_free(h, false);
+                if (!usbip_completion(s, "rx:0:%s", hex)) {
+                    return;
+                }
+                g_byte_array_remove_range(urb->data, 0, chunk);
+                if (chunk < maxp) {
+                    break;
+                }
+            }
+            if (!urb->data->len && !urb->token_sent) {
+                Error *err = NULL;
+
+                usb_sie_token(OBJECT(s), "in", &err);
+                if (err) {
+                    error_free(err);
+                }
+                urb->token_sent = true;
+                urb->state = 2;
+            }
+            return;
+        }
+        if (stage == 5 || stage == 2 || stage == 4) {
+            urb->state = 2;
+        } else if (stage == 0) {
+            usbip_urb_finish(s, urb, -EIO);
+            return;
+        } else {
+            return;
+        }
+    }
+    if (urb->state == 2) { /* status stage */
+        bool gate = s->auto_address ||
+                    (!(R(s, INTSTS0) & 8) && (R(s, DCPCTR) & 7) == 5);
+
+        stage = R(s, INTSTS0) & 7;
+        if (stage == 0) {
+            usbip_urb_finish(s, urb, 0);
+            return;
+        }
+        if (!gate) {
+            return;
+        }
+        if (stage == 2) {
+            usbip_completion(s, "rx:0:");
+        } else if (stage == 4 || stage == 5) {
+            usbip_completion(s, "ack:0");
+        } else {
+            return;
+        }
+        if ((R(s, INTSTS0) & 7) == 0) {
+            usbip_urb_finish(s, urb, 0);
+        }
+    }
+}
+
+static void usbip_drive_pipe(RX113USBState *s, RX113UsbipUrb *urb)
+{
+    int n = usbip_resolve_pipe(s, urb);
+    RX113USBPipe *p;
+    unsigned maxp;
+
+    if (n < 0) {
+        return; /* endpoint not configured yet */
+    }
+    p = &s->pipe[n];
+    maxp = p->maxp & 0x1ff;
+    if (!maxp) {
+        return;
+    }
+    if (usbip_pipe_stalled(s, n)) {
+        usbip_urb_finish(s, urb, -EPIPE);
+        return;
+    }
+    if (urb->in) {
+        if (usb_sie_is_tx(s, n) && p->valid[p->sie]) {
+            unsigned plane = p->sie;
+            unsigned len = p->length[plane];
+
+            g_byte_array_append(urb->data, p->data[plane], len);
+            usbip_completion(s, "ack:%u", n);
+            if (len < maxp || urb->data->len >= urb->want) {
+                usbip_urb_finish(s, urb, 0);
+            }
+        } else if ((p->cfg & 0xc010) == 0x4010 &&
+                   (R(s, CTR(n)) & 0x403) == 0x401) {
+            /* ATREPM automatic zero-length packet (sie-tx snapshot case). */
+            usbip_completion(s, "ack:%u", n);
+            usbip_urb_finish(s, urb, 0);
+        }
+        return;
+    }
+    /* OUT: inject one packet per free plane. */
+    while (urb->data->len && (R(s, CTR(n)) & 3) == 1 &&
+           !p->valid[p->sie]) {
+        unsigned chunk = MIN((uint32_t)urb->data->len, maxp);
+        GString *h = g_string_new(NULL);
+        g_autofree char *hex = NULL;
+
+        for (unsigned i = 0; i < chunk; i++) {
+            g_string_append_printf(h, "%02x", urb->data->data[i]);
+        }
+        hex = g_string_free(h, false);
+        if (!usbip_completion(s, "rx:%u:%s", n, hex)) {
+            return;
+        }
+        g_byte_array_remove_range(urb->data, 0, chunk);
+    }
+    if (!urb->data->len) {
+        usbip_urb_finish(s, urb, 0);
+    }
+}
+
+/*
+ * Bus-state management plus per-endpoint head-of-queue driving.
+ * Called on the frame tick, on submit and on SYSCFG writes (the
+ * writes that can raise the pull-up or enable the function).
+ */
+static void rx113_usbip_drive(RX113USBState *s)
+{
+    RX113UsbipConn *c = s->usbip_conn;
+    RX113UsbipUrb *urb;
+
+    if (!c || !c->imported || (R(s, SYSCFG) & DCFM) || !usb_active(s)) {
+        return;
+    }
+    /* A host resets the device once it sees the pull-up. */
+    if (R(s, SYSCFG) & 0x08) {
+        if (!s->usbip_pullup && !s->usbip_reset_done) {
+            Error *err = NULL;
+
+            usb_bus_event(OBJECT(s), "reset", &err);
+            if (err) {
+                error_free(err);
+            } else {
+                s->usbip_reset_done = true;
+            }
+        }
+        s->usbip_pullup = true;
+    } else {
+        s->usbip_pullup = false;
+        s->usbip_reset_done = false;
+    }
+    if (!s->sof_received) {
+        Error *err = NULL;
+
+        usb_sie_sof(OBJECT(s), "0", &err);
+        if (err) {
+            error_free(err);
+        }
+    }
+    {
+        RX113UsbipUrb *next;
+
+        QTAILQ_FOREACH_SAFE(urb, &s->usbip_urbs, entry, next) {
+            RX113UsbipUrb *prev;
+            bool head = true;
+
+            QTAILQ_FOREACH(prev, &s->usbip_urbs, entry) {
+                if (prev == urb) {
+                    break;
+                }
+                if (prev->ep == urb->ep && prev->in == urb->in &&
+                    prev->control == urb->control) {
+                    head = false;
+                    break;
+                }
+            }
+            if (!head) {
+                continue;
+            }
+            if (urb->control) {
+                usbip_drive_control(s, urb);
+            } else {
+                usbip_drive_pipe(s, urb);
+            }
+            if (!s->usbip_conn) {
+                return; /* session closed by a finish path */
+            }
+        }
+    }
+}
+
+static void rx113_usbip_frame(RX113USBState *s)
+{
+    rx113_usbip_drive(s);
+}
+
+static void usbip_rep_device(GByteArray *out, bool with_path)
+{
+    static const char path[] = "/sys/devices/rx113-usb/1-1";
+    uint8_t rec[312];
+
+    memset(rec, 0, sizeof(rec));
+    if (with_path) {
+        memcpy(rec, path, strlen(path));
+        memcpy(rec + 256, USBIP_BUSID, strlen(USBIP_BUSID));
+    } else {
+        memcpy(rec, USBIP_BUSID, strlen(USBIP_BUSID));
+    }
+    /* busnum, devnum, speed (full) follow the bus id. */
+    rec[288 + 3] = 1;
+    rec[288 + 7] = 1;
+    rec[288 + 11] = 2;
+    /* The import reply is the same record from the bus id on. */
+    g_byte_array_append(out, rec + (with_path ? 0 : 256),
+                        with_path ? 312 : 56);
+}
+
+static void usbip_handle_submit(RX113USBState *s, RX113UsbipConn *c,
+                                const uint8_t *hdr, const uint8_t *payload)
+{
+    uint32_t seqnum = usbip_get32(hdr + 4);
+    uint32_t devid = usbip_get32(hdr + 8);
+    bool in = usbip_get32(hdr + 12) == 1;
+    uint32_t ep = usbip_get32(hdr + 16);
+    int32_t buflen = (int32_t)usbip_get32(hdr + 24);
+    int32_t npackets = (int32_t)usbip_get32(hdr + 32);
+    RX113UsbipUrb *urb;
+
+    if (npackets != -1) { /* isochronous: not bridged */
+        g_autoptr(GByteArray) out = g_byte_array_new();
+
+        usbip_put32(out, USBIP_RET_SUBMIT);
+        usbip_put32(out, seqnum);
+        usbip_put32(out, devid);
+        usbip_put32(out, in ? 1 : 0);
+        usbip_put32(out, ep);
+        usbip_put32(out, (uint32_t)-EOPNOTSUPP);
+        usbip_put32(out, 0);
+        usbip_put32(out, 0);
+        usbip_put32(out, 0xffffffff);
+        usbip_put32(out, 0);
+        usbip_put32(out, 0); /* pad the fixed 48-byte header */
+        usbip_put32(out, 0);
+        usbip_queue_tx(s, c, out->data, out->len);
+        usbip_flush(s, c);
+        return;
+    }
+    urb = g_new0(RX113UsbipUrb, 1);
+    urb->seqnum = seqnum;
+    urb->devid = devid;
+    urb->ep = ep;
+    urb->in = in;
+    urb->control = ep == 0;
+    urb->pipe = -1;
+    urb->data = g_byte_array_new();
+    if (ep == 0) {
+        memcpy(urb->setup, hdr + 40, 8);
+    }
+    if (in) {
+        urb->want = buflen > 0 ? buflen : 0;
+    } else if (buflen > 0) {
+        g_byte_array_append(urb->data, payload, buflen);
+    }
+    QTAILQ_INSERT_TAIL(&s->usbip_urbs, urb, entry);
+    rx113_usbip_drive(s);
+}
+
+static void usbip_handle_unlink(RX113USBState *s, RX113UsbipConn *c,
+                                const uint8_t *hdr)
+{
+    uint32_t seqnum = usbip_get32(hdr + 4);
+    uint32_t target = usbip_get32(hdr + 20);
+    RX113UsbipUrb *urb;
+    int32_t status = -EINVAL;
+    g_autoptr(GByteArray) out = g_byte_array_new();
+
+    QTAILQ_FOREACH(urb, &s->usbip_urbs, entry) {
+        if (urb->seqnum == target) {
+            QTAILQ_REMOVE(&s->usbip_urbs, urb, entry);
+            g_byte_array_unref(urb->data);
+            g_free(urb);
+            status = 0;
+            break;
+        }
+    }
+    usbip_put32(out, USBIP_RET_UNLINK);
+    usbip_put32(out, seqnum);
+    usbip_put32(out, usbip_get32(hdr + 8));
+    usbip_put32(out, 0);
+    usbip_put32(out, 0);
+    usbip_put32(out, (uint32_t)status);
+    for (unsigned i = 0; i < 6; i++) {
+        usbip_put32(out, 0);
+    }
+    usbip_queue_tx(s, c, out->data, out->len);
+    usbip_flush(s, c);
+}
+
+static bool usbip_parse(RX113USBState *s, RX113UsbipConn *c)
+{
+
+    for (;;) {
+        if (!c->imported) {
+            uint16_t code;
+            uint32_t status = 0;
+
+            if (c->rx->len < 8) {
+                break;
+            }
+            code = (c->rx->data[2] << 8) | c->rx->data[3];
+            if (code == USBIP_OP_REQ_LIST) {
+                g_autoptr(GByteArray) out = g_byte_array_new();
+
+                usbip_put16(out, USBIP_VERSION);
+                usbip_put16(out, USBIP_OP_REP_LIST);
+                usbip_put32(out, 0);
+                usbip_put32(out, 1);
+                usbip_rep_device(out, true);
+                g_byte_array_remove_range(c->rx, 0, 8);
+                usbip_queue_tx(s, c, out->data, out->len);
+                usbip_flush(s, c);
+                continue;
+            }
+            if (code == USBIP_OP_REQ_IMPORT) {
+                g_autoptr(GByteArray) out = g_byte_array_new();
+
+                if (c->rx->len < 40) {
+                    break;
+                }
+                if (memcmp(c->rx->data + 8, USBIP_BUSID,
+                           strlen(USBIP_BUSID)) ||
+                    c->rx->data[8 + strlen(USBIP_BUSID)]) {
+                    status = 1;
+                }
+                usbip_put16(out, USBIP_VERSION);
+                usbip_put16(out, USBIP_OP_REP_IMPORT);
+                usbip_put32(out, status);
+                if (!status) {
+                    usbip_rep_device(out, false);
+                }
+                g_byte_array_remove_range(c->rx, 0, 40);
+                usbip_queue_tx(s, c, out->data, out->len);
+                usbip_flush(s, c);
+                if (status) {
+                    continue;
+                }
+                c->imported = true;
+                if (!s->vbus) {
+                    s->usbip_vbus_driven = true;
+                    s->vbus = true;
+                    usb_update_bus(s);
+                    usb_update_irq(s);
+                }
+                rx113_usbip_drive(s);
+                continue;
+            }
+            return false; /* unknown opcode: caller closes */
+        }
+        /* URB phase: fixed 48-byte headers. */
+        if (c->rx->len < USBIP_HDR_LEN) {
+            break;
+        }
+        {
+            const uint8_t *hdr = c->rx->data;
+            uint32_t cmd = usbip_get32(hdr);
+            bool in = usbip_get32(hdr + 12) == 1;
+            int32_t buflen = (int32_t)usbip_get32(hdr + 24);
+            int32_t npackets = (int32_t)usbip_get32(hdr + 32);
+            size_t total = USBIP_HDR_LEN;
+
+            if (cmd == USBIP_CMD_SUBMIT) {
+                if (npackets != -1) {
+                    total += (size_t)npackets * 16;
+                    if (!in) {
+                        total += buflen > 0 ? buflen : 0;
+                    }
+                } else if (!in) {
+                    total += buflen > 0 ? buflen : 0;
+                }
+                if (c->rx->len < total) {
+                    break;
+                }
+                usbip_handle_submit(s, c, hdr, hdr + USBIP_HDR_LEN);
+                g_byte_array_remove_range(c->rx, 0, total);
+                continue;
+            }
+            if (cmd == USBIP_CMD_UNLINK) {
+                usbip_handle_unlink(s, c, hdr);
+                g_byte_array_remove_range(c->rx, 0, USBIP_HDR_LEN);
+                continue;
+            }
+            return false; /* unknown command: caller closes */
+        }
+    }
+    return true;
+}
+
+static gboolean usbip_conn_cb(QIOChannel *chan, GIOCondition cond,
+                              void *opaque)
+{
+    RX113USBState *s = opaque;
+    RX113UsbipConn *c = s->usbip_conn;
+    uint8_t buf[16384];
+
+    if (!c || chan != c->chan) {
+        return G_SOURCE_REMOVE;
+    }
+    if (cond & (G_IO_HUP | G_IO_ERR)) {
+        rx113_usbip_session_close(s);
+        return G_SOURCE_REMOVE;
+    }
+    if (cond & G_IO_IN) {
+        Error *err = NULL;
+        ssize_t got = qio_channel_read(c->chan, (char *)buf, sizeof(buf),
+                                       &err);
+
+        if (err) {
+            error_free(err);
+        }
+        if (got == 0 || got == -1) { /* EOF or hard error */
+            rx113_usbip_session_close(s);
+            return G_SOURCE_REMOVE;
+        }
+        if (got > 0) {
+            g_byte_array_append(c->rx, buf, got);
+            if (!usbip_parse(s, c)) {
+                rx113_usbip_session_close(s);
+                return G_SOURCE_REMOVE;
+            }
+            if (!s->usbip_conn) {
+                return G_SOURCE_REMOVE;
+            }
+            rx113_usbip_drive(s);
+        }
+    }
+    if (cond & G_IO_OUT) {
+        usbip_flush(s, c);
+    }
+    return G_SOURCE_CONTINUE;
+}
+
+static gboolean usbip_accept_cb(QIOChannel *chan, GIOCondition cond,
+                                void *opaque)
+{
+    RX113USBState *s = opaque;
+    Error *err = NULL;
+    QIOChannelSocket *cioc = qio_channel_socket_accept(s->usbip_sioc, &err);
+    RX113UsbipConn *c;
+
+    if (!cioc) {
+        if (err) {
+            error_free(err);
+        }
+        return G_SOURCE_CONTINUE;
+    }
+    qio_channel_set_blocking(QIO_CHANNEL(cioc), false, NULL);
+    if (s->usbip_conn && s->usbip_conn->imported) {
+        object_unref(OBJECT(cioc));
+        return G_SOURCE_CONTINUE; /* one session at a time */
+    }
+    if (s->usbip_conn) {
+        rx113_usbip_session_close(s);
+    }
+    c = g_new0(RX113UsbipConn, 1);
+    c->chan = QIO_CHANNEL(cioc);
+    c->rx = g_byte_array_new();
+    c->tx = g_byte_array_new();
+    s->usbip_conn = c;
+    usbip_conn_watch_update(s, c);
+    return G_SOURCE_CONTINUE;
+}
+
+static void rx113_usbip_listen(RX113USBState *s, Error **errp)
+{
+    g_autoptr(SocketAddress) addr = socket_parse(s->usbip_listen, errp);
+    SocketAddress *bound;
+
+    if (!addr) {
+        return;
+    }
+    s->usbip_sioc = qio_channel_socket_new();
+    if (qio_channel_socket_listen_sync(s->usbip_sioc, addr, 1, errp) < 0) {
+        object_unref(OBJECT(s->usbip_sioc));
+        s->usbip_sioc = NULL;
+        return;
+    }
+    bound = qio_channel_socket_get_local_address(s->usbip_sioc, NULL);
+    if (bound && bound->type == SOCKET_ADDRESS_TYPE_INET) {
+        s->usbip_port = atoi(bound->u.inet.port);
+    }
+    qapi_free_SocketAddress(bound);
+    s->usbip_accept_watch = qio_channel_add_watch(
+        QIO_CHANNEL(s->usbip_sioc), G_IO_IN, usbip_accept_cb, s, NULL);
+}
+
+static char *rx113_usbip_port_get(Object *obj, Error **errp)
+{
+    RX113USBState *s = RX113_USB(obj);
+
+    return g_strdup_printf("%u", s->usbip_port);
+}
+
 /* Adapter/fixture output: immutable snapshot of the next SIE-owned packet. */
 static char *usb_sie_tx(Object *obj, Error **errp)
 {
@@ -1684,6 +2485,7 @@ static void rx113_usb_reset_hold(Object *obj, ResetType type)
 
     s->adapter_gen++;
     s->adapter_reset_done = false;
+    rx113_usbip_session_close(s);
     for (unsigned n = 0; n < 10; n++) {
         s->chan[n].busy = false;
     }
@@ -1761,6 +2563,7 @@ static int rx113_usb_post_load(void *opaque, int version_id)
     for (unsigned n = 0; n < 10; n++) {
         s->chan[n].busy = false;
     }
+    rx113_usbip_session_close(s);
     usb_update_irq(s);
     return 0;
 }
@@ -1825,6 +2628,8 @@ static void rx113_usb_init(Object *obj)
     object_property_add_str(obj, "sie-token", NULL, usb_sie_token);
     object_property_add_str(obj, "bus-event", NULL, usb_bus_event);
     object_property_add_str(obj, "sie-tx", usb_sie_tx, NULL);
+    object_property_add_str(obj, "usbip-port", rx113_usbip_port_get, NULL);
+    QTAILQ_INIT(&s->usbip_urbs);
     usb_bus_new(&s->bus, sizeof(s->bus), &rx113_usb_bus_ops, DEVICE(obj));
     usb_register_port(&s->bus, &s->port, s, 0, &rx113_usb_port_ops,
                       USB_SPEED_MASK_LOW | USB_SPEED_MASK_FULL);
@@ -1837,10 +2642,30 @@ static void rx113_usb_finalize(Object *obj)
 {
     RX113USBState *s = RX113_USB(obj);
 
+    rx113_usbip_session_close(s);
+    if (s->usbip_accept_watch) {
+        g_source_remove(s->usbip_accept_watch);
+    }
+    if (s->usbip_sioc) {
+        object_unref(OBJECT(s->usbip_sioc));
+    }
     timer_free(s->attach_timer);
     timer_free(s->frame_timer);
     timer_free(s->wake_timer);
 }
+
+static void rx113_usb_realize(DeviceState *dev, Error **errp)
+{
+    RX113USBState *s = RX113_USB(dev);
+
+    if (s->usbip_listen) {
+        rx113_usbip_listen(s, errp);
+    }
+}
+
+static const Property rx113_usb_properties[] = {
+    DEFINE_PROP_STRING("usbip-listen", RX113USBState, usbip_listen),
+};
 
 static void rx113_usb_class_init(ObjectClass *oc, const void *data)
 {
@@ -1849,6 +2674,8 @@ static void rx113_usb_class_init(ObjectClass *oc, const void *data)
 
     dc->user_creatable = false;
     dc->vmsd = &vmstate_rx113_usb;
+    dc->realize = rx113_usb_realize;
+    device_class_set_props(dc, rx113_usb_properties);
     rc->phases.hold = rx113_usb_reset_hold;
 }
 

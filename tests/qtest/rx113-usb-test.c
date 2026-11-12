@@ -5,6 +5,11 @@
 #include "qemu/osdep.h"
 #include "libqtest.h"
 #include "qobject/qdict.h"
+#include <poll.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #define USB 0xa0000
 #define MSTPCRB 0x80014
@@ -1313,12 +1318,380 @@ static void test_adapter_nak(void)
     qtest_quit(qts);
 }
 
+/*
+ * USB/IP function adapter (Issue #74): a minimal client speaks the
+ * protocol over a socket while the test plays the firmware through
+ * MMIO, exactly like the fixture tests play the host.
+ */
+typedef struct UsbipClient {
+    int fd;
+    uint8_t buf[16384];
+    size_t len;
+} UsbipClient;
+
+static QTestState *usbip_init(uint16_t *port_out)
+{
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in sin = {
+        .sin_family = AF_INET,
+        .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+    };
+    socklen_t slen = sizeof(sin);
+    uint16_t port;
+    QTestState *qts;
+    g_autofree char *args = NULL;
+    g_autofree char *expect = NULL;
+
+    g_assert_cmpint(fd, >=, 0);
+    g_assert_cmpint(bind(fd, (struct sockaddr *)&sin, sizeof(sin)), ==, 0);
+    g_assert_cmpint(getsockname(fd, (struct sockaddr *)&sin, &slen), ==, 0);
+    port = ntohs(sin.sin_port);
+    close(fd);
+    args = g_strdup_printf("-M rx113-r5f51138 -global "
+                           "rx113-usb.usbip-listen=127.0.0.1:%u", port);
+    qts = qtest_init(args);
+    qtest_writew(qts, 0x803fe, 0xa503);
+    qtest_writeb(qts, 0x80032, 0);
+    qtest_clock_step(qts, 2048000);
+    qtest_writew(qts, 0x8002c, 0x0b11);
+    qtest_writeb(qts, 0x8002e, 0);
+    qtest_clock_step(qts, 50000);
+    g_assert_cmphex(qtest_readb(qts, 0x8003c) & 0x21, ==, 0x21);
+    qtest_writel(qts, MSTPCRB, RUN_B);
+    wr(qts, 0, 0x401);
+    expect = g_strdup_printf("%u", port);
+    property_text(qts, "usbip-port", expect);
+    *port_out = port;
+    return qts;
+}
+
+static void usbip_connect(UsbipClient *c, uint16_t port)
+{
+    struct sockaddr_in sin = {
+        .sin_family = AF_INET,
+        .sin_port = htons(port),
+        .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+    };
+
+    c->fd = socket(AF_INET, SOCK_STREAM, 0);
+    g_assert_cmpint(c->fd, >=, 0);
+    g_assert_cmpint(connect(c->fd, (struct sockaddr *)&sin, sizeof(sin)),
+                    ==, 0);
+    c->len = 0;
+}
+
+static void usbip_send(UsbipClient *c, const uint8_t *data, size_t len)
+{
+    while (len) {
+        ssize_t n = send(c->fd, data, len, 0);
+
+        g_assert_cmpint(n, >, 0);
+        data += n;
+        len -= n;
+    }
+}
+
+static void usbip_put32(uint8_t *p, uint32_t v)
+{
+    p[0] = v >> 24;
+    p[1] = v >> 16;
+    p[2] = v >> 8;
+    p[3] = v;
+}
+
+static uint32_t usbip_get32(const uint8_t *p)
+{
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+           ((uint32_t)p[2] << 8) | p[3];
+}
+
+/* Read until at least need bytes are buffered, stepping frames. */
+static bool usbip_fill(QTestState *qts, UsbipClient *c, size_t need,
+                       unsigned budget)
+{
+    while (c->len < need) {
+        struct pollfd pfd = { .fd = c->fd, .events = POLLIN };
+
+        if (!budget--) {
+            return false;
+        }
+        if (poll(&pfd, 1, 2) > 0 && (pfd.revents & POLLIN)) {
+            ssize_t n = recv(c->fd, c->buf + c->len,
+                             sizeof(c->buf) - c->len, 0);
+
+            g_assert_cmpint(n, >, 0);
+            c->len += n;
+        }
+        qtest_clock_step(qts, 1000000);
+    }
+    return true;
+}
+
+static void usbip_consume(UsbipClient *c, size_t n)
+{
+    memmove(c->buf, c->buf + n, c->len - n);
+    c->len -= n;
+}
+
+static void usbip_devlist(QTestState *qts, UsbipClient *c)
+{
+    uint8_t req[8] = { 0x01, 0x11, 0x80, 0x05, 0, 0, 0, 0 };
+
+    usbip_send(c, req, sizeof(req));
+    g_assert_true(usbip_fill(qts, c, 8 + 4 + 312, 20000));
+    g_assert_cmphex(c->buf[2] << 8 | c->buf[3], ==, 0x0005);
+    g_assert_cmphex(usbip_get32(c->buf + 8), ==, 1);
+    g_assert_cmpstr((const char *)c->buf + 8 + 4 + 256, ==, "1-1");
+    usbip_consume(c, 8 + 4 + 312);
+}
+
+static void usbip_import(QTestState *qts, UsbipClient *c)
+{
+    uint8_t req[40] = { 0x01, 0x11, 0x80, 0x03 };
+
+    memcpy(req + 8, "1-1", 3);
+    usbip_send(c, req, sizeof(req));
+    g_assert_true(usbip_fill(qts, c, 8 + 56, 20000));
+    g_assert_cmphex(c->buf[2] << 8 | c->buf[3], ==, 0x0003);
+    g_assert_cmphex(usbip_get32(c->buf + 4), ==, 0);
+    usbip_consume(c, 8 + 56);
+    adapter_wait(qts, 0x40, 0x80, 0x80); /* VBSTS follows the import. */
+}
+
+static void usbip_pullup(QTestState *qts)
+{
+    wr(qts, 0x5e, 0x40); /* DCPMAXP: 64-byte control pipe. */
+    wr(qts, 0, 0x409); /* DPRPU: the bridge answers with a bus reset. */
+    adapter_wait(qts, 0x40, 0x70, 0x10); /* Device state: Powered. */
+}
+
+static void usbip_submit(UsbipClient *c, uint32_t seq, uint32_t ep,
+                         bool in, uint32_t len, const uint8_t *setup,
+                         const uint8_t *out)
+{
+    uint8_t hdr[48] = { 0 };
+
+    usbip_put32(hdr + 0, 1);
+    usbip_put32(hdr + 4, seq);
+    usbip_put32(hdr + 8, 0x10001);
+    usbip_put32(hdr + 12, in ? 1 : 0);
+    usbip_put32(hdr + 16, ep);
+    usbip_put32(hdr + 24, len);
+    usbip_put32(hdr + 32, 0xffffffff);
+    if (setup) {
+        memcpy(hdr + 40, setup, 8);
+    }
+    usbip_send(c, hdr, sizeof(hdr));
+    if (!in && out && len) {
+        usbip_send(c, out, len);
+    }
+}
+
+static void usbip_expect_ret(QTestState *qts, UsbipClient *c, uint32_t seq,
+                             int32_t want_status, uint8_t *payload,
+                             uint32_t *actual_out)
+{
+    uint32_t actual;
+
+    g_assert_true(usbip_fill(qts, c, 48, 20000));
+    g_assert_cmphex(usbip_get32(c->buf + 0), ==, 3);
+    g_assert_cmphex(usbip_get32(c->buf + 4), ==, seq);
+    g_assert_cmpint((int32_t)usbip_get32(c->buf + 20), ==, want_status);
+    actual = usbip_get32(c->buf + 24);
+    if (actual_out) {
+        *actual_out = actual;
+    }
+    if (actual) {
+        g_assert_true(usbip_fill(qts, c, 48 + actual, 20000));
+        if (payload) {
+            memcpy(payload, c->buf + 48, actual);
+        }
+    }
+    usbip_consume(c, 48 + actual);
+}
+
+/* Drive one control transfer's firmware side to the status stage. */
+static void usbip_fw_status(QTestState *qts)
+{
+    adapter_wait(qts, 0x40, 0x8, 0x8); /* VALID */
+    wr(qts, 0x40, 0xfff7); /* release the setup */
+}
+
+static void test_usbip_enumerate(void)
+{
+    uint16_t port;
+    QTestState *qts = usbip_init(&port);
+    UsbipClient c;
+    static const uint8_t get_desc[8] = {
+        0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 0x08, 0x00
+    };
+    static const uint8_t desc[8] = {
+        0x12, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x40
+    };
+    static const uint8_t set_conf[8] = {
+        0x00, 0x09, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00
+    };
+    uint8_t payload[64];
+    uint32_t actual = 0;
+
+    usbip_connect(&c, port);
+    usbip_devlist(qts, &c);
+    usbip_import(qts, &c);
+    usbip_pullup(qts);
+
+    usbip_submit(&c, 1, 0, true, 8, get_desc, NULL);
+    usbip_fw_status(qts);
+    wr(qts, 0x20, 0x20);
+    wr(qts, 0x60, 1);
+    for (unsigned i = 0; i < 8; i++) {
+        qtest_writeb(qts, USB + 0x14, desc[i]);
+    }
+    wr(qts, 0x22, 0x8000); /* BVAL */
+    adapter_wait(qts, 0x40, 0x7, 0x2); /* Control read status stage. */
+    wr(qts, 0x60, 5); /* CCPL */
+    usbip_expect_ret(qts, &c, 1, 0, payload, &actual);
+    g_assert_cmpuint(actual, ==, 8);
+    g_assert_true(memcmp(payload, desc, 8) == 0);
+
+    usbip_submit(&c, 2, 0, false, 0, set_conf, NULL);
+    usbip_fw_status(qts);
+    wr(qts, 0x60, 5); /* CCPL */
+    usbip_expect_ret(qts, &c, 2, 0, NULL, &actual);
+    g_assert_cmpuint(actual, ==, 0);
+    g_assert_cmphex(rd(qts, 0x40) & 0x70, ==, 0x30); /* Configured. */
+    close(c.fd);
+    qtest_quit(qts);
+}
+
+static void test_usbip_bulk(void)
+{
+    uint16_t port;
+    QTestState *qts = usbip_init(&port);
+    UsbipClient c;
+    static const char out_text[] = "USBIP-OUT!";
+    static const char in_text[] = "USBIP-IN!!";
+    uint8_t payload[64];
+    uint32_t actual = 0;
+
+    usbip_connect(&c, port);
+    usbip_import(qts, &c);
+    usbip_pullup(qts);
+    pipe_config(qts, 1, 0x4011, 64); /* Bulk, SIE sends, EP1. */
+    pipe_config(qts, 2, 0x4002, 64); /* Bulk, SIE receives, EP2. */
+
+    wr(qts, 0x72, 1); /* Arm pipe 2 (BUF). */
+    usbip_submit(&c, 10, 2, false, 10, NULL,
+                 (const uint8_t *)out_text);
+    usbip_expect_ret(qts, &c, 10, 0, NULL, &actual);
+    g_assert_cmpuint(actual, ==, 0);
+    wr(qts, 0x20, 0x8402); /* CFIFO read, RCNT, pipe 2. */
+    adapter_wait(qts, 0x22, 0x2000, 0x2000); /* FRDY */
+    for (unsigned i = 0; i < 10; i++) {
+        g_assert_cmphex(qtest_readb(qts, USB + 0x14), ==, out_text[i]);
+    }
+    wr(qts, 0x22, 0x4000); /* BCLR */
+
+    wr(qts, 0x20, 0x401);
+    wr(qts, 0x70, 1);
+    for (unsigned i = 0; i < 10; i++) {
+        qtest_writeb(qts, USB + 0x14, in_text[i]);
+    }
+    wr(qts, 0x22, 0x8000); /* BVAL */
+    usbip_submit(&c, 11, 1, true, 10, NULL, NULL);
+    usbip_expect_ret(qts, &c, 11, 0, payload, &actual);
+    g_assert_cmpuint(actual, ==, 10);
+    g_assert_true(memcmp(payload, in_text, 10) == 0);
+    close(c.fd);
+    qtest_quit(qts);
+}
+
+static void test_usbip_interrupt(void)
+{
+    uint16_t port;
+    QTestState *qts = usbip_init(&port);
+    UsbipClient c;
+    static const uint8_t report[4] = { 0x01, 0x02, 0x03, 0x04 };
+    uint8_t payload[64];
+    uint32_t actual = 0;
+
+    usbip_connect(&c, port);
+    usbip_import(qts, &c);
+    usbip_pullup(qts);
+    pipe_config(qts, 6, 0x8011, 8); /* Interrupt, SIE sends, EP1. */
+
+    wr(qts, 0x20, 0x406);
+    wr(qts, 0x7a, 1);
+    for (unsigned i = 0; i < 4; i++) {
+        qtest_writeb(qts, USB + 0x14, report[i]);
+    }
+    wr(qts, 0x22, 0x8000); /* BVAL */
+    usbip_submit(&c, 12, 1, true, 4, NULL, NULL);
+    usbip_expect_ret(qts, &c, 12, 0, payload, &actual);
+    g_assert_cmpuint(actual, ==, 4);
+    g_assert_true(memcmp(payload, report, 4) == 0);
+    close(c.fd);
+    qtest_quit(qts);
+}
+
+static void test_usbip_unlink(void)
+{
+    uint16_t port;
+    QTestState *qts = usbip_init(&port);
+    UsbipClient c;
+    uint8_t unlink[48] = { 0 };
+    uint8_t payload[64];
+    uint32_t actual = 0;
+
+    usbip_connect(&c, port);
+    usbip_import(qts, &c);
+    usbip_pullup(qts);
+    pipe_config(qts, 1, 0x4011, 64);
+
+    usbip_submit(&c, 20, 1, true, 4, NULL, NULL);
+    for (unsigned i = 0; i < 5; i++) {
+        qtest_clock_step(qts, 1000000);
+    }
+    g_assert_false(usbip_fill(qts, &c, 1, 3)); /* Nothing completes. */
+
+    usbip_put32(unlink + 0, 2);
+    usbip_put32(unlink + 4, 21);
+    usbip_put32(unlink + 8, 0x10001);
+    usbip_put32(unlink + 20, 20);
+    usbip_send(&c, unlink, sizeof(unlink));
+    g_assert_true(usbip_fill(qts, &c, 48, 20000));
+    g_assert_cmphex(usbip_get32(c.buf + 0), ==, 4); /* RET_UNLINK */
+    g_assert_cmphex(usbip_get32(c.buf + 4), ==, 21);
+    g_assert_cmpint((int32_t)usbip_get32(c.buf + 20), ==, 0);
+    usbip_consume(&c, 48);
+    for (unsigned i = 0; i < 5; i++) {
+        qtest_clock_step(qts, 1000000);
+    }
+    g_assert_false(usbip_fill(qts, &c, 1, 3)); /* No RET_SUBMIT follows. */
+
+    wr(qts, 0x20, 0x401);
+    wr(qts, 0x70, 1);
+    qtest_writeb(qts, USB + 0x14, 0xaa);
+    qtest_writeb(qts, USB + 0x14, 0xbb);
+    wr(qts, 0x22, 0x8000);
+    usbip_submit(&c, 22, 1, true, 2, NULL, NULL);
+    usbip_expect_ret(qts, &c, 22, 0, payload, &actual);
+    g_assert_cmpuint(actual, ==, 2);
+    g_assert_cmphex(payload[0], ==, 0xaa);
+    g_assert_cmphex(payload[1], ==, 0xbb);
+    close(c.fd);
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
     qtest_add_func("/rx113-usb/adapter-enumerate", test_adapter_enumerate);
     qtest_add_func("/rx113-usb/adapter-storage", test_adapter_storage);
     qtest_add_func("/rx113-usb/adapter-nak", test_adapter_nak);
+    qtest_add_func("/rx113-usb/usbip-enumerate", test_usbip_enumerate);
+    qtest_add_func("/rx113-usb/usbip-bulk", test_usbip_bulk);
+    qtest_add_func("/rx113-usb/usbip-interrupt", test_usbip_interrupt);
+    qtest_add_func("/rx113-usb/usbip-unlink", test_usbip_unlink);
     qtest_add_func("/rx113-usb/queued-zlp", test_queued_zlp);
     qtest_add_func("/rx113-usb/wakeup", test_wakeup);
     qtest_add_func("/rx113-usb/periodic-host", test_periodic_host);
