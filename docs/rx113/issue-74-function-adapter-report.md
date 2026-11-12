@@ -110,3 +110,26 @@ All in `hw/rx/rx113-usb.c`:
   Windows-side client); the tool is self-made, so running it
   under WSL or giving it a TCP transport with a small
   WSL-side bridge are the two candidate shapes.
+
+## Addendum (2026-11-12): Stage 2 preparation findings
+
+A wire-layout audit against the kernel's normative sources
+(Documentation/usb/usbip_protocol.rst, the tools' packed
+struct usbip_usb_device and drivers/usb/usbip/usbip_common.h)
+found one real divergence, tracked as Issue #76:
+OP_REP_IMPORT must carry the full 312-byte device record,
+path included; the implementation sent a 56-byte suffix and
+the in-test client shared the assumption. All other audited
+layouts matched (op headers, DEVLIST count + interface
+records, the 48-byte URB header field offsets).
+
+With the fix, a live interoperability smoke also passes:
+a bare-metal RX113 firmware (bulk echo device, EP1 IN /
+EP2 OUT, polling) runs on the model under TCG - a real guest
+CPU, not the qtest MMIO actor - and an independent Python
+USB/IP client written from the protocol document enumerates
+it (descriptors byte-checked, SET_CONFIGURATION) and
+completes bulk echo round trips of 100, 5 and 64 bytes.
+Three consecutive runs passed. Remaining Stage 2 work is
+the on-machine check with a real vhci (Linux or WSL) and
+the PO's own communication tool.
