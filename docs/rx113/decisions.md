@@ -561,3 +561,27 @@ Stage 2 (RXD sampling) adds:
   communication tool, self-made) is a separate verification
   step; the protocol-level behavior is pinned by qtest with an
   in-test USB/IP client.
+
+## D-029: Issue #60 IWDT lazy deviation accepted (Issue #60)
+
+- The deviation recorded in Issue #60 is accepted as a
+  permanent known limitation (PO decision, 2026-11-12): during
+  an IWDT lazy interval, repeated-underflow WUNI re-requests
+  are not delivered autonomously; they materialize at the
+  next IWDT MMIO access (catch-up), compressed to one pulse
+  per boundary as in D-021.
+- Grounds: the first underflow is always delivered on time;
+  the deviation needs the conjunction of WUNI/NMI output
+  mode, already-latched error flags, sleep-stop off, and a
+  handler that clears only the ICU latch and never touches
+  an IWDT register - and in reset-output mode (the basic
+  configuration) there is no second firing at all, because
+  the first underflow restarts the MCU. Normal servicing
+  (reading IWDTSR, refreshing the counter) exits the lazy
+  state and restores cycle-accurate delivery, so what is
+  lost in the corner is only repeated diagnostic
+  notification for an already-hung system, not the primary
+  watchdog action.
+- Revisit only if target firmware is found to service WUNI
+  without touching IWDT registers; the fix routes and their
+  clock-warp constraints stay recorded in Issue #60.
