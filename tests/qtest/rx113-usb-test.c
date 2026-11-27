@@ -732,6 +732,46 @@ static void test_fifo(void)
     qtest_quit(qts);
 }
 
+static void test_bval_after_auto_commit(void)
+{
+    QTestState *qts = usb_init();
+    g_autoptr(GString) expected = g_string_new("1:");
+
+    /*
+     * Issue #80: a maxp-sized FIFO write auto-commits the packet.
+     * If the SIE consumes it before the firmware's trailing BVAL
+     * write, that BVAL must not validate the emptied plane again
+     * as a zero-length packet.
+     */
+    pipe_config(qts, 1, 0x4011, 64);
+    wr(qts, 0x20, 0x401);
+    wr(qts, 0x70, 1);
+    for (unsigned i = 0; i < 64; i++) {
+        qtest_writeb(qts, USB + 0x14, i);
+        g_string_append_printf(expected, "%02x", i);
+    }
+    g_string_append_c(expected, ';');
+    /* The 64th write alone committed the packet. */
+    tx_snapshot(qts, expected->str);
+    completion(qts, "ack:1");
+    tx_snapshot(qts, "");
+    /* The trailing BVAL for the same fill sends nothing. */
+    wr(qts, 0x22, 0x8000);
+    tx_snapshot(qts, "");
+    /* A short fill under a fresh selection still commits. */
+    wr(qts, 0x20, 0x401);
+    qtest_writeb(qts, USB + 0x14, 0xaa);
+    wr(qts, 0x22, 0x8000);
+    tx_snapshot(qts, "1:aa;");
+    completion(qts, "ack:1");
+    /* An intentional ZLP (BVAL with no data written) still works. */
+    wr(qts, 0x20, 0x401);
+    wr(qts, 0x22, 0x8000);
+    tx_snapshot(qts, "1:;");
+    completion(qts, "ack:1");
+    qtest_quit(qts);
+}
+
 static void test_fifo_ports(void)
 {
     static const unsigned ports[] = { 0x14, 0x18, 0x1c };
@@ -1709,6 +1749,8 @@ int main(int argc, char **argv)
     qtest_add_func("/rx113-usb/inventory", test_inventory);
     qtest_add_func("/rx113-usb/windows-access", test_windows_access);
     qtest_add_func("/rx113-usb/fifo", test_fifo);
+    qtest_add_func("/rx113-usb/bval-after-auto-commit",
+                   test_bval_after_auto_commit);
     qtest_add_func("/rx113-usb/fifo-ports", test_fifo_ports);
     qtest_add_func("/rx113-usb/double-bfre-counter", test_double_bfre_counter);
     qtest_add_func("/rx113-usb/interrupts", test_interrupts);
