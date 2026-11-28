@@ -623,3 +623,14 @@ of depending on that timing. A genuine ZLP is unaffected:
 selecting the pipe (or BCLR) starts a new fill, and a BVAL with
 no data written then commits an empty packet as before. The
 bridge's short-packet finish stays unchanged.
+
+The flag is migration state: it travels in a
+`rx113-usb/pipe/fill-validated` VMState subsection, written
+only for pipes whose flag is set. A stream without the
+subsection (saved before this change) loads with the flag
+clear, matching the pre-fix behaviour for that stream only.
+(Added after cross-model review showed a same-version
+migration otherwise reopened a validated fill: the destination
+started with the flag clear and the trailing BVAL queued the
+phantom ZLP again. The `migration-validated-fill` qtest pins
+the migrated case.)

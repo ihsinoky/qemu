@@ -2547,10 +2547,32 @@ static void rx113_usb_reset_hold(Object *obj, ResetType type)
     usb_update_irq(s);
 }
 
+static bool usb_pipe_fill_validated_needed(void *opaque)
+{
+    RX113USBPipe *p = opaque;
+
+    return p->fill_validated;
+}
+
+static const VMStateDescription vmstate_usb_pipe_fill = {
+    .name = "rx113-usb/pipe/fill-validated",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = usb_pipe_fill_validated_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_BOOL(fill_validated, RX113USBPipe),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static const VMStateDescription vmstate_usb_pipe = {
     .name = "rx113-usb/pipe",
     .version_id = 1,
     .minimum_version_id = 1,
+    .subsections = (const VMStateDescription * const []) {
+        &vmstate_usb_pipe_fill,
+        NULL
+    },
     .fields = (const VMStateField[]) {
         VMSTATE_UINT16(cfg, RX113USBPipe),
         VMSTATE_UINT16(maxp, RX113USBPipe),

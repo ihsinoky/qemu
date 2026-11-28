@@ -1724,6 +1724,53 @@ static void test_usbip_unlink(void)
     qtest_quit(qts);
 }
 
+static void test_migration_validated_fill(void)
+{
+    QTestState *src = usb_init();
+    QTestState *dst;
+    g_autofree char *dir = g_dir_make_tmp("rx113-usb-val-XXXXXX", NULL);
+    g_autofree char *file = g_strdup_printf("%s/state", dir);
+    g_autofree char *uri = g_strdup_printf("file:%s", file);
+    g_autoptr(GString) expected = g_string_new("1:");
+
+    /*
+     * Issue #80: the validated state of a fill survives migration.
+     * A maxp fill is auto-committed and consumed before migration;
+     * the trailing BVAL on the destination must not validate the
+     * emptied plane again as a zero-length packet.
+     */
+    pipe_config(src, 1, 0x4011, 64);
+    wr(src, 0x20, 0x401);
+    wr(src, 0x70, 1);
+    for (unsigned i = 0; i < 64; i++) {
+        qtest_writeb(src, USB + 0x14, i);
+        g_string_append_printf(expected, "%02x", i);
+    }
+    g_string_append_c(expected, ';');
+    tx_snapshot(src, expected->str);
+    completion(src, "ack:1");
+    tx_snapshot(src, "");
+    qtest_qmp_assert_success(src, "{'execute':'migrate',"
+                             "'arguments':{'uri':%s}}", uri);
+    migration_wait(src);
+    dst = qtest_init("-M rx113-r5f51138 -incoming defer");
+    qtest_qmp_assert_success(dst, "{'execute':'migrate-incoming',"
+                             "'arguments':{'uri':%s}}", uri);
+    migration_wait(dst);
+    qtest_writel(dst, MSTPCRB, RUN_B);
+    wr(dst, 0x22, 0x8000);
+    tx_snapshot(dst, "");
+    /* An intentional ZLP under a fresh selection still works. */
+    wr(dst, 0x20, 0x401);
+    wr(dst, 0x22, 0x8000);
+    tx_snapshot(dst, "1:;");
+    completion(dst, "ack:1");
+    qtest_quit(dst);
+    qtest_quit(src);
+    unlink(file);
+    rmdir(dir);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -1749,6 +1796,8 @@ int main(int argc, char **argv)
     qtest_add_func("/rx113-usb/inventory", test_inventory);
     qtest_add_func("/rx113-usb/windows-access", test_windows_access);
     qtest_add_func("/rx113-usb/fifo", test_fifo);
+    qtest_add_func("/rx113-usb/migration-validated-fill",
+                   test_migration_validated_fill);
     qtest_add_func("/rx113-usb/bval-after-auto-commit",
                    test_bval_after_auto_commit);
     qtest_add_func("/rx113-usb/fifo-ports", test_fifo_ports);
