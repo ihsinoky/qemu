@@ -599,3 +599,41 @@ re-arms control transfers inside one evaluation can alias that
 observation away and deadlock polling firmware. Rule of thumb from
 this defect: the bridge must stay at or slower than real bus timing
 in every respect firmware can observe.
+
+## D-031: A FIFO fill is validated at most once (Issue #80)
+
+A TX pipe's FIFO fill is validated at most once. `usb_commit_tx`
+records the validation (`fill_validated`); the CFIFOCTR BVAL
+handler does not commit while the flag is set. The flag clears
+when the firmware starts a new fill: selecting the pipe on a
+FIFO port, writing BCLR for the pipe, or writing data into an
+empty, invalid plane. The maxp auto-commit in `usb_fifo_access`
+is unaffected and also records the validation.
+
+Rationale (findings F-007): a firmware that writes a maxp-sized
+packet and then sets BVAL — the common write-one-packet
+sequence — could, under host load, have the packet consumed by
+the bridge between the auto-commit and the BVAL write; the
+trailing BVAL then validated the emptied plane as a zero-length
+packet, and the bridge finished the IN URB early on the phantom
+short packet. On a real bus the BVAL lands long before any IN
+token can consume the packet, so one fill is validated exactly
+once there; the model now enforces the same invariant instead
+of depending on that timing. A genuine ZLP is unaffected:
+selecting the pipe (or BCLR) starts a new fill, and a BVAL with
+no data written then commits an empty packet as before. The
+bridge's short-packet finish stays unchanged.
+
+The flag is migration state: it travels in a
+`rx113-usb/pipe/fill-validated` VMState subsection, written
+only for pipes whose flag is set. A stream without the
+subsection (saved before this change) loads with the flag
+clear, matching the pre-fix behaviour for that stream only;
+a pipe pre-load hook defaults the flag to false before the
+fields load, so the result does not depend on whatever state
+the destination device held before the load.
+(Added after cross-model review showed a same-version
+migration otherwise reopened a validated fill: the destination
+started with the flag clear and the trailing BVAL queued the
+phantom ZLP again. The `migration-validated-fill` qtest pins
+the migrated case.)

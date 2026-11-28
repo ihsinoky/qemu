@@ -4,6 +4,75 @@ Empirical findings from external verification of emulation premises
 (Issue #51). Format per entry: conclusion, confidence, conditions,
 evidence, validity boundary, promoted-to. Newest first.
 
+## F-007: The Issue #80 short read is a phantom ZLP from a double commit: maxp auto-commit, bridge ACK, then the firmware's trailing BVAL commits the emptied plane (2026-11-27)
+
+- **Conclusion:** The intermittent bulk IN short read (100-byte URB
+  finishing with 64 bytes, status 0) is not the frame-boundary
+  mechanism guessed in Issue #80. An instrumented live-smoke
+  reproduction logs the bridge finishing the URB on a zero-length
+  packet: `append pipe=1 len=0 ... finish=1` with got=64, want=100.
+  The ZLP is manufactured by a double commit in the core:
+  (1) `usb_fifo_access` auto-commits a TX plane when the firmware's
+  FIFO writes reach exactly maxp (64); (2) the bridge appends the
+  packet and its `ack` completion clears the plane; (3) the
+  firmware's trailing CFIFOCTR BVAL write — part of the same
+  write-one-packet sequence; the smoke firmware sets BVAL
+  unconditionally — now finds the plane empty and ready, so the
+  BVAL handler calls `usb_commit_tx` on a zero-length plane;
+  (4) `usbip_drive_pipe` treats any valid plane with len < maxp as
+  the terminating short packet and finishes the URB with status 0
+  and the partial count. The full sequence was captured in one
+  failing run: commit-auto len=64, ack-consume len=64, append 64
+  (finish=0), commit-bval len=0, ack-consume len=0, append len=0
+  (finish=1). On a real bus the firmware's BVAL lands microseconds
+  after the last FIFO write, while the packet can only be consumed
+  by a later IN token; in the model the bridge drive (frame tick
+  and socket callbacks, main-loop thread) can interleave between
+  the two guest MMIO writes under host load. The failure is
+  therefore rare and load-sensitive — the same "bridge ordered
+  differently from a real bus" class as Issue #79 (D-030).
+- **Confidence:** High. The symptom was reproduced twice in ~110
+  instrumented runs this session (plus the original 1-in-25
+  observation), the finishing decision was logged directly, and
+  every link of the mechanism is a specific code site (below).
+  In passing runs the commit-site logs show the benign order:
+  the trailing BVAL is evaluated while the plane is still valid
+  and is ignored; commit-bval fires only with len > 0.
+- **Conditions:** Function adapter (USB/IP bridge) in use; a bulk
+  or interrupt IN transfer whose firmware writes a maxp-sized
+  packet and then sets BVAL for the same packet (a common firmware
+  pattern; the in-tree smoke firmware does); enough host load for
+  the bridge drive to run between the guest's auto-commit and its
+  BVAL write.
+- **Refuted alternative:** The issue's original hypothesis (the
+  bridge finishes the URB at a frame boundary on a momentarily
+  empty FIFO) does not match the code: `usbip_drive_pipe` never
+  finishes an IN URB without a valid packet, except the ATREPM
+  branch — which cannot fire here, as the smoke firmware never
+  sets ATREPM (logged PIPE1CTR value 0x0041, bit 10 clear).
+- **Validity boundary:** The same double commit can plant a stale
+  ZLP after a transfer that ends exactly at maxp (e.g. the
+  64-byte echo): if the trailing BVAL lands after the final ACK,
+  the empty commit remains in the pipe and would be delivered as
+  the first packet of the next IN URB. Not observed in the smoke
+  (the session ends there), but it follows from the same code
+  path, so a fix must cover it, not only the mid-transfer case.
+- **Evidence:** PMO diagnosis logs, 2026-11-27 (preserved with
+  the PMO records): smoke3-run-021.log (first instrumented
+  reproduction, append len=0), smoke5-run-027.log (full commit
+  sequence), smoke4-run-003.log (benign passing sequence).
+  Code sites in hw/rx/rx113-usb.c: `usb_fifo_access` (auto-commit
+  at maxp), `usb_sie_completion` ack branch (plane clear),
+  CFIFOCTR write handler (BVAL -> `usb_commit_tx`),
+  `usbip_drive_pipe` (short-packet finish).
+- **Promoted-to:** Issue #80. Fix direction proposed there:
+  the BVAL handler should not commit a plane that the current
+  FIFO fill did not write — a fill already validated (by the
+  maxp auto-commit or an earlier BVAL) must not be validated
+  again until the firmware starts a new fill (re-selection or
+  BCLR). The bridge's short-packet finish is correct behaviour
+  for a genuine ZLP and stays.
+
 ## F-006: The RX113 MTU TSR has no match flags; the constant TSR read is conforming (2026-11-12)
 
 - **Conclusion:** There is nothing to store. Section 20.2.6 of

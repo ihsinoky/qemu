@@ -118,6 +118,14 @@ typedef struct RX113USBPipe {
     bool seen;
     bool expected;
     bool tx_ready[2];
+    /*
+     * The current FIFO fill has already been validated, by the
+     * maxp auto-commit or by a BVAL write.  A fill is validated
+     * at most once (Issue #80): a trailing BVAL for a packet that
+     * was already auto-committed must not validate the emptied
+     * plane again as a zero-length packet.
+     */
+    bool fill_validated;
 } RX113USBPipe;
 
 /* One in-flight adapter transfer per pipe (Issue #72). */
@@ -620,6 +628,7 @@ static void usb_commit_tx(RX113USBState *s, unsigned n)
 {
     RX113USBPipe *p = &s->pipe[n];
 
+    p->fill_validated = true;
     p->valid[p->cpu] = true;
     p->cpu = usb_next(p, p->cpu);
     if (n && !p->valid[p->cpu]) {
@@ -649,6 +658,10 @@ static uint64_t usb_fifo_access(RX113USBState *s, unsigned f, unsigned size,
         if (!maxp || p->length[plane] + size > maxp ||
             p->length[plane] + size > sizeof(p->data[plane])) {
             return 0;
+        }
+        if (!p->valid[plane] && p->length[plane] == 0) {
+            /* A write into an empty plane starts a new fill. */
+            p->fill_validated = false;
         }
         for (unsigned b = 0; b < size; b++) {
             unsigned shift = size == 2 && (sel & 0x100) ? 8 * (1 - b) : 8 * b;
@@ -965,6 +978,10 @@ static void rx113_usb_write(void *opaque, hwaddr addr, uint64_t value,
         if ((value & 15) < 10) {
             R(s, addr) = value & usb_regs[index].mask;
             n = value & 15;
+            if (usb_tx(s, n)) {
+                /* Selecting a TX pipe starts a new fill. */
+                s->pipe[n].fill_validated = false;
+            }
             if ((value & 0x4000) && !usb_tx(s, n) && usb_ready(s, n)) {
                 s->pipe[n].pos[s->pipe[n].cpu] = 0;
             }
@@ -984,11 +1001,13 @@ static void rx113_usb_write(void *opaque, hwaddr addr, uint64_t value,
                 if ((value & BCLR) && (ready || pipe == 0)) {
                     if (usb_tx(s, pipe)) {
                         usb_clear_plane(p, p->cpu);
+                        p->fill_validated = false;
                     } else {
                         usb_release_rx(s, pipe);
                     }
                 }
-                if ((value & BVAL) && ready && usb_tx(s, pipe)) {
+                if ((value & BVAL) && ready && usb_tx(s, pipe) &&
+                    !p->fill_validated) {
                     usb_commit_tx(s, pipe);
                 }
             }
@@ -2528,10 +2547,45 @@ static void rx113_usb_reset_hold(Object *obj, ResetType type)
     usb_update_irq(s);
 }
 
+static bool usb_pipe_fill_validated_needed(void *opaque)
+{
+    RX113USBPipe *p = opaque;
+
+    return p->fill_validated;
+}
+
+static const VMStateDescription vmstate_usb_pipe_fill = {
+    .name = "rx113-usb/pipe/fill-validated",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = usb_pipe_fill_validated_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_BOOL(fill_validated, RX113USBPipe),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
+static int usb_pipe_pre_load(void *opaque)
+{
+    RX113USBPipe *p = opaque;
+
+    /*
+     * A stream without the fill-validated subsection means false,
+     * whatever the destination held before the load.
+     */
+    p->fill_validated = false;
+    return 0;
+}
+
 static const VMStateDescription vmstate_usb_pipe = {
     .name = "rx113-usb/pipe",
     .version_id = 1,
     .minimum_version_id = 1,
+    .pre_load = usb_pipe_pre_load,
+    .subsections = (const VMStateDescription * const []) {
+        &vmstate_usb_pipe_fill,
+        NULL
+    },
     .fields = (const VMStateField[]) {
         VMSTATE_UINT16(cfg, RX113USBPipe),
         VMSTATE_UINT16(maxp, RX113USBPipe),
