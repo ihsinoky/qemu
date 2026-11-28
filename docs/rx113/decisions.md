@@ -628,7 +628,10 @@ The flag is migration state: it travels in a
 `rx113-usb/pipe/fill-validated` VMState subsection, written
 only for pipes whose flag is set. A stream without the
 subsection (saved before this change) loads with the flag
-clear, matching the pre-fix behaviour for that stream only.
+clear, matching the pre-fix behaviour for that stream only;
+a pipe pre-load hook defaults the flag to false before the
+fields load, so the result does not depend on whatever state
+the destination device held before the load.
 (Added after cross-model review showed a same-version
 migration otherwise reopened a validated fill: the destination
 started with the flag clear and the trailing BVAL queued the

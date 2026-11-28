@@ -2565,10 +2565,23 @@ static const VMStateDescription vmstate_usb_pipe_fill = {
     },
 };
 
+static int usb_pipe_pre_load(void *opaque)
+{
+    RX113USBPipe *p = opaque;
+
+    /*
+     * A stream without the fill-validated subsection means false,
+     * whatever the destination held before the load.
+     */
+    p->fill_validated = false;
+    return 0;
+}
+
 static const VMStateDescription vmstate_usb_pipe = {
     .name = "rx113-usb/pipe",
     .version_id = 1,
     .minimum_version_id = 1,
+    .pre_load = usb_pipe_pre_load,
     .subsections = (const VMStateDescription * const []) {
         &vmstate_usb_pipe_fill,
         NULL
